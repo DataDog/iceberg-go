@@ -31,11 +31,11 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/testing/setup"
-	"gocloud.dev/pubsub"
-	"gocloud.dev/pubsub/driver"
-	"gocloud.dev/pubsub/drivertest"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/setup"
+	"github.com/apache/iceberg-go/go-cloud/pubsub"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/driver"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/drivertest"
 )
 
 const rabbitURL = "amqp://guest:guest@localhost:5672/"

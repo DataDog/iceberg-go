@@ -74,12 +74,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/wire"
-	gcaws "gocloud.dev/aws"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/driver"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/escape"
-	"gocloud.dev/internal/gcerr"
+	gcaws "github.com/apache/iceberg-go/go-cloud/aws"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob/driver"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/escape"
+	"github.com/apache/iceberg-go/go-cloud/internal/gcerr"
 )
 
 const defaultPageSize = 1000

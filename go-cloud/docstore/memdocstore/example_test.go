@@ -18,8 +18,8 @@ import (
 	"context"
 	"log"
 
-	"gocloud.dev/docstore"
-	"gocloud.dev/docstore/memdocstore"
+	"github.com/apache/iceberg-go/go-cloud/docstore"
+	"github.com/apache/iceberg-go/go-cloud/docstore/memdocstore"
 )
 
 func ExampleOpenCollection() {

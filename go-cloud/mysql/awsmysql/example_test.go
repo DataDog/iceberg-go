@@ -18,8 +18,8 @@ import (
 	"context"
 	"log"
 
-	"gocloud.dev/mysql"
-	_ "gocloud.dev/mysql/awsmysql"
+	"github.com/apache/iceberg-go/go-cloud/mysql"
+	_ "github.com/apache/iceberg-go/go-cloud/mysql/awsmysql"
 )
 
 func Example() {

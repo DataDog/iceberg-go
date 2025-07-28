@@ -24,14 +24,14 @@ import (
 	"net/url"
 
 	"github.com/google/wire"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/gcsblob"
-	"gocloud.dev/gcp"
-	"gocloud.dev/gcp/gcpcloud"
-	"gocloud.dev/mysql/gcpmysql"
-	"gocloud.dev/runtimevar"
-	"gocloud.dev/runtimevar/gcpruntimeconfig"
-	"gocloud.dev/server"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob/gcsblob"
+	"github.com/apache/iceberg-go/go-cloud/gcp"
+	"github.com/apache/iceberg-go/go-cloud/gcp/gcpcloud"
+	"github.com/apache/iceberg-go/go-cloud/mysql/gcpmysql"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/gcpruntimeconfig"
+	"github.com/apache/iceberg-go/go-cloud/server"
 	pb "google.golang.org/genproto/googleapis/cloud/runtimeconfig/v1beta1"
 )
 

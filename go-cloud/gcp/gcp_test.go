@@ -18,8 +18,8 @@ import (
 	"context"
 	"testing"
 
-	"gocloud.dev/gcp"
-	"gocloud.dev/internal/testing/setup"
+	"github.com/apache/iceberg-go/go-cloud/gcp"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/setup"
 )
 
 func TestNewHTTPClient(t *testing.T) {

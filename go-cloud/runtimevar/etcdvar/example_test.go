@@ -19,8 +19,8 @@ import (
 	"log"
 
 	"go.etcd.io/etcd/client/v3"
-	"gocloud.dev/runtimevar"
-	"gocloud.dev/runtimevar/etcdvar"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/etcdvar"
 )
 
 func ExampleOpenVariable() {

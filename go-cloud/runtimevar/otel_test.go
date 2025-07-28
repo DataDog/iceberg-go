@@ -16,10 +16,10 @@ package runtimevar_test
 
 import (
 	"context"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/testing/oteltest"
-	"gocloud.dev/runtimevar"
-	"gocloud.dev/runtimevar/constantvar"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/oteltest"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/constantvar"
 	"testing"
 )
 
