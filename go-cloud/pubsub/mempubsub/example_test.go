@@ -19,8 +19,8 @@ import (
 	"log"
 	"time"
 
-	"gocloud.dev/pubsub"
-	"gocloud.dev/pubsub/mempubsub"
+	"github.com/apache/iceberg-go/go-cloud/pubsub"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/mempubsub"
 )
 
 func ExampleNewSubscription() {

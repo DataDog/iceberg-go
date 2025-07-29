@@ -78,13 +78,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/googleapis/gax-go/v2"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/gcerr"
-	"gocloud.dev/internal/openurl"
-	gcdkotel "gocloud.dev/internal/otel"
-	"gocloud.dev/internal/retry"
-	"gocloud.dev/pubsub/batcher"
-	"gocloud.dev/pubsub/driver"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/gcerr"
+	"github.com/apache/iceberg-go/go-cloud/internal/openurl"
+	gcdkotel "github.com/apache/iceberg-go/go-cloud/internal/otel"
+	"github.com/apache/iceberg-go/go-cloud/internal/retry"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/batcher"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/driver"
 	"golang.org/x/sync/errgroup"
 )
 

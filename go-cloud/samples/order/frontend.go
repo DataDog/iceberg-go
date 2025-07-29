@@ -28,14 +28,14 @@ import (
 	"strings"
 	"time"
 
-	"gocloud.dev/blob"
-	_ "gocloud.dev/blob/fileblob"
-	"gocloud.dev/docstore"
-	_ "gocloud.dev/docstore/memdocstore"
-	"gocloud.dev/pubsub"
-	_ "gocloud.dev/pubsub/mempubsub"
-	"gocloud.dev/server"
-	"gocloud.dev/server/requestlog"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	_ "github.com/apache/iceberg-go/go-cloud/blob/fileblob"
+	"github.com/apache/iceberg-go/go-cloud/docstore"
+	_ "github.com/apache/iceberg-go/go-cloud/docstore/memdocstore"
+	"github.com/apache/iceberg-go/go-cloud/pubsub"
+	_ "github.com/apache/iceberg-go/go-cloud/pubsub/mempubsub"
+	"github.com/apache/iceberg-go/go-cloud/server"
+	"github.com/apache/iceberg-go/go-cloud/server/requestlog"
 )
 
 // A frontend is a web server that takes image-processing orders.

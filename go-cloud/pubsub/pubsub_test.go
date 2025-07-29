@@ -25,11 +25,11 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/gcerr"
-	"gocloud.dev/internal/testing/oteltest"
-	"gocloud.dev/pubsub/batcher"
-	"gocloud.dev/pubsub/driver"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/gcerr"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/oteltest"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/batcher"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/driver"
 )
 
 type driverTopic struct {

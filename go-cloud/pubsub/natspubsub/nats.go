@@ -82,10 +82,10 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/pubsub"
-	"gocloud.dev/pubsub/batcher"
-	"gocloud.dev/pubsub/driver"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/pubsub"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/batcher"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/driver"
 )
 
 var errNotInitialized = errors.New("natspubsub: topic not initialized")

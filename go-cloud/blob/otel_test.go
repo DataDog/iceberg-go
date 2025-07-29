@@ -17,10 +17,10 @@ package blob_test
 import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/memblob"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/testing/oteltest"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob/memblob"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/oteltest"
 	"testing"
 )
 

@@ -26,10 +26,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/go-cmp/cmp"
-	"gocloud.dev/internal/testing/setup"
-	"gocloud.dev/secrets"
-	"gocloud.dev/secrets/driver"
-	"gocloud.dev/secrets/drivertest"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/setup"
+	"github.com/apache/iceberg-go/go-cloud/secrets"
+	"github.com/apache/iceberg-go/go-cloud/secrets/driver"
+	"github.com/apache/iceberg-go/go-cloud/secrets/drivertest"
 )
 
 const (

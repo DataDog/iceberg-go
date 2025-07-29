@@ -45,10 +45,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/wire"
-	gcaws "gocloud.dev/aws"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/gcerr"
-	"gocloud.dev/secrets"
+	gcaws "github.com/apache/iceberg-go/go-cloud/aws"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/gcerr"
+	"github.com/apache/iceberg-go/go-cloud/secrets"
 )
 
 func init() {

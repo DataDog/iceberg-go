@@ -18,8 +18,8 @@ import (
 	"context"
 	"log"
 
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/azureblob"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob/azureblob"
 )
 
 func ExampleOpenBucket() {

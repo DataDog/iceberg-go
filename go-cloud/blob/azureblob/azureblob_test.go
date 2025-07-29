@@ -31,10 +31,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 
 	"github.com/google/go-cmp/cmp"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/driver"
-	"gocloud.dev/blob/drivertest"
-	"gocloud.dev/internal/testing/setup"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob/driver"
+	"github.com/apache/iceberg-go/go-cloud/blob/drivertest"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/setup"
 )
 
 // Prerequisites for -record mode

@@ -42,9 +42,9 @@ import (
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
 	"github.com/XSAM/otelsql"
 	"github.com/lib/pq"
-	"gocloud.dev/gcp"
-	"gocloud.dev/gcp/cloudsql"
-	"gocloud.dev/postgres"
+	"github.com/apache/iceberg-go/go-cloud/gcp"
+	"github.com/apache/iceberg-go/go-cloud/gcp/cloudsql"
+	"github.com/apache/iceberg-go/go-cloud/postgres"
 )
 
 // Scheme is the URL scheme gcppostgres registers its URLOpener under on

@@ -35,8 +35,8 @@ import (
 
 	"github.com/XSAM/otelsql"
 	"github.com/go-sql-driver/mysql"
-	"gocloud.dev/azure/azuredb"
-	cdkmysql "gocloud.dev/mysql"
+	"github.com/apache/iceberg-go/go-cloud/azure/azuredb"
+	cdkmysql "github.com/apache/iceberg-go/go-cloud/mysql"
 )
 
 // URLOpener opens Azure MySQL URLs

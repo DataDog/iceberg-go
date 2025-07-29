@@ -18,8 +18,8 @@ import (
 	"context"
 	"log"
 
-	"gocloud.dev/postgres"
-	_ "gocloud.dev/postgres/gcppostgres"
+	"github.com/apache/iceberg-go/go-cloud/postgres"
+	_ "github.com/apache/iceberg-go/go-cloud/postgres/gcppostgres"
 )
 
 func Example() {

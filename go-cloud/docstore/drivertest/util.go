@@ -19,7 +19,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"gocloud.dev/docstore/driver"
+	"github.com/apache/iceberg-go/go-cloud/docstore/driver"
 )
 
 // MakeUniqueStringDeterministicForTesting uses a specified seed value to
