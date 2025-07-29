@@ -32,9 +32,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"gocloud.dev/blob"
-	"gocloud.dev/docstore"
-	"gocloud.dev/pubsub"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/docstore"
+	"github.com/apache/iceberg-go/go-cloud/pubsub"
 )
 
 var (

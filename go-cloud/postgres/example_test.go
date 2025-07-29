@@ -18,7 +18,7 @@ import (
 	"context"
 	"log"
 
-	"gocloud.dev/postgres"
+	"github.com/apache/iceberg-go/go-cloud/postgres"
 )
 
 func ExampleOpen() {

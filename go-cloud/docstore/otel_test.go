@@ -16,10 +16,10 @@ package docstore_test
 
 import (
 	"context"
-	"gocloud.dev/docstore"
-	"gocloud.dev/docstore/memdocstore"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/testing/oteltest"
+	"github.com/apache/iceberg-go/go-cloud/docstore"
+	"github.com/apache/iceberg-go/go-cloud/docstore/memdocstore"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/testing/oteltest"
 	"testing"
 )
 

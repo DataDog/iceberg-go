@@ -22,7 +22,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
-	"gocloud.dev/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
 	"reflect"
 	"time"
 )

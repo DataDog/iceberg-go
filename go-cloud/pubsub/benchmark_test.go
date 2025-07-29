@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"gocloud.dev/pubsub/driver"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/driver"
 	"golang.org/x/sync/errgroup"
 )
 

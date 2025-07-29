@@ -25,7 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gocloud.dev/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob"
 )
 
 // blobOpenFile describes a single open blob as a File.

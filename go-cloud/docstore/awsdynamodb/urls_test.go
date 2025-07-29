@@ -18,7 +18,7 @@ import (
 	"net/url"
 	"testing"
 
-	gcaws "gocloud.dev/aws"
+	gcaws "github.com/apache/iceberg-go/go-cloud/aws"
 )
 
 func TestProcessURL(t *testing.T) {

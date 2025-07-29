@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"log"
 
-	"gocloud.dev/blob/memblob"
-	"gocloud.dev/runtimevar"
-	"gocloud.dev/runtimevar/blobvar"
+	"github.com/apache/iceberg-go/go-cloud/blob/memblob"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/blobvar"
 )
 
 func ExampleOpenVariable() {

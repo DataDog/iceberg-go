@@ -38,10 +38,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/driver"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/escape"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	"github.com/apache/iceberg-go/go-cloud/blob/driver"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/internal/escape"
 )
 
 // Harness descibes the functionality test harnesses must provide to run

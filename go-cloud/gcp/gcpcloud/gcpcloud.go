@@ -17,14 +17,14 @@ package gcpcloud // import "gocloud.dev/gcp/gcpcloud"
 
 import (
 	"github.com/google/wire"
-	"gocloud.dev/blob/gcsblob"
-	"gocloud.dev/docstore/gcpfirestore"
-	"gocloud.dev/gcp"
-	"gocloud.dev/gcp/cloudsql"
-	"gocloud.dev/pubsub/gcppubsub"
-	"gocloud.dev/runtimevar/gcpruntimeconfig"
-	"gocloud.dev/secrets/gcpkms"
-	"gocloud.dev/server/sdserver"
+	"github.com/apache/iceberg-go/go-cloud/blob/gcsblob"
+	"github.com/apache/iceberg-go/go-cloud/docstore/gcpfirestore"
+	"github.com/apache/iceberg-go/go-cloud/gcp"
+	"github.com/apache/iceberg-go/go-cloud/gcp/cloudsql"
+	"github.com/apache/iceberg-go/go-cloud/pubsub/gcppubsub"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/gcpruntimeconfig"
+	"github.com/apache/iceberg-go/go-cloud/secrets/gcpkms"
+	"github.com/apache/iceberg-go/go-cloud/server/sdserver"
 )
 
 // GCP is a Wire provider set that includes all Google Cloud Platform services

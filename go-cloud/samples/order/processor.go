@@ -32,13 +32,13 @@ import (
 	"strings"
 	"time"
 
-	"gocloud.dev/blob"
-	_ "gocloud.dev/blob/fileblob"
-	"gocloud.dev/docstore"
-	_ "gocloud.dev/docstore/memdocstore"
-	"gocloud.dev/gcerrors"
-	"gocloud.dev/pubsub"
-	_ "gocloud.dev/pubsub/mempubsub"
+	"github.com/apache/iceberg-go/go-cloud/blob"
+	_ "github.com/apache/iceberg-go/go-cloud/blob/fileblob"
+	"github.com/apache/iceberg-go/go-cloud/docstore"
+	_ "github.com/apache/iceberg-go/go-cloud/docstore/memdocstore"
+	"github.com/apache/iceberg-go/go-cloud/gcerrors"
+	"github.com/apache/iceberg-go/go-cloud/pubsub"
+	_ "github.com/apache/iceberg-go/go-cloud/pubsub/mempubsub"
 )
 
 // A processor holds the state for processing images.

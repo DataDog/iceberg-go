@@ -32,7 +32,7 @@ import (
 	"github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/suite"
 	"github.com/uptrace/bun/driver/sqliteshim"
-	"gocloud.dev/blob/azureblob"
+	"github.com/apache/iceberg-go/go-cloud/blob/azureblob"
 )
 
 const (

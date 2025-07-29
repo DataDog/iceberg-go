@@ -19,8 +19,8 @@ import (
 	"fmt"
 	"log"
 
-	"gocloud.dev/secrets"
-	_ "gocloud.dev/secrets/localsecrets"
+	"github.com/apache/iceberg-go/go-cloud/secrets"
+	_ "github.com/apache/iceberg-go/go-cloud/secrets/localsecrets"
 )
 
 func Example_openFromURL() {

@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"gocloud.dev/runtimevar"
-	"gocloud.dev/runtimevar/driver"
-	"gocloud.dev/runtimevar/drivertest"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/driver"
+	"github.com/apache/iceberg-go/go-cloud/runtimevar/drivertest"
 )
 
 type harness struct {
