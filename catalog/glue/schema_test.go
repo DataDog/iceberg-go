@@ -20,7 +20,7 @@ package glue
 import (
 	"testing"
 
-	"github.com/apache/iceberg-go"
+	"github.com/DataDog/iceberg-go"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/glue/types"
 	"github.com/stretchr/testify/assert"
