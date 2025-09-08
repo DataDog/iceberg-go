@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
@@ -129,7 +130,12 @@ func createAzureBucket(ctx context.Context, parsed *url.URL, props map[string]st
 		}
 	} else {
 		var err error
-		cred, err := azidentity.NewChainedTokenCredential(nil, nil)
+		managed, err := azidentity.NewManagedIdentityCredential(nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed azidentity.NewManagedIdentityCredential: %w", err)
+		}
+
+		cred, err := azidentity.NewChainedTokenCredential([]azcore.TokenCredential{managed}, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed azidentity.NewChainedTokenCredential: %w", err)
 		}
