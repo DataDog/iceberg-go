@@ -241,6 +241,7 @@ func inferFileIOFromSchema(ctx context.Context, path string, props map[string]st
 		return nil, err
 	}
 	var bucket *blob.Bucket
+	var bucketName string
 
 	switch parsed.Scheme {
 	case "s3", "s3a", "s3n":
@@ -248,14 +249,17 @@ func inferFileIOFromSchema(ctx context.Context, path string, props map[string]st
 		if err != nil {
 			return nil, err
 		}
+		bucketName = parsed.Host
 	case "gs":
 		bucket, err = createGCSBucket(ctx, parsed, props)
 		if err != nil {
 			return nil, err
 		}
+		bucketName = parsed.Host
 	case "mem":
 		// memblob doesn't use the URL host or path
 		bucket = memblob.OpenBucket(nil)
+		bucketName = parsed.Host
 	case "file", "":
 		return LocalFS{}, nil
 	case "abfs", "abfss", "wasb", "wasbs":
@@ -263,11 +267,12 @@ func inferFileIOFromSchema(ctx context.Context, path string, props map[string]st
 		if err != nil {
 			return nil, err
 		}
+		bucketName = parsed.User.Username()
 	default:
 		return nil, fmt.Errorf("IO for file '%s' not implemented", path)
 	}
 
-	return createBlobFS(ctx, bucket, parsed.Host), nil
+	return createBlobFS(ctx, bucket, bucketName), nil
 }
 
 // LoadFS takes a map of properties and an optional URI location
