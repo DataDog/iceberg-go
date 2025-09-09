@@ -24,7 +24,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
@@ -50,11 +49,10 @@ const (
 func extractStorageAccountFromURI(parsed *url.URL) string {
 	hostname := parsed.Hostname()
 
-	if strings.HasSuffix(hostname, ".dfs.core.windows.net") {
-		parts := strings.Split(hostname, ".")
-		if len(parts) > 0 {
-			return parts[0]
-		}
+	// extract the storage account name from the host (remove the domain)
+	parts := strings.Split(hostname, ".")
+	if len(parts) > 0 {
+		return parts[0]
 	}
 
 	return ""
@@ -129,14 +127,9 @@ func createAzureBucket(ctx context.Context, parsed *url.URL, props map[string]st
 		}
 	} else {
 		var err error
-		managed, err := azidentity.NewManagedIdentityCredential(nil)
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed azidentity.NewManagedIdentityCredential: %w", err)
-		}
-
-		cred, err := azidentity.NewChainedTokenCredential([]azcore.TokenCredential{managed}, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed azidentity.NewChainedTokenCredential: %w", err)
+			return nil, fmt.Errorf("failed azidentity.NewDefaultAzureCredential: %w", err)
 		}
 
 		svcURL, err := azureblob.NewServiceURL(&azureblob.ServiceURLOptions{
@@ -148,7 +141,8 @@ func createAzureBucket(ctx context.Context, parsed *url.URL, props map[string]st
 			return nil, err
 		}
 
-		containerURL, err := url.JoinPath(string(svcURL), parsed.Host)
+		containerName := parsed.User.Username()
+		containerURL, err := url.JoinPath(string(svcURL), containerName)
 		if err != nil {
 			return nil, err
 		}
