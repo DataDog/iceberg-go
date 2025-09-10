@@ -267,7 +267,8 @@ func inferFileIOFromSchema(ctx context.Context, path string, props map[string]st
 		if err != nil {
 			return nil, err
 		}
-		bucketName = parsed.User.Username()
+		storageAccount := parsed.Host
+		bucketName = parsed.User.Username() + "@" + storageAccount
 	default:
 		return nil, fmt.Errorf("IO for file '%s' not implemented", path)
 	}
