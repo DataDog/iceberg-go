@@ -27,8 +27,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/azureblob"
+	"github.com/DataDog/iceberg-go/go-cloud/blob"
+	"github.com/DataDog/iceberg-go/go-cloud/blob/azureblob"
 )
 
 // Constants for Azure configuration options
