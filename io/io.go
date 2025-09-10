@@ -268,7 +268,8 @@ func inferFileIOFromSchema(ctx context.Context, path string, props map[string]st
 			return nil, err
 		}
 		// For Azure, the container name is not in the Host
-		bucketName = getContainerNameFromURI(parsed)
+		storageAccount := parsed.Host
+		bucketName = getContainerNameFromURI(parsed) + "@" + storageAccount
 	default:
 		return nil, fmt.Errorf("IO for file '%s' not implemented", path)
 	}
