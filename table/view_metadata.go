@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DataDog/iceberg-go"
@@ -41,6 +42,8 @@ const (
 
 const (
 	supportedViewFormatVersion = 1
+	viewEngineProperty         = "engine-name"
+	defaultViewEngine          = "iceberg-go"
 )
 
 // ViewMetadata for an iceberg view as specified in the Iceberg spec
@@ -60,7 +63,7 @@ type ViewMetadata interface {
 	// CurrentVersionID returns the ID of the current version of the view (version-id)
 	CurrentVersionID() int
 	// CurrentVersion returns the current version of the view
-	CurrentVersion() *Version
+	CurrentVersion() *ViewVersion
 	// CurrentSchemaID returns the ID of the current schema
 	CurrentSchemaID() int
 	// CurrentSchema returns the current schema of the view
@@ -68,7 +71,7 @@ type ViewMetadata interface {
 	// SchemasByID returns a map of schema IDs to schemas
 	SchemasByID() map[int]*iceberg.Schema
 	// Versions returns the list of view versions
-	Versions() []*Version
+	Versions() []*ViewVersion
 	// VersionLog returns a list of version log entries
 	// with the timestamp and version-id for every change to current-version-id
 	VersionLog() []VersionHistoryEntry
@@ -81,9 +84,9 @@ type ViewMetadata interface {
 // VersionSummary is string to string map of summary metadata about a view's version
 type VersionSummary map[string]string
 
-// Representation is a struct containing information about a view's representation
+// ViewRepresentation is a struct containing information about a view's representation
 // https://iceberg.apache.org/view-spec/#sql-representation
-type Representation struct {
+type ViewRepresentation struct {
 	// Must be sql
 	Type string `json:"type"`
 	// A SQL SELECT statement
@@ -92,7 +95,15 @@ type Representation struct {
 	Dialect string `json:"dialect"`
 }
 
-type Version struct {
+func NewViewRepresentation(sql string, dialect string) ViewRepresentation {
+	return ViewRepresentation{
+		Type:    "sql",
+		Sql:     sql,
+		Dialect: dialect,
+	}
+}
+
+type ViewVersion struct {
 	// ID for the version
 	VersionID int `json:"version-id"`
 	// ID of the schema for the view version
@@ -102,18 +113,70 @@ type Version struct {
 	// A string to string map of summary metadata about the version
 	Summary VersionSummary `json:"summary"`
 	// A list of representations for the view definition
-	Representations []Representation `json:"representations"`
+	Representations []ViewRepresentation `json:"representations"`
+	// The default view namespace (as a list of strings)
+	DefaultNamespace Identifier `json:"default-namespace"`
+	// An (optional) default catalog name for querying the view
+	DefaultCatalog string `json:"default-catalog,omitempty"`
+}
+
+type ViewVersionOpt func(*ViewVersion)
+
+func WithVersionSummary(summary VersionSummary) ViewVersionOpt {
+	return func(v *ViewVersion) {
+		if v.Summary == nil {
+			v.Summary = summary
+		} else {
+			maps.Copy(v.Summary, summary)
+		}
+	}
+}
+
+func WithDefaultViewCatalog(catalogName string) func(*ViewVersion) {
+	return func(version *ViewVersion) {
+		version.DefaultCatalog = catalogName
+	}
+}
+
+// NewViewVersion creates a ViewVersion instance from the provided parameters.
+// If building updates using the ViewMetadataBuilder, and one desires to use the last
+// added schema ID, one should use the LastAddedID constant as the provided schemaID
+func NewViewVersion(id int, schemaID int, representations []ViewRepresentation, defaultNamespace Identifier, opts ...ViewVersionOpt) (*ViewVersion, error) {
+	if id < 1 {
+		return nil, errors.New("id should be greater than 0")
+	}
+
+	if len(representations) == 0 {
+		return nil, errors.New("invalid view version: must have at least one representation")
+	}
+
+	version := &ViewVersion{
+		VersionID:        id,
+		SchemaID:         schemaID,
+		Representations:  representations,
+		Summary:          VersionSummary{viewEngineProperty: defaultViewEngine},
+		TimestampMS:      time.Now().UnixMilli(),
+		DefaultNamespace: defaultNamespace,
+	}
+
+	for _, opt := range opts {
+		opt(version)
+	}
+
+	return version, nil
 }
 
 // Equals checks whether the other Version would behave the same
 // while ignoring the view version id, and the creation timestamp
-func (v *Version) Equals(other *Version) bool {
+func (v *ViewVersion) Equals(other *ViewVersion) bool {
 	return v.SchemaID == other.SchemaID &&
+		v.DefaultCatalog == other.DefaultCatalog &&
+		slices.Equal(v.DefaultNamespace, other.DefaultNamespace) &&
 		maps.Equal(v.Summary, other.Summary) &&
 		slices.Equal(v.Representations, other.Representations)
 }
 
-func (v *Version) Clone() *Version {
+func (v *ViewVersion) Clone() *ViewVersion {
 	if v == nil {
 		return nil
 	}
@@ -133,20 +196,20 @@ type VersionHistoryEntry struct {
 
 type ViewMetadataBuilder struct {
 	base    ViewMetadata
-	updates []ViewUpdate
+	updates ViewUpdates
 
 	// common fields
 	formatVersion    int
 	uuid             uuid.UUID
 	loc              string
 	schemaList       []*iceberg.Schema
-	versionList      []*Version
+	versionList      []*ViewVersion
 	currentVersionID int
 	versionLog       []VersionHistoryEntry
 	props            iceberg.Properties
 
 	// lookup maps
-	versionsById map[int]*Version
+	versionsById map[int]*ViewVersion
 	schemasById  map[int]*iceberg.Schema
 
 	// update tracking
@@ -157,11 +220,13 @@ type ViewMetadataBuilder struct {
 
 func NewViewMetadataBuilder() (*ViewMetadataBuilder, error) {
 	return &ViewMetadataBuilder{
-		updates:     make([]ViewUpdate, 0),
-		schemaList:  make([]*iceberg.Schema, 0),
-		versionList: make([]*Version, 0),
-		versionLog:  make([]VersionHistoryEntry, 0),
-		props:       make(iceberg.Properties),
+		updates:      make([]ViewUpdate, 0),
+		schemaList:   make([]*iceberg.Schema, 0),
+		versionList:  make([]*ViewVersion, 0),
+		versionLog:   make([]VersionHistoryEntry, 0),
+		props:        make(iceberg.Properties),
+		versionsById: make(map[int]*ViewVersion),
+		schemasById:  make(map[int]*iceberg.Schema),
 	}, nil
 }
 
@@ -180,7 +245,7 @@ func ViewMetadataBuilderFromBase(metadata ViewMetadata) (*ViewMetadataBuilder, e
 	b.props = maps.Clone(metadata.Properties())
 
 	// Build lookup maps
-	b.versionsById = indexBy(b.versionList, func(vl *Version) int { return vl.VersionID })
+	b.versionsById = indexBy(b.versionList, func(vl *ViewVersion) int { return vl.VersionID })
 	b.schemasById = indexBy(b.schemaList, func(sc *iceberg.Schema) int { return sc.ID })
 
 	return b, nil
@@ -188,7 +253,7 @@ func ViewMetadataBuilderFromBase(metadata ViewMetadata) (*ViewMetadataBuilder, e
 
 func (b *ViewMetadataBuilder) HasChanges() bool { return len(b.updates) > 0 }
 
-func (b *ViewMetadataBuilder) CurrentVersion() *Version {
+func (b *ViewMetadataBuilder) CurrentVersion() *ViewVersion {
 	v, _ := b.GetVersionByID(b.currentVersionID)
 
 	return v
@@ -200,7 +265,7 @@ func (b *ViewMetadataBuilder) CurrentSchema() *iceberg.Schema {
 	return s
 }
 
-func (b *ViewMetadataBuilder) SetCurrentVersion(version *Version, schema *iceberg.Schema) (*ViewMetadataBuilder, error) {
+func (b *ViewMetadataBuilder) SetCurrentVersion(version *ViewVersion, schema *iceberg.Schema) (*ViewMetadataBuilder, error) {
 	newSchemaID, err := b.addSchema(schema)
 	if err != nil {
 		return nil, err
@@ -216,12 +281,12 @@ func (b *ViewMetadataBuilder) SetCurrentVersion(version *Version, schema *iceber
 	return b.SetCurrentVersionID(newVersionID)
 }
 
-func (b *ViewMetadataBuilder) AddVersion(newVersion *Version) (*ViewMetadataBuilder, error) {
+func (b *ViewMetadataBuilder) AddVersion(newVersion *ViewVersion) (*ViewMetadataBuilder, error) {
 	_, err := b.addVersion(newVersion)
 	return b, err
 }
 
-func (b *ViewMetadataBuilder) addVersion(newVersion *Version) (int, error) {
+func (b *ViewMetadataBuilder) addVersion(newVersion *ViewVersion) (int, error) {
 	newVersionID := b.reuseOrCreateNewVersionID(newVersion)
 	version := newVersion.Clone()
 	if newVersionID != version.VersionID {
@@ -280,26 +345,28 @@ func (b *ViewMetadataBuilder) addVersion(newVersion *Version) (int, error) {
 
 func (b *ViewMetadataBuilder) AddSchema(schema *iceberg.Schema) (*ViewMetadataBuilder, error) {
 	_, err := b.addSchema(schema)
-	return nil, err
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (b *ViewMetadataBuilder) addSchema(schema *iceberg.Schema) (int, error) {
 	newSchemaID := b.reuseOrCreateNewSchemaID(schema)
 
 	if _, ok := b.schemasById[newSchemaID]; ok {
-		if b.lastAddedSchemaID == nil || *b.lastAddedSchemaID != newSchemaID {
-			b.updates = append(b.updates, NewAddSchemaUpdate(schema))
-			b.lastAddedSchemaID = &newSchemaID
-		}
-
 		return newSchemaID, nil
 	}
 
-	schema.ID = newSchemaID
+	newSchema := schema
+	// Build a fresh schema if we reset the ID
+	if schema.ID != newSchemaID {
+		newSchema = iceberg.NewSchemaWithIdentifiers(newSchemaID, schema.IdentifierFieldIDs, schema.Fields()...)
+	}
 
-	b.schemaList = append(b.schemaList, schema)
-	b.schemasById[newSchemaID] = schema
-	b.updates = append(b.updates, NewAddSchemaUpdate(schema))
+	b.schemaList = append(b.schemaList, newSchema)
+	b.schemasById[newSchemaID] = newSchema
+	b.updates = append(b.updates, NewAddSchemaUpdate(newSchema))
 	b.lastAddedSchemaID = &newSchemaID
 
 	return newSchemaID, nil
@@ -416,6 +483,8 @@ func (b *ViewMetadataBuilder) SetUUID(uuid uuid.UUID) (*ViewMetadataBuilder, err
 	return b, nil
 }
 
+func (b *ViewMetadataBuilder) Updates() ViewUpdates { return b.updates }
+
 func (b *ViewMetadataBuilder) buildCommonViewMetadata() (*commonViewMetadata, error) {
 	md := &commonViewMetadata{
 		FormatVersionValue:    b.formatVersion,
@@ -432,7 +501,7 @@ func (b *ViewMetadataBuilder) buildCommonViewMetadata() (*commonViewMetadata, er
 	return md, nil
 }
 
-func (b *ViewMetadataBuilder) GetVersionByID(id int) (*Version, error) {
+func (b *ViewMetadataBuilder) GetVersionByID(id int) (*ViewVersion, error) {
 	if v, ok := b.versionsById[id]; ok {
 		return v, nil
 	}
@@ -468,7 +537,7 @@ func (b *ViewMetadataBuilder) Build() (ViewMetadata, error) {
 	}, nil
 }
 
-func (b *ViewMetadataBuilder) reuseOrCreateNewVersionID(newVersion *Version) int {
+func (b *ViewMetadataBuilder) reuseOrCreateNewVersionID(newVersion *ViewVersion) int {
 	newVersionID := newVersion.VersionID
 	for _, version := range b.versionList {
 		if newVersion.Equals(version) {
@@ -484,6 +553,7 @@ func (b *ViewMetadataBuilder) reuseOrCreateNewVersionID(newVersion *Version) int
 
 func (b *ViewMetadataBuilder) reuseOrCreateNewSchemaID(newSchema *iceberg.Schema) int {
 	newSchemaID := newSchema.ID
+	// if the schema already exists, use its id; otherwise use the highest id + 1
 	for _, schema := range b.schemaList {
 		if newSchema.Equals(schema) {
 			return schema.ID
@@ -565,14 +635,14 @@ type commonViewMetadata struct {
 	UUID                  uuid.UUID             `json:"view-uuid"`
 	Loc                   string                `json:"location"`
 	CurrentVersionIDValue int                   `json:"current-version-id"`
-	VersionList           []*Version            `json:"versions"`
+	VersionList           []*ViewVersion        `json:"versions"`
 	SchemaList            []*iceberg.Schema     `json:"schemas"`
 	VersionHistoryList    []VersionHistoryEntry `json:"version-log"`
 	Props                 iceberg.Properties    `json:"properties,omitempty"`
 
 	// cached lookup helpers, must be initialized in init()
-	versionsByID map[int]*Version
-	schemasByID  map[int]*iceberg.Schema
+	lazyVersionsByID func() map[int]*ViewVersion
+	lazySchemasByID  func() map[int]*iceberg.Schema
 }
 
 func (c *commonViewMetadata) Equals(other *commonViewMetadata) bool {
@@ -593,17 +663,19 @@ func (c *commonViewMetadata) Equals(other *commonViewMetadata) bool {
 
 }
 
-func (c *commonViewMetadata) FormatVersion() int                   { return c.FormatVersionValue }
-func (c *commonViewMetadata) ViewUUID() uuid.UUID                  { return c.UUID }
-func (c *commonViewMetadata) Location() string                     { return c.Loc }
-func (c *commonViewMetadata) Versions() []*Version                 { return c.VersionList }
-func (c *commonViewMetadata) Schemas() []*iceberg.Schema           { return c.SchemaList }
-func (c *commonViewMetadata) SchemasByID() map[int]*iceberg.Schema { return maps.Clone(c.schemasByID) }
+func (c *commonViewMetadata) FormatVersion() int         { return c.FormatVersionValue }
+func (c *commonViewMetadata) ViewUUID() uuid.UUID        { return c.UUID }
+func (c *commonViewMetadata) Location() string           { return c.Loc }
+func (c *commonViewMetadata) Versions() []*ViewVersion   { return c.VersionList }
+func (c *commonViewMetadata) Schemas() []*iceberg.Schema { return c.SchemaList }
+func (c *commonViewMetadata) SchemasByID() map[int]*iceberg.Schema {
+	return maps.Clone(c.lazySchemasByID())
+}
 func (c *commonViewMetadata) CurrentVersionID() int {
 	return c.CurrentVersionIDValue
 }
-func (c *commonViewMetadata) CurrentVersion() *Version {
-	version, ok := c.versionsByID[c.CurrentVersionIDValue]
+func (c *commonViewMetadata) CurrentVersion() *ViewVersion {
+	version, ok := c.lazyVersionsByID()[c.CurrentVersionIDValue]
 	if !ok {
 		panic("current version not found")
 	}
@@ -613,7 +685,7 @@ func (c *commonViewMetadata) CurrentSchemaID() int {
 	return c.CurrentVersion().SchemaID
 }
 func (c *commonViewMetadata) CurrentSchema() *iceberg.Schema {
-	schema, ok := c.schemasByID[c.CurrentSchemaID()]
+	schema, ok := c.lazySchemasByID()[c.CurrentSchemaID()]
 	if !ok {
 		panic("current schema not found")
 	}
@@ -644,8 +716,12 @@ func (c *commonViewMetadata) validate() error {
 // It should be called on a new commonViewMetadata instance before returning
 // to a caller.
 func (c *commonViewMetadata) init() {
-	c.versionsByID = indexBy(c.VersionList, func(v *Version) int { return v.VersionID })
-	c.schemasByID = indexBy(c.SchemaList, func(v *iceberg.Schema) int { return v.ID })
+	c.lazyVersionsByID = sync.OnceValue(func() map[int]*ViewVersion {
+		return indexBy(c.VersionList, func(v *ViewVersion) int { return v.VersionID })
+	})
+	c.lazySchemasByID = sync.OnceValue(func() map[int]*iceberg.Schema {
+		return indexBy(c.SchemaList, func(v *iceberg.Schema) int { return v.ID })
+	})
 }
 
 type viewMetadataV1 struct {

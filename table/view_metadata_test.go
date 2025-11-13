@@ -30,18 +30,18 @@ func TestCloneSlice(t *testing.T) {
 // Test the Equals method on the Version struct
 func TestVersionEquals(t *testing.T) {
 	summary := VersionSummary{"foo.bar": "foobar"}
-	representations := []Representation{
+	representations := []ViewRepresentation{
 		{"sql", "SELECT * FROM my.table", "spark"},
 		{"sql", "SELECT * FROM my.table", "trino"},
 	}
-	v1 := &Version{
+	v1 := &ViewVersion{
 		VersionID:       1,
 		SchemaID:        1,
 		TimestampMS:     0,
 		Summary:         summary,
 		Representations: representations,
 	}
-	v2 := &Version{
+	v2 := &ViewVersion{
 		VersionID:       1,
 		SchemaID:        1,
 		TimestampMS:     0,

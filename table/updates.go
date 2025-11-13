@@ -692,13 +692,13 @@ func (u *removeSchemasUpdate) Apply(builder *MetadataBuilder) error {
 
 type addViewVersionUpdate struct {
 	baseViewUpdate
-	Version *Version `json:"version"`
+	Version *ViewVersion `json:"view-version"`
 }
 
 // NewAddViewVersionUpdate creates a new ViewUpdate that adds a version to a view
-func NewAddViewVersionUpdate(version *Version) *addViewVersionUpdate {
+func NewAddViewVersionUpdate(version *ViewVersion) *addViewVersionUpdate {
 	return &addViewVersionUpdate{
-		baseViewUpdate: baseViewUpdate{ActionName: UpdateRemoveSchemas},
+		baseViewUpdate: baseViewUpdate{ActionName: UpdateAddViewVersion},
 		Version:        version,
 	}
 }

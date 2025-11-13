@@ -40,11 +40,11 @@ func (t View) Equals(other View) bool {
 func (t View) Identifier() Identifier           { return t.identifier }
 func (t View) Metadata() ViewMetadata           { return t.metadata }
 func (t View) MetadataLocation() string         { return t.metadataLocation }
-func (t View) CurrentVersion() *Version         { return t.metadata.CurrentVersion() }
+func (t View) CurrentVersion() *ViewVersion     { return t.metadata.CurrentVersion() }
 func (t View) CurrentSchema() *iceberg.Schema   { return t.metadata.CurrentSchema() }
 func (t View) Properties() iceberg.Properties   { return t.metadata.Properties() }
 func (t View) Location() string                 { return t.metadata.Location() }
-func (t View) Versions() []*Version             { return t.metadata.Versions() }
+func (t View) Versions() []*ViewVersion         { return t.metadata.Versions() }
 func (t View) Schemas() map[int]*iceberg.Schema { return t.metadata.SchemasByID() }
 
 func NewView(ident Identifier, meta ViewMetadata, metadataLocation string) *View {
