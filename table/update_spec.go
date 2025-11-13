@@ -150,7 +150,7 @@ func (us *UpdateSpec) Apply() iceberg.PartitionSpec {
 				return iceberg.PartitionSpec{}
 			}
 			partitionFields = append(partitionFields, newField)
-		} else if us.txn.tbl.Metadata().Version() == 1 {
+		} else if us.txn.tbl.Metadata().FormatVersion() == 1 {
 			if rename, renamed := us.renames[field.Name]; renamed {
 				newField, err = us.addNewField(us.txn.tbl.Schema(), field.SourceID, field.FieldID, rename, iceberg.VoidTransform{}, partitionNames)
 			} else {
@@ -312,7 +312,7 @@ func (us *UpdateSpec) renameField(name string, newName string) updateSpecOp {
 }
 
 func (us *UpdateSpec) partitionField(key transformKey, name string) (iceberg.PartitionField, error) {
-	if us.txn.tbl.Metadata().Version() == 2 {
+	if us.txn.tbl.Metadata().FormatVersion() == 2 {
 		sourceId, transform := key.SourceId, key.Transform
 		historicalFields := make([]iceberg.PartitionField, 0)
 		for _, spec := range us.txn.tbl.Metadata().PartitionSpecs() {

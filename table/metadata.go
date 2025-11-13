@@ -62,8 +62,8 @@ func generateSnapshotID() int64 {
 //
 // https://iceberg.apache.org/spec/#iceberg-table-spec
 type Metadata interface {
-	// Version indicates the version of this metadata, 1 for V1, 2 for V2, etc.
-	Version() int
+	// FormatVersion indicates the version of this metadata, 1 for V1, 2 for V2, etc.
+	FormatVersion() int
 	// TableUUID returns a UUID that identifies the table, generated when the
 	// table is created. Implementations must throw an exception if a table's
 	// UUID does not match the expected UUID after refreshing metadata.
@@ -184,7 +184,7 @@ func MetadataBuilderFromBase(metadata Metadata) (*MetadataBuilder, error) {
 	b := &MetadataBuilder{}
 	b.base = metadata
 
-	b.formatVersion = metadata.Version()
+	b.formatVersion = metadata.FormatVersion()
 	b.uuid = metadata.TableUUID()
 	b.loc = metadata.Location()
 	b.lastUpdatedMS = metadata.LastUpdatedMillis()
@@ -199,7 +199,7 @@ func MetadataBuilderFromBase(metadata Metadata) (*MetadataBuilder, error) {
 	b.snapshotList = slices.Clone(metadata.Snapshots())
 	b.sortOrderList = slices.Clone(metadata.SortOrders())
 	b.defaultSortOrderID = metadata.DefaultSortOrder()
-	if metadata.Version() > 1 {
+	if metadata.FormatVersion() > 1 {
 		seq := metadata.LastSequenceNumber()
 		b.lastSequenceNumber = &seq
 	}
@@ -656,7 +656,7 @@ func (b *MetadataBuilder) buildCommonMetadata() (*commonMetadata, error) {
 	}
 
 	return &commonMetadata{
-		FormatVersion:      b.formatVersion,
+		FormatVersionValue: b.formatVersion,
 		UUID:               b.uuid,
 		Loc:                b.loc,
 		LastUpdatedMS:      b.lastUpdatedMS,
@@ -870,7 +870,7 @@ func sliceEqualHelper[T interface{ Equals(T) bool }](s1, s2 []T) bool {
 
 // https://iceberg.apache.org/spec/#iceberg-table-spec
 type commonMetadata struct {
-	FormatVersion      int                     `json:"format-version"`
+	FormatVersionValue int                     `json:"format-version"`
 	UUID               uuid.UUID               `json:"table-uuid"`
 	Loc                string                  `json:"location"`
 	LastUpdatedMS      int64                   `json:"last-updated-ms"`
@@ -933,7 +933,7 @@ func (c *commonMetadata) Equals(other *commonMetadata) bool {
 		return false
 	}
 
-	return c.FormatVersion == other.FormatVersion && c.UUID == other.UUID &&
+	return c.FormatVersionValue == other.FormatVersionValue && c.UUID == other.UUID &&
 		((c.LastPartitionID == other.LastPartitionID) || (*c.LastPartitionID == *other.LastPartitionID)) &&
 		((c.CurrentSnapshotID == other.CurrentSnapshotID) || (*c.CurrentSnapshotID == *other.CurrentSnapshotID)) &&
 		c.Loc == other.Loc && c.LastUpdatedMS == other.LastUpdatedMS &&
@@ -1147,7 +1147,7 @@ func (c *commonMetadata) NameMapping() iceberg.NameMapping {
 	return nil
 }
 
-func (c *commonMetadata) Version() int { return c.FormatVersion }
+func (c *commonMetadata) FormatVersion() int { return c.FormatVersionValue }
 
 type metadataV1 struct {
 	Schema    *iceberg.Schema          `json:"schema,omitempty"`
@@ -1220,7 +1220,7 @@ func (m *metadataV1) UnmarshalJSON(b []byte) error {
 
 func (m *metadataV1) ToV2() metadataV2 {
 	commonOut := m.commonMetadata
-	commonOut.FormatVersion = 2
+	commonOut.FormatVersionValue = 2
 	if commonOut.UUID.String() == "" {
 		commonOut.UUID = uuid.New()
 	}
@@ -1312,7 +1312,7 @@ func NewMetadataWithUUID(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, 
 	common := commonMetadata{
 		LastUpdatedMS:      time.Now().UnixMilli(),
 		LastColumnId:       freshSchema.HighestFieldID(),
-		FormatVersion:      formatVersion,
+		FormatVersionValue: formatVersion,
 		UUID:               tableUuid,
 		Loc:                location,
 		SchemaList:         []*iceberg.Schema{freshSchema},

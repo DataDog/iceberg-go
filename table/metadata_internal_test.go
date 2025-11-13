@@ -118,7 +118,7 @@ func TestMetadataV1Parsing(t *testing.T) {
 	require.NotNil(t, meta)
 
 	assert.IsType(t, (*metadataV1)(nil), meta)
-	assert.Equal(t, 1, meta.Version())
+	assert.Equal(t, 1, meta.FormatVersion())
 
 	data := meta.(*metadataV1)
 	assert.Equal(t, uuid.MustParse("d20125c8-7284-442c-9aea-15fee620737c"), meta.TableUUID())
@@ -166,7 +166,7 @@ func TestMetadataV2Parsing(t *testing.T) {
 	require.NotNil(t, meta)
 
 	assert.IsType(t, (*metadataV2)(nil), meta)
-	assert.Equal(t, 2, meta.Version())
+	assert.Equal(t, 2, meta.FormatVersion())
 
 	data := meta.(*metadataV2)
 	assert.Equal(t, uuid.MustParse("9c12d441-03fe-4693-9a96-a0705ddf69c1"), data.UUID)
@@ -593,7 +593,7 @@ func TestNewMetadataWithExplicitV1Format(t *testing.T) {
 			LastPartitionID:    &lastPartitionID,
 			SortOrderList:      []SortOrder{expectedSortOrder},
 			DefaultSortOrderID: 1,
-			FormatVersion:      1,
+			FormatVersionValue: 1,
 		},
 		Schema:    expectedSchema,
 		Partition: slices.Collect(expectedSpec.Fields()),
@@ -657,7 +657,7 @@ func TestNewMetadataV2Format(t *testing.T) {
 			LastPartitionID:    &lastPartitionID,
 			SortOrderList:      []SortOrder{expectedSortOrder},
 			DefaultSortOrderID: 1,
-			FormatVersion:      2,
+			FormatVersionValue: 2,
 		},
 	}
 
@@ -669,7 +669,7 @@ func TestMetadataV1Serialize(t *testing.T) {
 		iceberg.NestedField{ID: 1, Name: "int", Type: iceberg.PrimitiveTypes.Int32})
 	toserialize := &metadataV1{
 		commonMetadata: commonMetadata{
-			FormatVersion:      1,
+			FormatVersionValue: 1,
 			UUID:               uuid.MustParse("dd93fa46-a1a7-43bb-8748-6cc7eff107a3"),
 			Loc:                "s3a://warehouse/iceberg/iceberg-test-2.db/test-table-2",
 			LastUpdatedMS:      1742412491193,
@@ -713,7 +713,7 @@ func TestMetadataV2Serialize(t *testing.T) {
 	toserialize := &metadataV2{
 		LastSeqNum: 1,
 		commonMetadata: commonMetadata{
-			FormatVersion:      1,
+			FormatVersionValue: 1,
 			UUID:               uuid.MustParse("dd93fa46-a1a7-43bb-8748-6cc7eff107a3"),
 			Loc:                "s3a://warehouse/iceberg/iceberg-test-2.db/test-table-2",
 			LastUpdatedMS:      1742412491193,

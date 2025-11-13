@@ -1191,19 +1191,30 @@ type viewResponse struct {
 	MetadataLoc string             `json:"metadata-location"`
 	RawMetadata json.RawMessage    `json:"metadata"`
 	Config      iceberg.Properties `json:"config"`
-	Metadata    table.Metadata     `json:"-"`
+	Metadata    table.ViewMetadata `json:"-"`
+}
+
+func (v *viewResponse) UnmarshalJSON(b []byte) (err error) {
+	type Alias viewResponse
+	if err = json.Unmarshal(b, (*Alias)(v)); err != nil {
+		return err
+	}
+
+	v.Metadata, err = table.ParseViewMetadataBytes(v.RawMetadata)
+
+	return
 }
 
 // CreateView creates a new view in the catalog.
-func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, sql string, props iceberg.Properties) error {
+func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, sql string, props iceberg.Properties) (*table.View, error) {
 	ns, view, err := splitIdentForPath(identifier)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	freshSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	payload := createViewRequest{
@@ -1228,14 +1239,41 @@ func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, s
 		},
 	}
 
-	_, err = doPost[createViewRequest, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views"}, payload,
+	ret, err := doPost[createViewRequest, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views"}, payload,
 		r.cl, map[int]error{
 			http.StatusNotFound: catalog.ErrNoSuchNamespace,
 			http.StatusConflict: catalog.ErrViewAlreadyExists,
 		})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return table.NewView(identifier, ret.Metadata, ret.MetadataLoc), nil
+}
+
+// UpdateView updates a new view in the catalog.
+func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requirements []table.ViewRequirement, updates []table.ViewUpdate) (*table.View, error) {
+	ns, view, err := splitIdentForPath(ident)
+	if err != nil {
+		return nil, err
+	}
+
+	restIdentifier := identifier{
+		Namespace: catalog.NamespaceFromIdent(ident),
+		Name:      view,
+	}
+	type payload struct {
+		Identifier   identifier              `json:"identifier"`
+		Requirements []table.ViewRequirement `json:"requirements"`
+		Updates      []table.ViewUpdate      `json:"updates"`
+	}
+	ret, err := doPost[payload, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", view},
+		payload{Identifier: restIdentifier, Requirements: requirements, Updates: updates}, r.cl,
+		map[int]error{http.StatusNotFound: catalog.ErrNoSuchView, http.StatusConflict: ErrCommitFailed})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return table.NewView(ident, ret.Metadata, ret.MetadataLoc), nil
 }

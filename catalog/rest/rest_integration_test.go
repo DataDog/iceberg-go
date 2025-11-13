@@ -25,14 +25,14 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/catalog/rest"
 	"github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -220,6 +220,35 @@ func (s *RestIntegrationSuite) TestCreateView() {
 
 	s.Require().NoError(s.cat.DropTable(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table")))
 	s.Require().NoError(s.cat.DropView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view")))
+}
+
+func (s *RestIntegrationSuite) TestUpdateView() {
+	s.ensureNamespace()
+
+	const location = "s3://warehouse/iceberg"
+	// create a table first
+	tbl, err := s.cat.CreateTable(s.ctx,
+		catalog.ToIdentifier(TestNamespaceIdent, "test-table"),
+		tableSchemaSimple, catalog.WithProperties(iceberg.Properties{"foobar": "baz"}),
+		catalog.WithLocation(location))
+	s.Require().NoError(err)
+	s.Require().NotNil(tbl)
+
+	s.Equal(location, tbl.Location())
+	s.Equal("baz", tbl.Properties()["foobar"])
+
+	exists, err := s.cat.CheckTableExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-table"))
+	s.Require().NoError(err)
+	s.True(exists)
+
+	// Create a view
+	viewSQL := fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table")
+
+	err = s.cat.CreateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"), tableSchemaSimple, viewSQL, iceberg.Properties{"foobar": "baz"})
+	s.Require().NoError(err)
+
+	err = s.cat.UpdateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"))
+	s.Require().NoError(err)
 }
 
 func (s *RestIntegrationSuite) TestWriteCommitTable() {
