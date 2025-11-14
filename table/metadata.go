@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/DataDog/iceberg-go"
+	iceberginternal "github.com/DataDog/iceberg-go/internal"
 
 	"github.com/google/uuid"
 )
@@ -862,12 +863,6 @@ func ParseMetadataBytes(b []byte) (Metadata, error) {
 	return ret, json.Unmarshal(b, ret)
 }
 
-func sliceEqualHelper[T interface{ Equals(T) bool }](s1, s2 []T) bool {
-	return slices.EqualFunc(s1, s2, func(t1, t2 T) bool {
-		return t1.Equals(t2)
-	})
-}
-
 // https://iceberg.apache.org/spec/#iceberg-table-spec
 type commonMetadata struct {
 	FormatVersionValue int                     `json:"format-version"`
@@ -921,11 +916,11 @@ func (c *commonMetadata) Equals(other *commonMetadata) bool {
 	}
 
 	switch {
-	case !sliceEqualHelper(c.SchemaList, other.SchemaList):
+	case !iceberginternal.SliceEqualHelper(c.SchemaList, other.SchemaList):
 		fallthrough
-	case !sliceEqualHelper(c.SnapshotList, other.SnapshotList):
+	case !iceberginternal.SliceEqualHelper(c.SnapshotList, other.SnapshotList):
 		fallthrough
-	case !sliceEqualHelper(c.Specs, other.Specs):
+	case !iceberginternal.SliceEqualHelper(c.Specs, other.Specs):
 		fallthrough
 	case !maps.Equal(c.Props, other.Props):
 		fallthrough
@@ -940,7 +935,7 @@ func (c *commonMetadata) Equals(other *commonMetadata) bool {
 		c.LastColumnId == other.LastColumnId && c.CurrentSchemaID == other.CurrentSchemaID &&
 		c.DefaultSpecID == other.DefaultSpecID && c.DefaultSortOrderID == other.DefaultSortOrderID &&
 		slices.Equal(c.SnapshotLog, other.SnapshotLog) && slices.Equal(c.MetadataLog, other.MetadataLog) &&
-		sliceEqualHelper(c.SortOrderList, other.SortOrderList)
+		iceberginternal.SliceEqualHelper(c.SortOrderList, other.SortOrderList)
 }
 
 func (c *commonMetadata) TableUUID() uuid.UUID       { return c.UUID }

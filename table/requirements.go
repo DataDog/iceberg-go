@@ -72,6 +72,8 @@ func requirementForType[T Requirement](reqType string) (T, error) {
 		req = &assertCreate{}
 	case reqAssertTableUUID:
 		req = &assertTableUuid{}
+	case reqAssertViewUUID:
+		req = &assertViewUuid{}
 	case reqAssertRefSnapshotID:
 		req = &assertRefSnapshotID{}
 	case reqAssertDefaultSpecID:

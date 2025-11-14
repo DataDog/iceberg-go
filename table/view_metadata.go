@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/DataDog/iceberg-go"
+	iceberginternal "github.com/DataDog/iceberg-go/internal"
 
 	"github.com/google/uuid"
 )
@@ -656,8 +657,8 @@ func (c *commonViewMetadata) Equals(other *commonViewMetadata) bool {
 
 	return c.UUID == other.UUID &&
 		c.FormatVersionValue == other.FormatVersionValue &&
-		sliceEqualHelper(c.SchemaList, other.SchemaList) &&
-		sliceEqualHelper(c.VersionList, other.VersionList) &&
+		iceberginternal.SliceEqualHelper(c.SchemaList, other.SchemaList) &&
+		iceberginternal.SliceEqualHelper(c.VersionList, other.VersionList) &&
 		c.CurrentVersionIDValue == other.CurrentVersionIDValue &&
 		slices.Equal(c.VersionHistoryList, other.VersionHistoryList)
 
