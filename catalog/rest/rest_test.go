@@ -976,6 +976,74 @@ var (
 		iceberg.NestedField{ID: 2, Name: "bar", Type: iceberg.PrimitiveTypes.Int32, Required: true},
 		iceberg.NestedField{ID: 3, Name: "baz", Type: iceberg.PrimitiveTypes.Bool, Required: false},
 	)
+
+	exampleViewMetadataJSON = `{
+		"view-uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+		"format-version": 1,
+		"location": "string",
+		"current-version-id": 0,
+		"versions": [
+		  {
+			"version-id": 0,
+			"timestamp-ms": 0,
+			"schema-id": 0,
+			"summary": {
+			  "additionalProp1": "string",
+			  "additionalProp2": "string",
+			  "additionalProp3": "string"
+			},
+			"representations": [
+			  {
+				"type": "string",
+				"sql": "string",
+				"dialect": "string"
+			  }
+			],
+			"default-catalog": "string",
+			"default-namespace": [
+			  "accounting",
+			  "tax"
+			]
+		  }
+		],
+		"version-log": [
+		  {
+			"version-id": 0,
+			"timestamp-ms": 0
+		  }
+		],
+		"schemas": [
+		  {
+			"type": "struct",
+			"fields": [
+			  {
+				"id": 0,
+				"name": "string",
+				"type": "long",
+				"required": true,
+				"doc": "string",
+				"initial-default": true,
+				"write-default": true
+			  }
+			],
+			"schema-id": 0,
+			"identifier-field-ids": [
+			  0
+			]
+		  }
+		],
+		"properties": {
+		  "additionalProp1": "string",
+		  "additionalProp2": "string",
+		  "additionalProp3": "string"
+		}
+	}`
+
+	createViewRestExample = fmt.Sprintf(`{
+	"metadata-location": "s3://warehouse/database/view/metadata.json",
+	"metadata": %s,
+	"config": {}
+}`, exampleViewMetadataJSON)
 )
 
 func (r *RestCatalogSuite) TestCreateTable200() {
@@ -1003,7 +1071,7 @@ func (r *RestCatalogSuite) TestCreateTable200() {
 
 	r.Equal(catalog.ToIdentifier("fokko", "fokko2"), tbl.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata.json", tbl.MetadataLocation())
-	r.EqualValues(1, tbl.Metadata().Version())
+	r.EqualValues(1, tbl.Metadata().FormatVersion())
 	r.Equal("bf289591-dcc0-4234-ad4f-5c3eed811a29", tbl.Metadata().TableUUID().String())
 	r.EqualValues(1657810967051, tbl.Metadata().LastUpdatedMillis())
 	r.Equal(3, tbl.Metadata().LastColumnID())
@@ -1178,7 +1246,7 @@ func (r *RestCatalogSuite) TestLoadTable200() {
 
 	r.Equal(catalog.ToIdentifier("fokko", "table"), tbl.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata/00001-5f2f8166-244c-4eae-ac36-384ecdec81fc.gz.metadata.json", tbl.MetadataLocation())
-	r.EqualValues(1, tbl.Metadata().Version())
+	r.EqualValues(1, tbl.Metadata().FormatVersion())
 	r.Equal("b55d9dda-6561-423a-8bfc-787980ce421f", tbl.Metadata().TableUUID().String())
 	r.EqualValues(1646787054459, tbl.Metadata().LastUpdatedMillis())
 	r.Equal(2, tbl.Metadata().LastColumnID())
@@ -1262,7 +1330,7 @@ func (r *RestCatalogSuite) TestRenameTable200() {
 
 	r.Equal(catalog.ToIdentifier("fokko", "destination"), renamedTable.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata.json", renamedTable.MetadataLocation())
-	r.EqualValues(1, renamedTable.Metadata().Version())
+	r.EqualValues(1, renamedTable.Metadata().FormatVersion())
 	r.Equal("bf289591-dcc0-4234-ad4f-5c3eed811a29", renamedTable.Metadata().TableUUID().String())
 	r.EqualValues(1657810967051, renamedTable.Metadata().LastUpdatedMillis())
 	r.Equal(3, renamedTable.Metadata().LastColumnID())
@@ -1464,7 +1532,7 @@ func (r *RestCatalogSuite) TestRegisterTable200() {
 
 	r.Equal(catalog.ToIdentifier("fokko", "fokko2"), tbl.Identifier())
 	r.Equal("s3://warehouse/database/table/metadata/00001-5f2f8166-244c-4eae-ac36-384ecdec81fc.gz.metadata.json", tbl.MetadataLocation())
-	r.EqualValues(1, tbl.Metadata().Version())
+	r.EqualValues(1, tbl.Metadata().FormatVersion())
 	r.Equal("d55d9dda-6561-423a-8bfc-787980ce421f", tbl.Metadata().TableUUID().String())
 	r.Equal("bryan", tbl.Metadata().Properties()["owner"])
 }
@@ -1986,6 +2054,7 @@ type createViewRequest struct {
 
 type viewResponse struct {
 	MetadataLoc string             `json:"metadata-location"`
+	Metadata    string             `json:"metadata"`
 	Config      iceberg.Properties `json:"config"`
 }
 
@@ -2000,6 +2069,7 @@ func (r *RestCatalogSuite) TestCreateView200() {
 		Required: true,
 	})
 	sql := "SELECT * FROM table"
+	reprs := []table.ViewRepresentation{table.NewViewRepresentation(sql, "default")}
 	viewVersionJSON, _ := json.Marshal(map[string]interface{}{
 		"version-id":   1,
 		"timestamp-ms": time.Now().UnixMilli(),
@@ -2026,7 +2096,6 @@ func (r *RestCatalogSuite) TestCreateView200() {
 		err := json.NewDecoder(req.Body).Decode(&payload)
 		r.NoError(err)
 		r.Equal(view, payload.Name)
-		r.Equal(sql, payload.SQL)
 		r.Equal(schema.ID, payload.Schema.ID)
 		r.Equal(1, payload.ViewVersion.VersionID)
 		r.Equal(0, payload.ViewVersion.SchemaID)
@@ -2038,16 +2107,13 @@ func (r *RestCatalogSuite) TestCreateView200() {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(viewResponse{
-			MetadataLoc: "metadata-location",
-			Config:      iceberg.Properties{},
-		})
+		w.Write([]byte(createViewRestExample))
 	})
 
 	ctlg, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL)
 	r.NoError(err)
 
-	err = ctlg.CreateView(context.Background(), identifier, schema, sql, props)
+	_, err = ctlg.CreateView(context.Background(), identifier, schema, reprs, props)
 	r.NoError(err)
 }
 
@@ -2062,6 +2128,7 @@ func (r *RestCatalogSuite) TestCreateView409() {
 		Required: true,
 	})
 	sql := "SELECT * FROM table"
+	reprs := []table.ViewRepresentation{table.NewViewRepresentation(sql, "default")}
 
 	r.mux.HandleFunc("/v1/namespaces/"+ns+"/views", func(w http.ResponseWriter, req *http.Request) {
 		r.Equal(http.MethodPost, req.Method)
@@ -2077,7 +2144,7 @@ func (r *RestCatalogSuite) TestCreateView409() {
 	ctlg, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL)
 	r.NoError(err)
 
-	err = ctlg.CreateView(context.Background(), identifier, schema, sql, nil)
+	_, err = ctlg.CreateView(context.Background(), identifier, schema, reprs, nil)
 	r.Error(err)
 	r.ErrorIs(err, catalog.ErrViewAlreadyExists)
 }
@@ -2093,6 +2160,9 @@ func (r *RestCatalogSuite) TestCreateView404() {
 		Required: true,
 	})
 	sql := "SELECT * FROM table"
+	reprs := []table.ViewRepresentation{
+		table.NewViewRepresentation(sql, "spark"),
+	}
 
 	r.mux.HandleFunc("/v1/namespaces/"+ns+"/views", func(w http.ResponseWriter, req *http.Request) {
 		r.Equal(http.MethodPost, req.Method)
@@ -2108,7 +2178,7 @@ func (r *RestCatalogSuite) TestCreateView404() {
 	ctlg, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL)
 	r.NoError(err)
 
-	err = ctlg.CreateView(context.Background(), identifier, schema, sql, nil)
+	_, err = ctlg.CreateView(context.Background(), identifier, schema, reprs, nil)
 	r.Error(err)
 	r.ErrorIs(err, catalog.ErrNoSuchNamespace)
 }

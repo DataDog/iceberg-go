@@ -29,6 +29,7 @@ import (
 const (
 	reqAssertCreate                  = "assert-create"
 	reqAssertTableUUID               = "assert-table-uuid"
+	reqAssertViewUUID                = "assert-view-uuid"
 	reqAssertRefSnapshotID           = "assert-ref-snapshot-id"
 	reqAssertDefaultSpecID           = "assert-default-spec-id"
 	reqAssertCurrentSchemaID         = "assert-current-schema-id"
@@ -48,9 +49,57 @@ type Requirement interface {
 	GetType() string
 }
 
-type Requirements []Requirement
+// A ViewRequirement is a validation rule that must be satisfied before attempting to
+// make and commit changes to a view. Requirements are used to ensure that the
+// view is in a valid state before making changes.
+type ViewRequirement interface {
+	Requirement
+	ValidateView(ViewMetadata) error
+}
 
-func (r *Requirements) UnmarshalJSON(data []byte) error {
+type Requirements []Requirement
+type ViewRequirements []ViewRequirement
+
+// requirementForType returns an instance of a requirement corresponding to a given type
+// should be concretized with Requirement | ViewRequirement
+// This function will return an error if the type does not implement T
+func requirementForType[T Requirement](reqType string) (T, error) {
+	var zero T
+
+	var req Requirement
+	switch reqType {
+	case reqAssertCreate:
+		req = &assertCreate{}
+	case reqAssertTableUUID:
+		req = &assertTableUuid{}
+	case reqAssertViewUUID:
+		req = &assertViewUuid{}
+	case reqAssertRefSnapshotID:
+		req = &assertRefSnapshotID{}
+	case reqAssertDefaultSpecID:
+		req = &assertDefaultSpecId{}
+	case reqAssertCurrentSchemaID:
+		req = &assertCurrentSchemaId{}
+	case reqAssertDefaultSortOrderID:
+		req = &assertDefaultSortOrderId{}
+	case reqAssertLastAssignedFieldID:
+		req = &assertLastAssignedFieldId{}
+	case reqAssertLastAssignedPartitionID:
+		req = &assertLastAssignedPartitionId{}
+	default:
+		return zero, fmt.Errorf("unknown requirement type: %s", reqType)
+	}
+
+	concreteReq, ok := req.(T)
+	if !ok {
+		return zero, fmt.Errorf("unknown requirement type: %s", reqType)
+	}
+
+	return concreteReq, nil
+}
+
+// unmarshalRequirementJSON unmarshals the given bytes into a slice of requirements in place
+func unmarshalRequirementJSON[R Requirement, S ~[]R](requirements *S, data []byte) error {
 	var rawRequirements []json.RawMessage
 	if err := json.Unmarshal(data, &rawRequirements); err != nil {
 		return err
@@ -62,35 +111,30 @@ func (r *Requirements) UnmarshalJSON(data []byte) error {
 			return err
 		}
 
-		var req Requirement
-		switch base.Type {
-		case reqAssertCreate:
-			req = &assertCreate{}
-		case reqAssertTableUUID:
-			req = &assertTableUuid{}
-		case reqAssertRefSnapshotID:
-			req = &assertRefSnapshotID{}
-		case reqAssertDefaultSpecID:
-			req = &assertDefaultSpecId{}
-		case reqAssertCurrentSchemaID:
-			req = &assertCurrentSchemaId{}
-		case reqAssertDefaultSortOrderID:
-			req = &assertDefaultSortOrderId{}
-		case reqAssertLastAssignedFieldID:
-			req = &assertLastAssignedFieldId{}
-		case reqAssertLastAssignedPartitionID:
-			req = &assertLastAssignedPartitionId{}
-		default:
-			return fmt.Errorf("unknown requirement type: %s", base.Type)
+		req, err := requirementForType[R](base.Type)
+		if err != nil {
+			return err
 		}
 
 		if err := json.Unmarshal(raw, req); err != nil {
 			return err
 		}
-		*r = append(*r, req)
+		*requirements = append(*requirements, req)
 	}
 
 	return nil
+}
+
+func (u *Requirements) UnmarshalJSON(data []byte) error {
+	err := unmarshalRequirementJSON[Requirement, Requirements](u, data)
+
+	return err
+}
+
+func (u *ViewRequirements) UnmarshalJSON(data []byte) error {
+	err := unmarshalRequirementJSON[ViewRequirement, ViewRequirements](u, data)
+
+	return err
 }
 
 // baseRequirement is a common struct that all requirements embed. It is used to
@@ -100,6 +144,20 @@ type baseRequirement struct {
 }
 
 func (b baseRequirement) GetType() string {
+	return b.Type
+}
+
+// baseViewRequirement is a common struct that all view requirements embed. It is used to
+// identify the type of the requirement.
+type baseViewRequirement struct {
+	Type string `json:"type"`
+}
+
+func (b baseViewRequirement) Validate(_ Metadata) error {
+	return errors.New("cannot validate a table")
+}
+
+func (b baseViewRequirement) GetType() string {
 	return b.Type
 }
 
@@ -142,6 +200,31 @@ func (a *assertTableUuid) Validate(meta Metadata) error {
 
 	if meta.TableUUID() != a.UUID {
 		return fmt.Errorf("UUID mismatch: %s != %s", meta.TableUUID(), a.UUID)
+	}
+
+	return nil
+}
+
+type assertViewUuid struct {
+	baseViewRequirement
+	UUID uuid.UUID `json:"uuid"`
+}
+
+// AssertViewUUID creates a requirement that the table UUID matches the given UUID.
+func AssertViewUUID(uuid uuid.UUID) ViewRequirement {
+	return &assertViewUuid{
+		baseViewRequirement: baseViewRequirement{Type: reqAssertViewUUID},
+		UUID:                uuid,
+	}
+}
+
+func (a *assertViewUuid) ValidateView(meta ViewMetadata) error {
+	if meta == nil {
+		return errors.New("requirement failed: current view metadata does not exist")
+	}
+
+	if meta.ViewUUID() != a.UUID {
+		return fmt.Errorf("UUID mismatch: %s != %s", meta.ViewUUID(), a.UUID)
 	}
 
 	return nil
@@ -356,6 +439,14 @@ func ParseRequirementBytes(b []byte) (Requirement, error) {
 		}
 
 		return AssertTableUUID(req.UUID), nil
+
+	case reqAssertViewUUID:
+		var req assertViewUuid
+		if err := json.Unmarshal(b, &req); err != nil {
+			return nil, err
+		}
+
+		return AssertViewUUID(req.UUID), nil
 
 	case reqAssertRefSnapshotID:
 		var req assertRefSnapshotID
