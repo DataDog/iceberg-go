@@ -28,7 +28,7 @@ import (
 
 type View struct {
 	identifier       table.Identifier
-	metadata         ViewMetadata
+	metadata         Metadata
 	metadataLocation string
 }
 
@@ -39,16 +39,16 @@ func (t View) Equals(other View) bool {
 }
 
 func (t View) Identifier() table.Identifier     { return t.identifier }
-func (t View) Metadata() ViewMetadata           { return t.metadata }
+func (t View) Metadata() Metadata               { return t.metadata }
 func (t View) MetadataLocation() string         { return t.metadataLocation }
-func (t View) CurrentVersion() *ViewVersion     { return t.metadata.CurrentVersion() }
+func (t View) CurrentVersion() *Version         { return t.metadata.CurrentVersion() }
 func (t View) CurrentSchema() *iceberg.Schema   { return t.metadata.CurrentSchema() }
 func (t View) Properties() iceberg.Properties   { return t.metadata.Properties() }
 func (t View) Location() string                 { return t.metadata.Location() }
-func (t View) Versions() []*ViewVersion         { return t.metadata.Versions() }
+func (t View) Versions() []*Version             { return t.metadata.Versions() }
 func (t View) Schemas() map[int]*iceberg.Schema { return t.metadata.SchemasByID() }
 
-func NewView(ident table.Identifier, meta ViewMetadata, metadataLocation string) *View {
+func New(ident table.Identifier, meta Metadata, metadataLocation string) *View {
 	return &View{
 		identifier:       ident,
 		metadata:         meta,
@@ -56,13 +56,13 @@ func NewView(ident table.Identifier, meta ViewMetadata, metadataLocation string)
 	}
 }
 
-func NewViewFromLocation(
+func NewFromLocation(
 	ctx context.Context,
 	ident table.Identifier,
 	metalocation string,
 	fsysF table.FSysF,
 ) (*View, error) {
-	var meta ViewMetadata
+	var meta Metadata
 
 	fsys, err := fsysF(ctx)
 	if err != nil {
@@ -74,7 +74,7 @@ func NewViewFromLocation(
 			return nil, err
 		}
 
-		if meta, err = ParseViewMetadataBytes(data); err != nil {
+		if meta, err = ParseMetadataBytes(data); err != nil {
 			return nil, err
 		}
 	} else {
@@ -84,10 +84,10 @@ func NewViewFromLocation(
 		}
 		defer f.Close()
 
-		if meta, err = ParseViewMetadata(f); err != nil {
+		if meta, err = ParseMetadata(f); err != nil {
 			return nil, err
 		}
 	}
 
-	return NewView(ident, meta, metalocation), nil
+	return New(ident, meta, metalocation), nil
 }

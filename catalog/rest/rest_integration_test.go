@@ -30,6 +30,7 @@ import (
 	"github.com/DataDog/iceberg-go/catalog/rest"
 	"github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/view"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
@@ -209,9 +210,9 @@ func (s *RestIntegrationSuite) TestCreateView() {
 	s.True(exists)
 
 	// Create a view
-	viewSQL := fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table")
+	viewRepr := view.NewRepresentation(fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table"), "trino")
 
-	err = s.cat.CreateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"), tableSchemaSimple, viewSQL, iceberg.Properties{"foobar": "baz"})
+	_, err = s.cat.CreateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"), tableSchemaSimple, []view.Representation{viewRepr}, iceberg.Properties{"foobar": "baz"})
 	s.Require().NoError(err)
 
 	exists, err = s.cat.CheckViewExists(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"))
@@ -242,13 +243,14 @@ func (s *RestIntegrationSuite) TestUpdateView() {
 	s.True(exists)
 
 	// Create a view
-	viewSQL := fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table")
+	viewRepr := view.NewRepresentation(fmt.Sprintf("SELECT * FROM  %s.%s", TestNamespaceIdent, "test-table"), "trino")
 
-	err = s.cat.CreateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"), tableSchemaSimple, viewSQL, iceberg.Properties{"foobar": "baz"})
+	_, err = s.cat.CreateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"), tableSchemaSimple, []view.Representation{viewRepr}, iceberg.Properties{"foobar": "baz"})
 	s.Require().NoError(err)
 
-	err = s.cat.UpdateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"))
-	s.Require().NoError(err)
+	s.Require().True(false, "implement me")
+	//_, err = s.cat.UpdateView(s.ctx, catalog.ToIdentifier(TestNamespaceIdent, "test-view"))
+	//s.Require().NoError(err)
 }
 
 func (s *RestIntegrationSuite) TestWriteCommitTable() {

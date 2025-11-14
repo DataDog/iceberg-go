@@ -40,6 +40,7 @@ import (
 	"github.com/DataDog/iceberg-go/catalog"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/view"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -1170,14 +1171,14 @@ type createViewRequest struct {
 	Location    string             `json:"location,omitempty"`
 	Props       iceberg.Properties `json:"properties,omitempty"`
 	SQL         string             `json:"sql"`
-	ViewVersion *table.ViewVersion `json:"view-version"`
+	ViewVersion *view.Version      `json:"view-version"`
 }
 
 type viewResponse struct {
 	MetadataLoc string             `json:"metadata-location"`
 	RawMetadata json.RawMessage    `json:"metadata"`
 	Config      iceberg.Properties `json:"config"`
-	Metadata    table.ViewMetadata `json:"-"`
+	Metadata    view.Metadata      `json:"-"`
 }
 
 func (v *viewResponse) UnmarshalJSON(b []byte) (err error) {
@@ -1186,29 +1187,29 @@ func (v *viewResponse) UnmarshalJSON(b []byte) (err error) {
 		return err
 	}
 
-	v.Metadata, err = table.ParseViewMetadataBytes(v.RawMetadata)
+	v.Metadata, err = view.ParseMetadataBytes(v.RawMetadata)
 
 	return
 }
 
 // LoadView loads a view from the catalog
-func (r *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (*table.View, error) {
-	ns, view, err := splitIdentForPath(identifier)
+func (r *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(identifier)
 	if err != nil {
 		return nil, err
 	}
 
-	ret, err := doGet[viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", view},
+	ret, err := doGet[viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", viewName},
 		r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchView})
 	if err != nil {
 		return nil, err
 	}
 
-	return table.NewView(identifier, ret.Metadata, ret.MetadataLoc), nil
+	return view.New(identifier, ret.Metadata, ret.MetadataLoc), nil
 }
 
 // CreateView creates a new view in the catalog.
-func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, representations []table.ViewRepresentation, props iceberg.Properties, opts ...table.ViewVersionOpt) (*table.View, error) {
+func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, representations []view.Representation, props iceberg.Properties, opts ...view.VersionOpt) (*view.View, error) {
 	ns, viewName, err := splitIdentForPath(identifier)
 	if err != nil {
 		return nil, err
@@ -1220,11 +1221,11 @@ func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, s
 	}
 
 	defaultNS := catalog.NamespaceFromIdent(identifier)
-	version, err := table.NewViewVersion(1,
+	version, err := view.NewVersion(1,
 		freshSchema.ID,
 		representations,
 		defaultNS,
-		append(opts, table.WithDefaultViewCatalog("rest"))...,
+		append(opts, view.WithDefaultViewCatalog("rest"))...,
 	)
 	if err != nil {
 		return nil, err
@@ -1246,26 +1247,26 @@ func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, s
 		return nil, err
 	}
 
-	return table.NewView(identifier, ret.Metadata, ret.MetadataLoc), nil
+	return view.New(identifier, ret.Metadata, ret.MetadataLoc), nil
 }
 
 // UpdateView updates a new view in the catalog.
-func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requirements []table.ViewRequirement, updates []table.ViewUpdate) (*table.View, error) {
-	ns, view, err := splitIdentForPath(ident)
+func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requirements []view.Requirement, updates []view.Update) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(ident)
 	if err != nil {
 		return nil, err
 	}
 
 	restIdentifier := identifier{
 		Namespace: catalog.NamespaceFromIdent(ident),
-		Name:      view,
+		Name:      viewName,
 	}
 	type payload struct {
-		Identifier   identifier              `json:"identifier"`
-		Requirements []table.ViewRequirement `json:"requirements"`
-		Updates      []table.ViewUpdate      `json:"updates"`
+		Identifier   identifier         `json:"identifier"`
+		Requirements []view.Requirement `json:"requirements"`
+		Updates      []view.Update      `json:"updates"`
 	}
-	ret, err := doPost[payload, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", view},
+	ret, err := doPost[payload, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", viewName},
 		payload{Identifier: restIdentifier, Requirements: requirements, Updates: updates}, r.cl,
 		map[int]error{http.StatusNotFound: catalog.ErrNoSuchView, http.StatusConflict: ErrCommitFailed})
 
@@ -1273,5 +1274,5 @@ func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requir
 		return nil, err
 	}
 
-	return table.NewView(ident, ret.Metadata, ret.MetadataLoc), nil
+	return view.New(ident, ret.Metadata, ret.MetadataLoc), nil
 }

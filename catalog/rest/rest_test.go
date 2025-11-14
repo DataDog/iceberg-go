@@ -34,6 +34,7 @@ import (
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/catalog/rest"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/view"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -2060,8 +2061,8 @@ type viewResponse struct {
 
 func (r *RestCatalogSuite) TestCreateView200() {
 	ns := "ns"
-	view := "view"
-	identifier := table.Identifier{ns, view}
+	viewName := "view"
+	identifier := table.Identifier{ns, viewName}
 	schema := iceberg.NewSchema(0, iceberg.NestedField{
 		ID:       1,
 		Name:     "id",
@@ -2069,7 +2070,7 @@ func (r *RestCatalogSuite) TestCreateView200() {
 		Required: true,
 	})
 	sql := "SELECT * FROM table"
-	reprs := []table.ViewRepresentation{table.NewViewRepresentation(sql, "default")}
+	reprs := []view.Representation{view.NewRepresentation(sql, "default")}
 	viewVersionJSON, _ := json.Marshal(map[string]interface{}{
 		"version-id":   1,
 		"timestamp-ms": time.Now().UnixMilli(),
@@ -2095,7 +2096,7 @@ func (r *RestCatalogSuite) TestCreateView200() {
 		var payload createViewRequest
 		err := json.NewDecoder(req.Body).Decode(&payload)
 		r.NoError(err)
-		r.Equal(view, payload.Name)
+		r.Equal(viewName, payload.Name)
 		r.Equal(schema.ID, payload.Schema.ID)
 		r.Equal(1, payload.ViewVersion.VersionID)
 		r.Equal(0, payload.ViewVersion.SchemaID)
@@ -2119,8 +2120,8 @@ func (r *RestCatalogSuite) TestCreateView200() {
 
 func (r *RestCatalogSuite) TestCreateView409() {
 	ns := "ns"
-	view := "view"
-	identifier := table.Identifier{ns, view}
+	viewName := "view"
+	identifier := table.Identifier{ns, viewName}
 	schema := iceberg.NewSchema(1, iceberg.NestedField{
 		ID:       1,
 		Name:     "id",
@@ -2128,7 +2129,7 @@ func (r *RestCatalogSuite) TestCreateView409() {
 		Required: true,
 	})
 	sql := "SELECT * FROM table"
-	reprs := []table.ViewRepresentation{table.NewViewRepresentation(sql, "default")}
+	reprs := []view.Representation{view.NewRepresentation(sql, "default")}
 
 	r.mux.HandleFunc("/v1/namespaces/"+ns+"/views", func(w http.ResponseWriter, req *http.Request) {
 		r.Equal(http.MethodPost, req.Method)
@@ -2151,8 +2152,8 @@ func (r *RestCatalogSuite) TestCreateView409() {
 
 func (r *RestCatalogSuite) TestCreateView404() {
 	ns := "ns"
-	view := "view"
-	identifier := table.Identifier{ns, view}
+	viewName := "view"
+	identifier := table.Identifier{ns, viewName}
 	schema := iceberg.NewSchema(1, iceberg.NestedField{
 		ID:       1,
 		Name:     "id",
@@ -2160,8 +2161,8 @@ func (r *RestCatalogSuite) TestCreateView404() {
 		Required: true,
 	})
 	sql := "SELECT * FROM table"
-	reprs := []table.ViewRepresentation{
-		table.NewViewRepresentation(sql, "spark"),
+	reprs := []view.Representation{
+		view.NewRepresentation(sql, "spark"),
 	}
 
 	r.mux.HandleFunc("/v1/namespaces/"+ns+"/views", func(w http.ResponseWriter, req *http.Request) {

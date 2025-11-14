@@ -52,91 +52,19 @@ const (
 	UpdateUpgradeFormatVersion = "upgrade-format-version"
 )
 
-// View-specific updates
-const (
-	UpdateAddViewVersion        = "add-view-version"
-	UpdateSetCurrentViewVersion = "set-current-view-version"
-)
-
 // Update represents a change to a table's metadata.
 type Update interface {
 	// Action returns the name of the action that the update represents.
 	Action() string
-	// Apply applies the update to the given table metadata builder.
-	Apply(tableBuilder *MetadataBuilder) error
+	// Apply applies the update to the given metadata builder.
+	Apply(*MetadataBuilder) error
 	// PostCommit is called after successful commit of the update
 	PostCommit(context.Context, *Table, *Table) error
 }
 
-// ViewUpdate represents a change to a view's metadata.
-type ViewUpdate interface {
-	Update
-	// ApplyView applies the update to the given table metadata builder.
-	ApplyView(viewBuilder *ViewMetadataBuilder) error
-}
 type Updates []Update
-type ViewUpdates []ViewUpdate
 
-// updateForAction returns an instance of an update struct corresponding to a given action
-// should be concretized with TableUpdate | ViewUpdate
-// This function will return an error if the type does not implement T
-func updateForAction[T Update](action string) (T, error) {
-	var zero T
-
-	var upd Update
-	switch action {
-	case UpdateAssignUUID:
-		upd = &assignUUIDUpdate{}
-	case UpdateUpgradeFormatVersion:
-		upd = &upgradeFormatVersionUpdate{}
-	case UpdateAddSchema:
-		upd = &addSchemaUpdate{}
-	case UpdateSetCurrentSchema:
-		upd = &setCurrentSchemaUpdate{}
-	case UpdateAddSpec:
-		upd = &addPartitionSpecUpdate{}
-	case UpdateSetDefaultSpec:
-		upd = &setDefaultSpecUpdate{}
-	case UpdateAddSortOrder:
-		upd = &addSortOrderUpdate{}
-	case UpdateSetDefaultSortOrder:
-		upd = &setDefaultSortOrderUpdate{}
-	case UpdateAddSnapshot:
-		upd = &addSnapshotUpdate{}
-	case UpdateSetSnapshotRef:
-		upd = &setSnapshotRefUpdate{}
-	case UpdateRemoveSnapshots:
-		upd = &removeSnapshotsUpdate{}
-	case UpdateRemoveSnapshotRef:
-		upd = &removeSnapshotRefUpdate{}
-	case UpdateSetLocation:
-		upd = &setLocationUpdate{}
-	case UpdateSetProperties:
-		upd = &setPropertiesUpdate{}
-	case UpdateRemoveProperties:
-		upd = &removePropertiesUpdate{}
-	case UpdateRemoveSpec:
-		upd = &removeSpecUpdate{}
-	case UpdateRemoveSchemas:
-		upd = &removeSchemasUpdate{}
-	case UpdateAddViewVersion:
-		upd = &addViewVersionUpdate{}
-	case UpdateSetCurrentViewVersion:
-		upd = &setCurrentViewVersionUpdate{}
-	default:
-		return zero, fmt.Errorf("unknown update action: %s", action)
-	}
-
-	concreteUpdate, ok := upd.(T)
-	if !ok {
-		return zero, fmt.Errorf("unknown update action: %s", action)
-	}
-
-	return concreteUpdate, nil
-}
-
-// unmarshalUpdateJSON unmarshals the given bytes into a slice of updates in place
-func unmarshalUpdateJSON[U Update, S ~[]U](updates *S, data []byte) error {
+func (u *Updates) UnmarshalJSON(data []byte) error {
 	var rawUpdates []json.RawMessage
 	if err := json.Unmarshal(data, &rawUpdates); err != nil {
 		return err
@@ -148,30 +76,53 @@ func unmarshalUpdateJSON[U Update, S ~[]U](updates *S, data []byte) error {
 			return err
 		}
 
-		update, err := updateForAction[U](base.ActionName)
-		if err != nil {
-			return err
+		var upd Update
+		switch base.ActionName {
+		case UpdateAssignUUID:
+			upd = &assignUUIDUpdate{}
+		case UpdateUpgradeFormatVersion:
+			upd = &upgradeFormatVersionUpdate{}
+		case UpdateAddSchema:
+			upd = &addSchemaUpdate{}
+		case UpdateSetCurrentSchema:
+			upd = &setCurrentSchemaUpdate{}
+		case UpdateAddSpec:
+			upd = &addPartitionSpecUpdate{}
+		case UpdateSetDefaultSpec:
+			upd = &setDefaultSpecUpdate{}
+		case UpdateAddSortOrder:
+			upd = &addSortOrderUpdate{}
+		case UpdateSetDefaultSortOrder:
+			upd = &setDefaultSortOrderUpdate{}
+		case UpdateAddSnapshot:
+			upd = &addSnapshotUpdate{}
+		case UpdateSetSnapshotRef:
+			upd = &setSnapshotRefUpdate{}
+		case UpdateRemoveSnapshots:
+			upd = &removeSnapshotsUpdate{}
+		case UpdateRemoveSnapshotRef:
+			upd = &removeSnapshotRefUpdate{}
+		case UpdateSetLocation:
+			upd = &setLocationUpdate{}
+		case UpdateSetProperties:
+			upd = &setPropertiesUpdate{}
+		case UpdateRemoveProperties:
+			upd = &removePropertiesUpdate{}
+		case UpdateRemoveSpec:
+			upd = &removeSpecUpdate{}
+		case UpdateRemoveSchemas:
+			upd = &removeSchemasUpdate{}
+		default:
+			return fmt.Errorf("unknown update action: %s", base.ActionName)
 		}
 
-		if err := json.Unmarshal(raw, update); err != nil {
+		if err := json.Unmarshal(raw, upd); err != nil {
 			return err
 		}
-		*updates = append(*updates, update)
+		*u = append(*u, upd)
 	}
 
 	return nil
-}
-
-func (u *Updates) UnmarshalJSON(data []byte) error {
-	err := unmarshalUpdateJSON[Update, Updates](u, data)
-
-	return err
-}
-
-func (u *ViewUpdates) UnmarshalJSON(data []byte) error {
-	err := unmarshalUpdateJSON[ViewUpdate, ViewUpdates](u, data)
-
-	return err
 }
 
 // baseUpdate contains the common fields for all updates. It is used to identify the type
@@ -185,24 +136,6 @@ func (u *baseUpdate) Action() string {
 }
 
 func (u *baseUpdate) PostCommit(_ context.Context, _ *Table, _ *Table) error {
-	return nil
-}
-
-// baseViewUpdate contains the common fields for all view-specific updates.
-// It is used to identify the type of the update.
-type baseViewUpdate struct {
-	ActionName string `json:"action"`
-}
-
-func (u *baseViewUpdate) Action() string {
-	return u.ActionName
-}
-
-func (u *baseViewUpdate) Apply(_ *MetadataBuilder) error {
-	return errors.New("cannot apply update to a table")
-}
-
-func (u *baseViewUpdate) PostCommit(_ context.Context, _ *Table, _ *Table) error {
 	return nil
 }
 
@@ -220,12 +153,6 @@ func NewAssignUUIDUpdate(uuid uuid.UUID) *assignUUIDUpdate {
 }
 
 func (u *assignUUIDUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetUUID(u.UUID)
-
-	return err
-}
-
-func (u *assignUUIDUpdate) ApplyView(builder *ViewMetadataBuilder) error {
 	_, err := builder.SetUUID(u.UUID)
 
 	return err
@@ -251,12 +178,6 @@ func (u *upgradeFormatVersionUpdate) Apply(builder *MetadataBuilder) error {
 	return err
 }
 
-func (u *upgradeFormatVersionUpdate) ApplyView(builder *ViewMetadataBuilder) error {
-	_, err := builder.SetFormatVersion(u.FormatVersion)
-
-	return err
-}
-
 type addSchemaUpdate struct {
 	baseUpdate
 	Schema  *iceberg.Schema `json:"schema"`
@@ -272,12 +193,6 @@ func NewAddSchemaUpdate(schema *iceberg.Schema) *addSchemaUpdate {
 }
 
 func (u *addSchemaUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddSchema(u.Schema)
-
-	return err
-}
-
-func (u *addSchemaUpdate) ApplyView(builder *ViewMetadataBuilder) error {
 	_, err := builder.AddSchema(u.Schema)
 
 	return err
@@ -467,7 +382,7 @@ type setLocationUpdate struct {
 }
 
 // NewSetLocationUpdate creates a new update that sets the location of the table metadata.
-func NewSetLocationUpdate(loc string) *setLocationUpdate {
+func NewSetLocationUpdate(loc string) Update {
 	return &setLocationUpdate{
 		baseUpdate: baseUpdate{ActionName: UpdateSetLocation},
 		Location:   loc,
@@ -475,12 +390,6 @@ func NewSetLocationUpdate(loc string) *setLocationUpdate {
 }
 
 func (u *setLocationUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetLoc(u.Location)
-
-	return err
-}
-
-func (u *setLocationUpdate) ApplyView(builder *ViewMetadataBuilder) error {
 	_, err := builder.SetLoc(u.Location)
 
 	return err
@@ -506,12 +415,6 @@ func (u *setPropertiesUpdate) Apply(builder *MetadataBuilder) error {
 	return err
 }
 
-func (u *setPropertiesUpdate) ApplyView(builder *ViewMetadataBuilder) error {
-	_, err := builder.SetProperties(u.Updates)
-
-	return err
-}
-
 type removePropertiesUpdate struct {
 	baseUpdate
 	Removals []string `json:"removals"`
@@ -528,12 +431,6 @@ func NewRemovePropertiesUpdate(removals []string) *removePropertiesUpdate {
 }
 
 func (u *removePropertiesUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.RemoveProperties(u.Removals)
-
-	return err
-}
-
-func (u *removePropertiesUpdate) ApplyView(builder *ViewMetadataBuilder) error {
 	_, err := builder.RemoveProperties(u.Removals)
 
 	return err
@@ -688,42 +585,4 @@ func NewRemoveSchemasUpdate(schemaIds []int64) *removeSchemasUpdate {
 
 func (u *removeSchemasUpdate) Apply(builder *MetadataBuilder) error {
 	return fmt.Errorf("%w: %s", iceberg.ErrNotImplemented, UpdateRemoveSchemas)
-}
-
-type addViewVersionUpdate struct {
-	baseViewUpdate
-	Version *ViewVersion `json:"view-version"`
-}
-
-// NewAddViewVersionUpdate creates a new ViewUpdate that adds a version to a view
-func NewAddViewVersionUpdate(version *ViewVersion) *addViewVersionUpdate {
-	return &addViewVersionUpdate{
-		baseViewUpdate: baseViewUpdate{ActionName: UpdateAddViewVersion},
-		Version:        version,
-	}
-}
-
-func (u *addViewVersionUpdate) ApplyView(builder *ViewMetadataBuilder) error {
-	_, err := builder.AddVersion(u.Version)
-	return err
-}
-
-type setCurrentViewVersionUpdate struct {
-	baseViewUpdate
-	VersionID int `json:"view-version-id"`
-}
-
-// NewSetCurrentVersionUpdate creates a new ViewUpdate that sets the current version of a view
-// to the given version ID.
-func NewSetCurrentVersionUpdate(id int) *setCurrentViewVersionUpdate {
-	return &setCurrentViewVersionUpdate{
-		baseViewUpdate: baseViewUpdate{ActionName: UpdateSetCurrentViewVersion},
-		VersionID:      id,
-	}
-}
-
-func (u *setCurrentViewVersionUpdate) ApplyView(builder *ViewMetadataBuilder) error {
-	_, err := builder.SetCurrentVersionID(u.VersionID)
-
-	return err
 }
