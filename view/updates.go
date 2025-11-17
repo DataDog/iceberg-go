@@ -128,9 +128,9 @@ func NewAssignUUIDUpdate(uuid uuid.UUID) *assignUUIDUpdate {
 }
 
 func (u *assignUUIDUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetUUID(u.UUID)
+	builder.SetUUID(u.UUID)
 
-	return err
+	return builder.Err()
 }
 
 type upgradeFormatVersionUpdate struct {
@@ -148,9 +148,9 @@ func NewUpgradeFormatVersionUpdate(formatVersion int) *upgradeFormatVersionUpdat
 }
 
 func (u *upgradeFormatVersionUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetFormatVersion(u.FormatVersion)
+	builder.SetFormatVersion(u.FormatVersion)
 
-	return err
+	return builder.Err()
 }
 
 type addSchemaUpdate struct {
@@ -168,9 +168,9 @@ func NewAddSchemaUpdate(schema *iceberg.Schema) *addSchemaUpdate {
 }
 
 func (u *addSchemaUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddSchema(u.Schema)
+	builder.AddSchema(u.Schema)
 
-	return err
+	return builder.Err()
 }
 
 type setLocationUpdate struct {
@@ -187,9 +187,9 @@ func NewSetLocationUpdate(loc string) *setLocationUpdate {
 }
 
 func (u *setLocationUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetLoc(u.Location)
+	builder.SetLoc(u.Location)
 
-	return err
+	return builder.Err()
 }
 
 type setPropertiesUpdate struct {
@@ -207,9 +207,9 @@ func NewSetPropertiesUpdate(updates iceberg.Properties) *setPropertiesUpdate {
 }
 
 func (u *setPropertiesUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetProperties(u.Updates)
+	builder.SetProperties(u.Updates)
 
-	return err
+	return builder.Err()
 }
 
 type removePropertiesUpdate struct {
@@ -228,9 +228,9 @@ func NewRemovePropertiesUpdate(removals []string) *removePropertiesUpdate {
 }
 
 func (u *removePropertiesUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.RemoveProperties(u.Removals)
+	builder.RemoveProperties(u.Removals)
 
-	return err
+	return builder.Err()
 }
 
 type addViewVersionUpdate struct {
@@ -247,8 +247,8 @@ func NewAddViewVersionUpdate(version *Version) *addViewVersionUpdate {
 }
 
 func (u *addViewVersionUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.AddVersion(u.Version)
-	return err
+	builder.AddVersion(u.Version)
+	return builder.Err()
 }
 
 type setCurrentViewVersionUpdate struct {
@@ -266,7 +266,7 @@ func NewSetCurrentVersionUpdate(id int) *setCurrentViewVersionUpdate {
 }
 
 func (u *setCurrentViewVersionUpdate) Apply(builder *MetadataBuilder) error {
-	_, err := builder.SetCurrentVersionID(u.VersionID)
+	builder.SetCurrentVersionID(u.VersionID)
 
-	return err
+	return builder.Err()
 }

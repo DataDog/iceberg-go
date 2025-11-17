@@ -2,6 +2,7 @@ package view
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -12,26 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// buildChainer is a helper for chaining build commands without error handling
-// the build chainer requires that all errors are nil before proceeding.
-type buildChainer struct {
-	*MetadataBuilder
-	t *testing.T
-}
-
-func newCB(t *testing.T) *buildChainer {
-	return &buildChainer{
-		newTestBuilder(),
-		t,
-	}
-}
-
-func (bc *buildChainer) chain(mb *MetadataBuilder, err error) *buildChainer {
-	require.NoError(bc.t, err)
-	bc.MetadataBuilder = mb
-	return bc
-}
 
 func newTestBuilder() *MetadataBuilder {
 	b, _ := NewMetadataBuilder()
@@ -66,6 +47,30 @@ func newTestSchema(schemaID int, optFieldName ...string) *iceberg.Schema {
 	return iceberg.NewSchema(schemaID, iceberg.NestedField{ID: 1, Name: fieldName, Type: iceberg.PrimitiveTypes.Int64})
 }
 
+type clonable struct {
+	foo []int
+	bar int
+}
+
+func (c *clonable) Clone() *clonable {
+	cloned := *c
+	cloned.foo = slices.Clone(c.foo)
+	return &cloned
+}
+
+func mapSlice[T any, V any](s []T, fn func(T) V) []V {
+	mapped := make([]V, len(s))
+	for i, e := range s {
+		mapped[i] = fn(e)
+	}
+
+	return mapped
+}
+
+func stripErr[T any](v T, _ error) T {
+	return v
+}
+
 // Test the Equals method on the Version struct
 func TestVersionEquals(t *testing.T) {
 	summary := VersionSummary{"foo.bar": "foobar"}
@@ -97,88 +102,77 @@ func TestBuild_NullAndMissingFields(t *testing.T) {
 	assert.ErrorContains(t, err, "invalid location")
 
 	// Missing versions
-	builder, err := newTestBuilder().SetLoc("location")
-	require.NoError(t, err)
-	md, err = builder.Build()
+	md, err = newTestBuilder().SetLoc("location").Build()
 	assert.Nil(t, md)
 	assert.ErrorContains(t, err, "invalid view: no versions were added")
 
 	// Attempted setting to missing version ID
-	builder, err = newTestBuilder().SetLoc("location")
-	require.NoError(t, err)
-	_, err = builder.SetCurrentVersionID(1)
-	assert.ErrorContains(t, err, "cannot set current version to unknown version with id")
-	md, err = builder.Build()
-	assert.Nil(t, md)
-	assert.ErrorContains(t, err, "invalid view: no versions were added")
+	md, err = newTestBuilder().SetLoc("location").SetCurrentVersionID(1).Build()
+	assert.ErrorContains(t, err, "cannot set current version to unknown version with id 1")
 
 	// Invalid UUID
-	builder, err = newTestBuilder().SetUUID(uuid.Nil)
+	md, err = newTestBuilder().SetUUID(uuid.Nil).Build()
 	assert.ErrorContains(t, err, "cannot set uuid to null")
 }
 
 func TestSetFormatVersion_Invalid(t *testing.T) {
 	// Downgrade
-	_, err := newTestBuilder().SetFormatVersion(0)
+	_, err := newTestBuilder().SetFormatVersion(0).Build()
 	assert.ErrorContains(t, err, fmt.Sprintf("downgrading format version from %d to %d is not allowed", DefaultViewFormatVersion, 0))
 
 	// Invalid upgrade
-	_, err = newTestBuilder().SetFormatVersion(supportedViewFormatVersion + 1)
+	_, err = newTestBuilder().SetFormatVersion(supportedViewFormatVersion + 1).Build()
 	assert.ErrorContains(t, err, fmt.Sprintf("unsupported format version %d", supportedViewFormatVersion+1))
 }
 
 func TestAddVersion_EmptySchemas(t *testing.T) {
-	_, err := newTestBuilder().AddVersion(newTestVersion(1, 1))
+	_, err := newTestBuilder().AddVersion(newTestVersion(1, 1)).Build()
 	assert.ErrorContains(t, err, "cannot add version with unknown schema")
 }
 
 func TestSetCurrentVersionID_LastAdded(t *testing.T) {
 	testSchemaID := 1
-	bc := newCB(t)
-	builder := bc.
-		chain(bc.SetLoc("location")).
-		chain(bc.AddSchema(newTestSchema(testSchemaID))).
-		chain(bc.AddVersion(newTestVersion(1, LastAddedID))).
-		chain(bc.SetCurrentVersionID(LastAddedID))
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(newTestSchema(testSchemaID)).
+		AddVersion(newTestVersion(1, LastAddedID)).
+		SetCurrentVersionID(LastAddedID).
+		Build()
 
-	md, err := builder.Build()
 	assert.NotNil(t, md)
 	assert.NoError(t, err)
 }
 
 func TestSetCurrentVersionID_Invalid(t *testing.T) {
-	testSchemaID := 1
-	builder, err := newTestBuilder().AddSchema(newTestSchema(testSchemaID))
-	require.NoError(t, err)
-
-	builder, err = builder.AddVersion(newTestVersion(1, testSchemaID))
-	require.NoError(t, err)
-
-	_, err = builder.SetCurrentVersionID(23)
+	_, err := newTestBuilder().
+		AddSchema(newTestSchema(0)).
+		AddVersion(newTestVersion(1, 0)).
+		SetCurrentVersionID(23).
+		Build()
 	assert.ErrorContains(t, err, "cannot set current version to unknown version with id")
 }
 
 func TestAddVersion_InvalidSchemaID(t *testing.T) {
 	testSchemaID := 1
-	builder, err := newTestBuilder().AddSchema(newTestSchema(testSchemaID))
-	require.NoError(t, err)
-
-	builder, err = builder.AddVersion(newTestVersion(1, 23))
+	_, err := newTestBuilder().
+		AddSchema(newTestSchema(testSchemaID)).
+		AddVersion(newTestVersion(1, 23)).
+		Build()
 	assert.ErrorContains(t, err, "cannot add version with unknown schema: 23")
 }
 
 func TestViewVersionHistory_MaintainsCorrectTimeline(t *testing.T) {
-	v1 := newTestVersion(1, 1, WithTimestampMS(1000))
-	v2 := newTestVersion(2, 1, WithTimestampMS(2000))
+	v1 := newTestVersion(1, 0, WithTimestampMS(1000))
+	v2 := newTestVersion(2, 0, WithTimestampMS(2000))
 	v2.Representations[0].Dialect = "differentdialect"
 
-	cb := newCB(t)
 	// Build metadata for version V1 as current
-	viewMD, err := cb.chain(cb.SetLoc("location")).
-		chain(cb.AddSchema(newTestSchema(1))).
-		chain(cb.AddVersion(v1)).
-		chain(cb.AddVersion(v2)).
-		chain(cb.SetCurrentVersionID(1)).
+	viewMD, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(newTestSchema(0)).
+		AddVersion(v1).
+		AddVersion(v2).
+		SetCurrentVersionID(1).
 		Build()
 	require.NoError(t, err)
 
@@ -186,9 +180,7 @@ func TestViewVersionHistory_MaintainsCorrectTimeline(t *testing.T) {
 	builder, err := MetadataBuilderFromBase(viewMD)
 	require.NoError(t, err)
 	timeBeforeAdd := time.Now().UnixMilli()
-	builder, err = builder.SetCurrentVersionID(2)
-	require.NoError(t, err)
-	updatedMD, err := builder.Build()
+	updatedMD, err := builder.SetCurrentVersionID(2).Build()
 	require.NoError(t, err)
 
 	require.Len(t, updatedMD.VersionLog(), 2)
@@ -199,12 +191,11 @@ func TestViewVersionHistory_MaintainsCorrectTimeline(t *testing.T) {
 	assert.GreaterOrEqual(t, updatedMD.VersionLog()[1].TimestampMS, timeBeforeAdd)
 
 	// Add third version and set current version, it should use the latest timestamp
-	v3 := newTestVersion(3, 1, WithTimestampMS(3000))
+	v3 := newTestVersion(3, 0, WithTimestampMS(3000))
 	v3.Representations[0].Dialect = "otherotherdialect"
 	builder, err = MetadataBuilderFromBase(updatedMD)
 	require.NoError(t, err)
-	bc := &buildChainer{builder, t}
-	v3MD, err := bc.chain(builder.AddVersion(v3)).chain(builder.SetCurrentVersionID(3)).Build()
+	v3MD, err := builder.AddVersion(v3).SetCurrentVersionID(3).Build()
 	require.NoError(t, err)
 	// Should have final version history entry with timestamp 3000
 	expectedLog := append(slices.Clone(updatedMD.VersionLog()), VersionHistoryEntry{VersionID: 3, TimestampMS: 3000})
@@ -224,16 +215,16 @@ func TestViewMetadataAndUpdates(t *testing.T) {
 	// Build metadata
 	uuid_ := uuid.New()
 	props := iceberg.Properties{"k1": "v1", "k2": "v2"}
-	cb := newCB(t)
-	md, err := cb.chain(cb.SetUUID(uuid_)).
-		chain(cb.SetLoc("location")).
-		chain(cb.SetProperties(props)).
-		chain(cb.AddSchema(s1)).
-		chain(cb.AddSchema(s2)).
-		chain(cb.AddVersion(v1)).
-		chain(cb.AddVersion(v2)).
-		chain(cb.AddVersion(v3)).
-		chain(cb.SetCurrentVersionID(3)).
+	md, err := newTestBuilder().
+		SetUUID(uuid_).
+		SetLoc("location").
+		SetProperties(props).
+		AddSchema(s1).
+		AddSchema(s2).
+		AddVersion(v1).
+		AddVersion(v2).
+		AddVersion(v3).
+		SetCurrentVersionID(3).
 		Build()
 	require.NoError(t, err)
 
@@ -267,12 +258,12 @@ func TestViewMetadataAndUpdates(t *testing.T) {
 
 func TestSetUUID(t *testing.T) {
 	uuid_ := uuid.New()
-	cb := newCB(t)
-	md, err := cb.chain(cb.SetUUID(uuid_)).
-		chain(cb.SetLoc("location")).
-		chain(cb.AddSchema(newTestSchema(0))).
-		chain(cb.AddVersion(newTestVersion(1, 0))).
-		chain(cb.SetCurrentVersionID(1)).
+	md, err := newTestBuilder().
+		SetUUID(uuid_).
+		SetLoc("location").
+		AddSchema(newTestSchema(0)).
+		AddVersion(newTestVersion(1, 0)).
+		SetCurrentVersionID(1).
 		Build()
 	require.NoError(t, err)
 	assert.Equal(t, uuid_, md.ViewUUID())
@@ -288,8 +279,7 @@ func TestSetUUID(t *testing.T) {
 	// Reassignment to same UUID should be a noop with no changes
 	updatedBuilder, err = MetadataBuilderFromBase(md)
 	require.NoError(t, err)
-	cb = &buildChainer{updatedBuilder, t}
-	updatedMD, err = cb.chain(cb.SetUUID(uuid_)).Build()
+	updatedMD, err = updatedBuilder.SetUUID(uuid_).Build()
 	require.NoError(t, err)
 	assert.Equal(t, uuid_, updatedMD.ViewUUID())
 	assert.Empty(t, updatedMD.Updates())
@@ -297,7 +287,7 @@ func TestSetUUID(t *testing.T) {
 	// Reassignment to different UUID should fail
 	updatedBuilder, err = MetadataBuilderFromBase(md)
 	require.NoError(t, err)
-	_, err = cb.SetUUID(uuid.New())
+	_, err = updatedBuilder.SetUUID(uuid.New()).Build()
 	require.ErrorContains(t, err, "cannot reassign uuid")
 }
 
@@ -305,13 +295,13 @@ func TestAddVersion_IDReassignment(t *testing.T) {
 	v1 := newTestVersionWithSQL(1, 0, "select * from ns.tbl")
 	v2 := newTestVersionWithSQL(1, 0, "select count(*) from ns.tbl")
 	v3 := newTestVersionWithSQL(1, 0, "select count(*) as count from ns.tbl")
-	cb := newCB(t)
-	md, err := cb.chain(cb.SetLoc("location")).
-		chain(cb.AddSchema(newTestSchema(0))).
-		chain(cb.AddVersion(v1)).
-		chain(cb.AddVersion(v2)).
-		chain(cb.AddVersion(v3)).
-		chain(cb.SetCurrentVersionID(3)).
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(newTestSchema(0)).
+		AddVersion(v1).
+		AddVersion(v2).
+		AddVersion(v3).
+		SetCurrentVersionID(3).
 		Build()
 	require.NoError(t, err)
 
@@ -324,15 +314,253 @@ func TestAddVersion_IDReassignment(t *testing.T) {
 	assert.Equal(t, []*Version{v1, expectedV2, expectedV3}, md.Versions())
 }
 
-type clonable struct {
-	foo []int
-	bar int
+func TestAddVersion_Deduplication(t *testing.T) {
+	v1 := newTestVersionWithSQL(1, 0, "select * from ns.tbl")
+	v2 := newTestVersionWithSQL(1, 0, "select count(*) from ns.tbl")
+	v3 := newTestVersionWithSQL(1, 0, "select count(*) as count from ns.tbl")
+	v1Updated := newTestVersionWithSQL(1, 0, "select * from ns.tbl", WithTimestampMS(1000))
+	v2Updated := newTestVersionWithSQL(1, 0, "select count(*) from ns.tbl", WithTimestampMS(100))
+	v3Updated := newTestVersionWithSQL(1, 0, "select count(*) as count from ns.tbl", WithTimestampMS(10))
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(newTestSchema(0)).
+		AddVersion(v1).
+		AddVersion(v2).
+		AddVersion(v3).
+		AddVersion(v1Updated).
+		AddVersion(v2Updated).
+		AddVersion(v3Updated).
+		SetCurrentVersionID(3).
+		Build()
+	require.NoError(t, err)
+
+	// Should retain original unique versions with updated IDs
+	expectedV2 := v2.Clone()
+	expectedV2.VersionID = 2
+	expectedV3 := v3.Clone()
+	expectedV3.VersionID = 3
+	assert.Equal(t, expectedV3, md.CurrentVersion())
+	assert.Equal(t, []*Version{v1, expectedV2, expectedV3}, md.Versions())
 }
 
-func (c *clonable) Clone() *clonable {
-	cloned := *c
-	cloned.foo = slices.Clone(c.foo)
-	return &cloned
+func TestAddVersion_DeduplicationCustomSummary(t *testing.T) {
+	v1 := newTestVersionWithSQL(1, 0, "select * from ns.tbl", WithTimestampMS(0))
+	v2 := newTestVersionWithSQL(1, 0, "select count(*) from ns.tbl", WithTimestampMS(0))
+	v1Updated := newTestVersionWithSQL(1, 0, "select * from ns.tbl", WithTimestampMS(1000))
+	v2Updated := newTestVersionWithSQL(1, 0, "select count(*) from ns.tbl",
+		WithTimestampMS(0),
+		WithVersionSummary(VersionSummary{"key": "val"}),
+	)
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(newTestSchema(0)).
+		AddVersion(v1).
+		AddVersion(v2).
+		AddVersion(v1Updated).
+		AddVersion(v2Updated).
+		SetCurrentVersionID(3).
+		Build()
+	require.NoError(t, err)
+
+	// Should retain original unique versions with updated IDs
+	expectedV2 := v2.Clone()
+	expectedV2.VersionID = 2
+	expectedUpdatedV2 := v2Updated.Clone()
+	expectedUpdatedV2.VersionID = 3
+	assert.Equal(t, expectedUpdatedV2, md.CurrentVersion())
+	assert.Equal(t, []*Version{v1, expectedV2, expectedUpdatedV2}, md.Versions())
+}
+
+func TestSchemaIDReassignment(t *testing.T) {
+	s1 := newTestSchema(3, "x")
+	s2 := newTestSchema(6, "y")
+	s3 := newTestSchema(9, "z")
+
+	version := newTestVersion(1, 0)
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(s1).
+		AddSchema(s2).
+		AddSchema(s3).
+		SetCurrentVersion(version, s3).
+		Build()
+	require.NoError(t, err)
+
+	// Schema ID should be reassigned
+	expectedVersion := version.Clone()
+	expectedVersion.SchemaID = 2
+	assert.Equal(t, []*Version{expectedVersion}, md.Versions())
+
+	// All schema IDs should be re-assigned and start at 0
+	assert.Equal(t,
+		[]iceberg.StructType{s1.AsStruct(), s2.AsStruct(), s3.AsStruct()},
+		mapSlice(md.Schemas(), func(s *iceberg.Schema) iceberg.StructType { return s.AsStruct() }),
+	)
+	assert.Equal(t, slices.Sorted(maps.Keys(md.SchemasByID())), []int{0, 1, 2})
+}
+
+func TestSchemaDeduplication(t *testing.T) {
+	// Initial unique schemas
+	s1 := newTestSchema(3, "x")
+	s2 := newTestSchema(6, "y")
+	s3 := newTestSchema(9, "z")
+	// Duplicates with different IDs
+	s1Dupe := newTestSchema(4, "x")
+	s2Dupe := newTestSchema(7, "y")
+	s3Dupe := newTestSchema(10, "z")
+
+	version := newTestVersion(1, 0)
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(s1).
+		AddSchema(s2).
+		AddSchema(s3).
+		AddSchema(s1Dupe).
+		AddSchema(s2Dupe).
+		AddSchema(s3Dupe).
+		SetCurrentVersion(version, s3).
+		Build()
+	require.NoError(t, err)
+
+	// Schema ID should be reassigned
+	expectedVersion := version.Clone()
+	expectedVersion.SchemaID = 2
+	assert.Equal(t, []*Version{expectedVersion}, md.Versions())
+
+	// All schema IDs should be re-assigned and start at 0
+	assert.Equal(t,
+		[]iceberg.StructType{s1.AsStruct(), s2.AsStruct(), s3.AsStruct()},
+		mapSlice(md.Schemas(), func(s *iceberg.Schema) iceberg.StructType { return s.AsStruct() }),
+	)
+	assert.Equal(t, slices.Sorted(maps.Keys(md.SchemasByID())), []int{0, 1, 2})
+}
+
+func TestViewVersionAndSchemaIDReassignment(t *testing.T) {
+	s1 := newTestSchema(3, "x")
+	s2 := newTestSchema(6, "y")
+	s3 := newTestSchema(9, "z")
+
+	v1 := newTestVersionWithSQL(1, 3, "select * from ns.tbl")
+	v2 := newTestVersionWithSQL(1, 6, "select count(*) from ns.tbl")
+	v3 := newTestVersionWithSQL(1, 9, "select count(*) as count from ns.tbl")
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(s1).
+		AddSchema(s2).
+		AddSchema(s3).
+		SetCurrentVersion(v1, s1).
+		SetCurrentVersion(v2, s2).
+		SetCurrentVersion(v3, s3).
+		Build()
+	require.NoError(t, err)
+
+	// All versions should have reassigned IDs and use reassigned schema IDs
+	expectedV1 := v1.Clone()
+	expectedV1.SchemaID = 0
+	expectedV2 := v2.Clone()
+	expectedV2.VersionID = 2
+	expectedV2.SchemaID = 1
+	expectedV3 := v3.Clone()
+	expectedV3.VersionID = 3
+	expectedV3.SchemaID = 2
+
+	assert.Equal(t, expectedV3, md.CurrentVersion())
+	assert.Equal(t, []*Version{expectedV1, expectedV2, expectedV3}, md.Versions())
+
+	// All schema IDs should be re-assigned and start at 0
+	assert.Equal(t,
+		[]iceberg.StructType{s1.AsStruct(), s2.AsStruct(), s3.AsStruct()},
+		mapSlice(md.Schemas(), func(s *iceberg.Schema) iceberg.StructType { return s.AsStruct() }),
+	)
+	assert.Equal(t, slices.Sorted(maps.Keys(md.SchemasByID())), []int{0, 1, 2})
+}
+
+func TestAddVersion_MultipleSQLForSameDialect(t *testing.T) {
+	_, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(newTestSchema(0)).
+		AddVersion(
+			stripErr(NewVersion(1, 0,
+				[]Representation{
+					NewRepresentation("select * from ns.tbl", "spark"),
+					NewRepresentation("select * from ns.tbl3", "SpArK"),
+				},
+				table.Identifier{"ns"},
+			)),
+		).
+		SetCurrentVersionID(1).
+		Build()
+	assert.ErrorContains(t, err, "invalid view version: cannot add multiple queries for dialect spark")
+}
+
+func TestSetCurrentVersionID_NoLastAddedSchema(t *testing.T) {
+	_, err := newTestBuilder().
+		AddVersion(newTestVersion(1, LastAddedID)).
+		SetCurrentVersionID(1).
+		Build()
+	assert.ErrorContains(t, err, "cannot set last added schema: no schema has been added")
+}
+
+func TestDeduplicationViewVersionByIDAndSchemaID(t *testing.T) {
+	s1 := newTestSchema(1, "x")
+	s2 := newTestSchema(2, "y")
+
+	v1 := newTestVersionWithSQL(1, 0, "select * from ns.tbl")
+	v2 := newTestVersionWithSQL(2, 1, "select x from ns.tbl")
+	v3 := newTestVersionWithSQL(2, -1, "select count(*) from ns.tbl")
+
+	md, err := newTestBuilder().
+		SetLoc("location").
+		AddSchema(s1).
+		AddSchema(s2).
+		AddVersion(v1).
+		AddVersion(v2).
+		AddVersion(v3).
+		SetCurrentVersionID(3).
+		Build()
+	require.NoError(t, err)
+
+	assert.Len(t, md.Versions(), 3)
+	assert.Equal(t, md.CurrentVersion().VersionID, 3)
+	assert.Equal(t, md.CurrentSchema().ID, 1)
+}
+
+func TestNewMetadata(t *testing.T) {
+	version := newTestVersion(1, LastAddedID,
+		WithVersionSummary(VersionSummary{"summary-key": "summary-val"}),
+		WithTimestampMS(1000))
+	schema := newTestSchema(0)
+	props := iceberg.Properties{"prop": "value"}
+
+	md, err := NewMetadata(version, schema, "location", props)
+	require.NoError(t, err)
+
+	// Should not have updates since NewMetadata builds without them
+	assert.Empty(t, md.Updates())
+	expectedVersion := version.Clone()
+	expectedVersion.SchemaID = 0
+	assert.Equal(t, expectedVersion, md.CurrentVersion())
+	expectedSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
+	require.NoError(t, err)
+	assert.True(t, expectedSchema.Equals(md.CurrentSchema()))
+	assert.Equal(t, []VersionHistoryEntry{{TimestampMS: 1000, VersionID: 1}}, md.VersionLog())
+}
+
+func TestUnmarshalViewMetadata(t *testing.T) {
+	md, err := ParseMetadataString(exampleViewJSON)
+	require.NoError(t, err)
+	expectedUUID, _ := uuid.Parse("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+	assert.Equal(t, expectedUUID, md.ViewUUID())
+	assert.Equal(t, "s3://bucket/test/location", md.Location())
+	assert.Equal(t, 1, md.CurrentVersionID())
+	assert.Equal(t, 1, md.CurrentVersion().VersionID)
+	assert.Equal(t, 0, md.CurrentSchemaID())
+	assert.Equal(t, 0, md.CurrentSchema().ID)
+	assert.Equal(t, 0, md.CurrentVersion().SchemaID)
+	assert.Equal(t, VersionSummary{"summaryProp": "summaryVal"}, md.CurrentVersion().Summary)
+	assert.Equal(t, []VersionHistoryEntry{{TimestampMS: 1000, VersionID: 1}}, md.VersionLog())
+	assert.Equal(t, []Representation{NewRepresentation("select * from ns.tbl", "trino")}, md.CurrentVersion().Representations)
+	assert.Equal(t, iceberg.Properties{"prop": "value"}, md.Properties())
 }
 
 func TestCloneSlice(t *testing.T) {
@@ -342,3 +570,61 @@ func TestCloneSlice(t *testing.T) {
 	clonedX[0].foo[0] = 5
 	assert.NotEqualValues(t, x, clonedX)
 }
+
+var exampleViewJSON = `{
+	"view-uuid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+	"format-version": 1,
+	"location": "s3://bucket/test/location",
+	"current-version-id": 1,
+	"versions": [
+	  {
+		"version-id": 1,
+		"timestamp-ms": 1000,
+		"schema-id": 0,
+		"summary": {
+		  "summaryProp": "summaryVal"
+		},
+		"representations": [
+		  {
+			"type": "sql",
+			"sql": "select * from ns.tbl",
+			"dialect": "trino"
+		  }
+		],
+		"default-catalog": "string",
+		"default-namespace": [
+		  "accounting",
+		  "tax"
+		]
+	  }
+	],
+	"version-log": [
+	  {
+		"version-id": 1,
+		"timestamp-ms": 1000
+	  }
+	],
+	"schemas": [
+	  {
+		"type": "struct",
+		"fields": [
+		  {
+			"id": 1,
+			"name": "x",
+			"type": "long",
+			"required": true,
+			"doc": "",
+			"initial-default": true,
+			"write-default": true
+		  }
+		],
+		"schema-id": 0,
+		"identifier-field-ids": [
+		  0
+		]
+	  }
+	],
+	"properties": {
+		"prop": "value"
+	}
+}`

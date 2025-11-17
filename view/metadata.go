@@ -44,8 +44,11 @@ const (
 
 const (
 	supportedViewFormatVersion = 1
-	viewEngineProperty         = "engine-name"
-	defaultViewEngine          = "iceberg-go"
+
+	initialSchemaID = 0
+
+	viewEngineProperty = "engine-name"
+	defaultViewEngine  = "iceberg-go"
 )
 
 // Metadata for an iceberg view as specified in the Iceberg spec
@@ -199,6 +202,7 @@ func (v *Version) Clone() *Version {
 	cloned := *v
 	cloned.Summary = maps.Clone(v.Summary)
 	cloned.Representations = slices.Clone(v.Representations)
+	cloned.DefaultNamespace = slices.Clone(v.DefaultNamespace)
 	return &cloned
 }
 
@@ -231,6 +235,10 @@ type MetadataBuilder struct {
 	versionHistoryEntry *VersionHistoryEntry
 	lastAddedVersionID  *int
 	lastAddedSchemaID   *int
+
+	// error tracking for build chaining
+	// if set, subsequent operations become a noop
+	err error
 }
 
 func NewMetadataBuilder() (*MetadataBuilder, error) {
@@ -269,37 +277,36 @@ func MetadataBuilderFromBase(metadata Metadata) (*MetadataBuilder, error) {
 
 func (b *MetadataBuilder) HasChanges() bool { return len(b.updates) > 0 }
 
-func (b *MetadataBuilder) CurrentVersion() *Version {
-	v, _ := b.GetVersionByID(b.currentVersionID)
+func (b *MetadataBuilder) SetCurrentVersion(version *Version, schema *iceberg.Schema) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
 
-	return v
-}
-
-func (b *MetadataBuilder) CurrentSchema() *iceberg.Schema {
-	s, _ := b.GetSchemaByID(b.CurrentVersion().VersionID)
-
-	return s
-}
-
-func (b *MetadataBuilder) SetCurrentVersion(version *Version, schema *iceberg.Schema) (*MetadataBuilder, error) {
 	newSchemaID, err := b.addSchema(schema)
-	if err != nil {
-		return nil, err
+	if b.setErr(err) {
+		return b
 	}
 
 	newVersion := version.Clone()
 	newVersion.SchemaID = newSchemaID
 	newVersionID, err := b.addVersion(newVersion)
-	if err != nil {
-		return nil, err
+	if b.setErr(err) {
+		return b
 	}
 
 	return b.SetCurrentVersionID(newVersionID)
 }
 
-func (b *MetadataBuilder) AddVersion(newVersion *Version) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) AddVersion(newVersion *Version) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	_, err := b.addVersion(newVersion)
-	return b, err
+	if b.setErr(err) {
+		return b
+	}
+	return b
 }
 
 func (b *MetadataBuilder) addVersion(newVersion *Version) (int, error) {
@@ -323,7 +330,7 @@ func (b *MetadataBuilder) addVersion(newVersion *Version) (int, error) {
 	// If we have no lastAddedSchemaID, we fail
 	if version.SchemaID == LastAddedID {
 		if b.lastAddedSchemaID == nil {
-			return 0, errors.New("cannot set schema for version: no schema has been added")
+			return 0, errors.New("cannot set last added schema: no schema has been added")
 		}
 		version.SchemaID = *b.lastAddedSchemaID
 	}
@@ -359,12 +366,16 @@ func (b *MetadataBuilder) addVersion(newVersion *Version) (int, error) {
 	return newVersionID, nil
 }
 
-func (b *MetadataBuilder) AddSchema(schema *iceberg.Schema) (*MetadataBuilder, error) {
-	_, err := b.addSchema(schema)
-	if err != nil {
-		return nil, err
+func (b *MetadataBuilder) AddSchema(schema *iceberg.Schema) *MetadataBuilder {
+	if b.err != nil {
+		return b
 	}
-	return b, nil
+
+	_, err := b.addSchema(schema)
+	if b.setErr(err) {
+		return b
+	}
+	return b
 }
 
 func (b *MetadataBuilder) addSchema(schema *iceberg.Schema) (int, error) {
@@ -381,16 +392,20 @@ func (b *MetadataBuilder) addSchema(schema *iceberg.Schema) (int, error) {
 	}
 
 	b.schemaList = append(b.schemaList, newSchema)
-	b.schemasById[newSchemaID] = newSchema
+	b.schemasById[newSchema.ID] = newSchema
 	b.updates = append(b.updates, NewAddSchemaUpdate(newSchema))
 	b.lastAddedSchemaID = &newSchemaID
 
 	return newSchemaID, nil
 }
 
-func (b *MetadataBuilder) RemoveProperties(keys []string) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) RemoveProperties(keys []string) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	if len(keys) == 0 {
-		return b, nil
+		return b
 	}
 
 	b.updates = append(b.updates, NewRemovePropertiesUpdate(keys))
@@ -398,24 +413,30 @@ func (b *MetadataBuilder) RemoveProperties(keys []string) (*MetadataBuilder, err
 		delete(b.props, key)
 	}
 
-	return b, nil
+	return b
 }
 
-func (b *MetadataBuilder) SetCurrentVersionID(newVersionID int) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) SetCurrentVersionID(newVersionID int) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	if newVersionID == LastAddedID {
 		if b.lastAddedVersionID == nil {
-			return nil, errors.New("cannot set current version to last added, no version has been added")
+			b.err = errors.New("cannot set current version to last added, no version has been added")
+			return b
 		}
 		newVersionID = *b.lastAddedVersionID
 	}
 
 	if newVersionID == b.currentVersionID {
-		return b, nil
+		return b
 	}
 
 	_, ok := b.versionsById[newVersionID]
 	if !ok {
-		return nil, fmt.Errorf("cannot set current version to unknown version with id %d", newVersionID)
+		b.err = fmt.Errorf("cannot set current version to unknown version with id %d", newVersionID)
+		return b
 	}
 
 	if b.lastAddedVersionID != nil && *b.lastAddedVersionID == newVersionID {
@@ -441,43 +462,57 @@ func (b *MetadataBuilder) SetCurrentVersionID(newVersionID int) (*MetadataBuilde
 		TimestampMS: updateTimestampMS,
 	}
 
-	return b, nil
+	return b
 }
 
-func (b *MetadataBuilder) SetFormatVersion(formatVersion int) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) SetFormatVersion(formatVersion int) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	if formatVersion < b.formatVersion {
-		return nil, fmt.Errorf("downgrading format version from %d to %d is not allowed",
+		b.err = fmt.Errorf("downgrading format version from %d to %d is not allowed",
 			b.formatVersion, formatVersion)
+		return b
 	}
 
 	if formatVersion > supportedViewFormatVersion {
-		return nil, fmt.Errorf("unsupported format version %d", formatVersion)
+		b.err = fmt.Errorf("unsupported format version %d", formatVersion)
+		return b
 	}
 
 	if formatVersion == b.formatVersion {
-		return b, nil
+		return b
 	}
 
 	b.updates = append(b.updates, NewUpgradeFormatVersionUpdate(formatVersion))
 	b.formatVersion = formatVersion
 
-	return b, nil
+	return b
 }
 
-func (b *MetadataBuilder) SetLoc(loc string) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) SetLoc(loc string) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	if b.loc == loc {
-		return b, nil
+		return b
 	}
 
 	b.updates = append(b.updates, NewSetLocationUpdate(loc))
 	b.loc = loc
 
-	return b, nil
+	return b
 }
 
-func (b *MetadataBuilder) SetProperties(props iceberg.Properties) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) SetProperties(props iceberg.Properties) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	if len(props) == 0 {
-		return b, nil
+		return b
 	}
 
 	b.updates = append(b.updates, NewSetPropertiesUpdate(props))
@@ -487,30 +522,38 @@ func (b *MetadataBuilder) SetProperties(props iceberg.Properties) (*MetadataBuil
 		maps.Copy(b.props, props)
 	}
 
-	return b, nil
+	return b
 }
 
-func (b *MetadataBuilder) SetUUID(newUUID uuid.UUID) (*MetadataBuilder, error) {
+func (b *MetadataBuilder) SetUUID(newUUID uuid.UUID) *MetadataBuilder {
+	if b.err != nil {
+		return b
+	}
+
 	if newUUID == uuid.Nil {
-		return b, errors.New("cannot set uuid to null")
+		b.err = errors.New("cannot set uuid to null")
+		return b
 	}
 
 	// Noop - same UUID does not generate a change.
 	if b.uuid == newUUID {
-		return b, nil
+		return b
 	}
 
 	if b.uuid != uuid.Nil {
-		return b, errors.New("cannot reassign uuid")
+		b.err = errors.New("cannot reassign uuid")
+		return b
 	}
 
 	b.updates = append(b.updates, NewAssignUUIDUpdate(newUUID))
 	b.uuid = newUUID
 
-	return b, nil
+	return b
 }
 
-func (b *MetadataBuilder) Updates() Updates { return b.updates }
+func (b *MetadataBuilder) Err() error {
+	return b.err
+}
 
 func (b *MetadataBuilder) buildCommonMetadata() (*commonMetadata, error) {
 	md := &commonMetadata{
@@ -529,23 +572,14 @@ func (b *MetadataBuilder) buildCommonMetadata() (*commonMetadata, error) {
 	return md, nil
 }
 
-func (b *MetadataBuilder) GetVersionByID(id int) (*Version, error) {
-	if v, ok := b.versionsById[id]; ok {
-		return v, nil
+// build builds the view metadata updates from the builder
+// if withUpdates is set to false, updates will not be included
+// in the returned Metadata, thus its Updates() will return an empty slice
+func (b *MetadataBuilder) build(withUpdates bool) (Metadata, error) {
+	if b.err != nil {
+		return nil, b.err
 	}
 
-	return nil, fmt.Errorf("%w: version with id %d not found", iceberg.ErrInvalidArgument, id)
-}
-
-func (b *MetadataBuilder) GetSchemaByID(id int) (*iceberg.Schema, error) {
-	if s, ok := b.schemasById[id]; ok {
-		return s, nil
-	}
-
-	return nil, fmt.Errorf("%w: schema with id %d not found", iceberg.ErrInvalidArgument, id)
-}
-
-func (b *MetadataBuilder) Build() (Metadata, error) {
 	if b.formatVersion != supportedViewFormatVersion {
 		return nil, fmt.Errorf("unsupported format version %d", b.formatVersion)
 	}
@@ -558,13 +592,55 @@ func (b *MetadataBuilder) Build() (Metadata, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if err := common.validate(); err != nil {
 		return nil, err
 	}
 
-	return &viewMetadataV1{
-		*common,
-	}, nil
+	if !withUpdates {
+		common.updates = Updates{}
+	}
+
+	switch b.formatVersion {
+	case 1:
+		return &viewMetadataV1{
+			*common,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported format version %d", b.formatVersion)
+	}
+}
+
+func (b *MetadataBuilder) Build() (Metadata, error) {
+	return b.build(true)
+}
+
+func (b *MetadataBuilder) BuildWithoutUpdates() (Metadata, error) {
+	return b.build(false)
+}
+
+// setErr is a helper for enforcing build error assignment during operations.
+// This method returns true if the error was non-nil and the builder has entered
+// an error state. In this case, the operation must fail immediately, while still
+// returning the builder instance.
+//
+// Example usage inside a public builder method:
+//
+//	func (b *MetadataBuilder) SetSomething(param int) (*MetadataBuilder) {
+//	  val, err := b.internalOperation(param)
+//	  if b.setErr(err) {
+//	    return b
+//	  }
+//
+//	  b.val = val
+//	  return b
+//	}
+func (b *MetadataBuilder) setErr(err error) (buildHasFailed bool) {
+	if err != nil {
+		b.err = err
+		return true
+	}
+	return false
 }
 
 func (b *MetadataBuilder) reuseOrCreateNewVersionID(newVersion *Version) int {
@@ -572,8 +648,7 @@ func (b *MetadataBuilder) reuseOrCreateNewVersionID(newVersion *Version) int {
 	for _, version := range b.versionList {
 		if newVersion.Equals(version) {
 			return version.VersionID
-		}
-		if version.VersionID >= newVersionID {
+		} else if version.VersionID >= newVersionID {
 			newVersionID = version.VersionID + 1
 		}
 	}
@@ -582,13 +657,13 @@ func (b *MetadataBuilder) reuseOrCreateNewVersionID(newVersion *Version) int {
 }
 
 func (b *MetadataBuilder) reuseOrCreateNewSchemaID(newSchema *iceberg.Schema) int {
-	newSchemaID := newSchema.ID
+	newSchemaID := initialSchemaID
+
 	// if the schema already exists, use its id; otherwise use the highest id + 1
 	for _, schema := range b.schemaList {
 		if newSchema.Equals(schema) {
 			return schema.ID
-		}
-		if schema.ID >= newSchemaID {
+		} else if schema.ID >= newSchemaID {
 			newSchemaID = schema.ID + 1
 		}
 	}
@@ -688,12 +763,12 @@ func (c *commonMetadata) Equals(other *commonMetadata) bool {
 	}
 
 	return c.UUID == other.UUID &&
+		c.Loc == other.Loc &&
 		c.FormatVersionValue == other.FormatVersionValue &&
 		iceberginternal.SliceEqualHelper(c.SchemaList, other.SchemaList) &&
 		iceberginternal.SliceEqualHelper(c.VersionList, other.VersionList) &&
 		c.CurrentVersionIDValue == other.CurrentVersionIDValue &&
 		slices.Equal(c.VersionHistoryList, other.VersionHistoryList)
-
 }
 
 func (c *commonMetadata) Updates() Updates { return c.updates }
@@ -799,14 +874,14 @@ func (m *viewMetadataV1) UnmarshalJSON(b []byte) error {
 
 const DefaultViewFormatVersion = supportedViewFormatVersion
 
-// NewMetadata creates a new view metadata object using the provided schema, information, generating a fresh UUID for
-// the new table metadata.
-func NewMetadata(sc *iceberg.Schema, location string, props iceberg.Properties) (Metadata, error) {
-	return NewMetadataWithUUID(sc, location, props, uuid.Nil)
+// NewMetadata creates a new view metadata object using the provided version, schema, location, and props,
+// generating a fresh UUID for the new table metadata.
+func NewMetadata(version *Version, sc *iceberg.Schema, location string, props iceberg.Properties) (Metadata, error) {
+	return NewMetadataWithUUID(version, sc, location, props, uuid.Nil)
 }
 
 // NewMetadataWithUUID is like NewMetadata, but allows the caller to specify the UUID of the view rather than creating a new one.
-func NewMetadataWithUUID(sc *iceberg.Schema, location string, props iceberg.Properties, viewUUID uuid.UUID) (Metadata, error) {
+func NewMetadataWithUUID(version *Version, sc *iceberg.Schema, location string, props iceberg.Properties, viewUUID uuid.UUID) (Metadata, error) {
 	freshSchema, err := iceberg.AssignFreshSchemaIDs(sc, nil)
 	if err != nil {
 		return nil, err
@@ -827,21 +902,16 @@ func NewMetadataWithUUID(sc *iceberg.Schema, location string, props iceberg.Prop
 		}
 	}
 
-	common := commonMetadata{
-		FormatVersionValue:    formatVersion,
-		UUID:                  viewUUID,
-		Loc:                   location,
-		SchemaList:            []*iceberg.Schema{freshSchema},
-		CurrentVersionIDValue: freshSchema.ID,
-		Props:                 props,
+	builder, err := NewMetadataBuilder()
+	if err != nil {
+		return nil, err
 	}
 
-	switch formatVersion {
-	case 1:
-		return &viewMetadataV1{
-			commonMetadata: common,
-		}, nil
-	default:
-		return nil, fmt.Errorf("invalid format version: %d", formatVersion)
-	}
+	return builder.
+		SetFormatVersion(formatVersion).
+		SetUUID(viewUUID).
+		SetLoc(location).
+		SetProperties(props).
+		SetCurrentVersion(version, freshSchema).
+		BuildWithoutUpdates()
 }

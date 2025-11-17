@@ -2071,6 +2071,9 @@ func (r *RestCatalogSuite) TestCreateView200() {
 	})
 	sql := "SELECT * FROM table"
 	reprs := []view.Representation{view.NewRepresentation(sql, "default")}
+	version, err := view.NewVersion(1, 0, reprs, table.Identifier{ns}, view.WithDefaultViewCatalog("default-catalog"))
+	r.Require().NoError(err)
+
 	viewVersionJSON, _ := json.Marshal(map[string]interface{}{
 		"version-id":   1,
 		"timestamp-ms": time.Now().UnixMilli(),
@@ -2103,7 +2106,7 @@ func (r *RestCatalogSuite) TestCreateView200() {
 		r.Equal("sql", payload.ViewVersion.Representations[0].Type)
 		r.Equal(sql, payload.ViewVersion.Representations[0].SQL)
 		r.Equal("default", payload.ViewVersion.Representations[0].Dialect)
-		r.Equal("rest", payload.ViewVersion.DefaultCatalog)
+		r.Equal("default-catalog", payload.ViewVersion.DefaultCatalog)
 		r.Equal([]string{ns}, payload.ViewVersion.DefaultNamespace)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -2114,7 +2117,7 @@ func (r *RestCatalogSuite) TestCreateView200() {
 	ctlg, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL)
 	r.NoError(err)
 
-	_, err = ctlg.CreateView(context.Background(), identifier, schema, reprs, props)
+	_, err = ctlg.CreateView(context.Background(), identifier, version, schema, props)
 	r.NoError(err)
 }
 
@@ -2130,6 +2133,8 @@ func (r *RestCatalogSuite) TestCreateView409() {
 	})
 	sql := "SELECT * FROM table"
 	reprs := []view.Representation{view.NewRepresentation(sql, "default")}
+	version, err := view.NewVersion(1, 1, reprs, table.Identifier{ns})
+	r.Require().NoError(err)
 
 	r.mux.HandleFunc("/v1/namespaces/"+ns+"/views", func(w http.ResponseWriter, req *http.Request) {
 		r.Equal(http.MethodPost, req.Method)
@@ -2145,7 +2150,7 @@ func (r *RestCatalogSuite) TestCreateView409() {
 	ctlg, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL)
 	r.NoError(err)
 
-	_, err = ctlg.CreateView(context.Background(), identifier, schema, reprs, nil)
+	_, err = ctlg.CreateView(context.Background(), identifier, version, schema, nil)
 	r.Error(err)
 	r.ErrorIs(err, catalog.ErrViewAlreadyExists)
 }
@@ -2164,6 +2169,8 @@ func (r *RestCatalogSuite) TestCreateView404() {
 	reprs := []view.Representation{
 		view.NewRepresentation(sql, "spark"),
 	}
+	version, err := view.NewVersion(1, 1, reprs, table.Identifier{ns})
+	r.Require().NoError(err)
 
 	r.mux.HandleFunc("/v1/namespaces/"+ns+"/views", func(w http.ResponseWriter, req *http.Request) {
 		r.Equal(http.MethodPost, req.Method)
@@ -2179,7 +2186,7 @@ func (r *RestCatalogSuite) TestCreateView404() {
 	ctlg, err := rest.NewCatalog(context.Background(), "rest", r.srv.URL)
 	r.NoError(err)
 
-	_, err = ctlg.CreateView(context.Background(), identifier, schema, reprs, nil)
+	_, err = ctlg.CreateView(context.Background(), identifier, version, schema, nil)
 	r.Error(err)
 	r.ErrorIs(err, catalog.ErrNoSuchNamespace)
 }

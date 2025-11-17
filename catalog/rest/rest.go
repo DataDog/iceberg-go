@@ -1209,24 +1209,13 @@ func (r *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (*v
 }
 
 // CreateView creates a new view in the catalog.
-func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, representations []view.Representation, props iceberg.Properties, opts ...view.VersionOpt) (*view.View, error) {
+func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, version *view.Version, schema *iceberg.Schema, props iceberg.Properties) (*view.View, error) {
 	ns, viewName, err := splitIdentForPath(identifier)
 	if err != nil {
 		return nil, err
 	}
 
 	freshSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	defaultNS := catalog.NamespaceFromIdent(identifier)
-	version, err := view.NewVersion(1,
-		freshSchema.ID,
-		representations,
-		defaultNS,
-		append(opts, view.WithDefaultViewCatalog("rest"))...,
-	)
 	if err != nil {
 		return nil, err
 	}
@@ -1250,7 +1239,7 @@ func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, s
 	return view.New(identifier, ret.Metadata, ret.MetadataLoc), nil
 }
 
-// UpdateView updates a new view in the catalog.
+// UpdateView updates a view in the catalog.
 func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requirements []view.Requirement, updates []view.Update) (*view.View, error) {
 	ns, viewName, err := splitIdentForPath(ident)
 	if err != nil {
