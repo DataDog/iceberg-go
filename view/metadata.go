@@ -80,6 +80,9 @@ type Metadata interface {
 	// Properties is a string to string map of view properties.
 	Properties() iceberg.Properties
 
+	// Updates returns the list of metadata updates used to build this metadata
+	Updates() Updates
+
 	Equals(Metadata) bool
 }
 
@@ -96,6 +99,7 @@ type Representation struct {
 	// The dialect of the sql SELECT statement (e.g., "trino" or "spark")
 	Dialect string `json:"dialect"`
 }
+type Representations []Representation
 
 func NewRepresentation(sql string, dialect string) Representation {
 	return Representation{
@@ -140,9 +144,18 @@ func WithDefaultViewCatalog(catalogName string) func(*Version) {
 	}
 }
 
+func WithTimestampMS(timestampMS int64) VersionOpt {
+	return func(version *Version) {
+		version.TimestampMS = timestampMS
+	}
+}
+
 // NewVersion creates a Version instance from the provided parameters.
 // If building updates using the MetadataBuilder, and one desires to use the last
 // added schema ID, one should use the LastAddedID constant as the provided schemaID
+//
+// Note that NewVersion automatically seeds TimestampMS to time.Now().UnixMilli(),
+// and one should use the option WithTimestampMS to override this behavior.
 func NewVersion(id int, schemaID int, representations []Representation, defaultNamespace table.Identifier, opts ...VersionOpt) (*Version, error) {
 	if id < 1 {
 		return nil, errors.New("id should be greater than 0")
@@ -222,13 +235,14 @@ type MetadataBuilder struct {
 
 func NewMetadataBuilder() (*MetadataBuilder, error) {
 	return &MetadataBuilder{
-		updates:      make([]Update, 0),
-		schemaList:   make([]*iceberg.Schema, 0),
-		versionList:  make([]*Version, 0),
-		versionLog:   make([]VersionHistoryEntry, 0),
-		props:        make(iceberg.Properties),
-		versionsById: make(map[int]*Version),
-		schemasById:  make(map[int]*iceberg.Schema),
+		formatVersion: DefaultViewFormatVersion,
+		updates:       make([]Update, 0),
+		schemaList:    make([]*iceberg.Schema, 0),
+		versionList:   make([]*Version, 0),
+		versionLog:    make([]VersionHistoryEntry, 0),
+		props:         make(iceberg.Properties),
+		versionsById:  make(map[int]*Version),
+		schemasById:   make(map[int]*iceberg.Schema),
 	}, nil
 }
 
@@ -390,7 +404,7 @@ func (b *MetadataBuilder) RemoveProperties(keys []string) (*MetadataBuilder, err
 func (b *MetadataBuilder) SetCurrentVersionID(newVersionID int) (*MetadataBuilder, error) {
 	if newVersionID == LastAddedID {
 		if b.lastAddedVersionID == nil {
-			return nil, errors.New("can't set current version to last added, no version has been added")
+			return nil, errors.New("cannot set current version to last added, no version has been added")
 		}
 		newVersionID = *b.lastAddedVersionID
 	}
@@ -399,9 +413,9 @@ func (b *MetadataBuilder) SetCurrentVersionID(newVersionID int) (*MetadataBuilde
 		return b, nil
 	}
 
-	version, ok := b.versionsById[newVersionID]
+	_, ok := b.versionsById[newVersionID]
 	if !ok {
-		return nil, fmt.Errorf("can't set current version to version with id %d", newVersionID)
+		return nil, fmt.Errorf("cannot set current version to unknown version with id %d", newVersionID)
 	}
 
 	if b.lastAddedVersionID != nil && *b.lastAddedVersionID == newVersionID {
@@ -411,17 +425,19 @@ func (b *MetadataBuilder) SetCurrentVersionID(newVersionID int) (*MetadataBuilde
 	}
 	b.currentVersionID = newVersionID
 
-	// Set the current history entry
-	updateTimestampMS := version.TimestampMS
+	// Set the current history entry.
+	// If the version was added in the current set of changes, use its timestamp,
+	// otherwise use system time.
+	updateTimestampMS := time.Now().UnixMilli()
 	for _, update := range b.updates {
 		if v, ok := update.(*addViewVersionUpdate); ok && v.Version.VersionID == newVersionID {
-			updateTimestampMS = time.Now().UnixMilli()
+			updateTimestampMS = v.Version.TimestampMS
 			break
 		}
 	}
 
 	b.versionHistoryEntry = &VersionHistoryEntry{
-		VersionID:   version.VersionID,
+		VersionID:   newVersionID,
 		TimestampMS: updateTimestampMS,
 	}
 
@@ -474,13 +490,22 @@ func (b *MetadataBuilder) SetProperties(props iceberg.Properties) (*MetadataBuil
 	return b, nil
 }
 
-func (b *MetadataBuilder) SetUUID(uuid uuid.UUID) (*MetadataBuilder, error) {
-	if b.uuid == uuid {
+func (b *MetadataBuilder) SetUUID(newUUID uuid.UUID) (*MetadataBuilder, error) {
+	if newUUID == uuid.Nil {
+		return b, errors.New("cannot set uuid to null")
+	}
+
+	// Noop - same UUID does not generate a change.
+	if b.uuid == newUUID {
 		return b, nil
 	}
 
-	b.updates = append(b.updates, NewAssignUUIDUpdate(uuid))
-	b.uuid = uuid
+	if b.uuid != uuid.Nil {
+		return b, errors.New("cannot reassign uuid")
+	}
+
+	b.updates = append(b.updates, NewAssignUUIDUpdate(newUUID))
+	b.uuid = newUUID
 
 	return b, nil
 }
@@ -497,6 +522,7 @@ func (b *MetadataBuilder) buildCommonMetadata() (*commonMetadata, error) {
 		VersionHistoryList:    b.versionLog,
 		SchemaList:            b.schemaList,
 		Props:                 b.props,
+		updates:               b.updates,
 	}
 	md.init()
 
@@ -520,6 +546,14 @@ func (b *MetadataBuilder) GetSchemaByID(id int) (*iceberg.Schema, error) {
 }
 
 func (b *MetadataBuilder) Build() (Metadata, error) {
+	if b.formatVersion != supportedViewFormatVersion {
+		return nil, fmt.Errorf("unsupported format version %d", b.formatVersion)
+	}
+
+	if b.versionHistoryEntry != nil {
+		b.versionLog = append(b.versionLog, *b.versionHistoryEntry)
+	}
+
 	common, err := b.buildCommonMetadata()
 	if err != nil {
 		return nil, err
@@ -527,12 +561,6 @@ func (b *MetadataBuilder) Build() (Metadata, error) {
 	if err := common.validate(); err != nil {
 		return nil, err
 	}
-
-	if b.formatVersion != supportedViewFormatVersion {
-		return nil, fmt.Errorf("unsupported format version %d", b.formatVersion)
-	}
-
-	b.versionLog = append(b.versionLog, *b.versionHistoryEntry)
 
 	return &viewMetadataV1{
 		*common,
@@ -642,6 +670,9 @@ type commonMetadata struct {
 	VersionHistoryList    []VersionHistoryEntry `json:"version-log"`
 	Props                 iceberg.Properties    `json:"properties,omitempty"`
 
+	// updates from builder if applicable
+	updates Updates
+
 	// cached lookup helpers, must be initialized in init()
 	lazyVersionsByID func() map[int]*Version
 	lazySchemasByID  func() map[int]*iceberg.Schema
@@ -664,6 +695,8 @@ func (c *commonMetadata) Equals(other *commonMetadata) bool {
 		slices.Equal(c.VersionHistoryList, other.VersionHistoryList)
 
 }
+
+func (c *commonMetadata) Updates() Updates { return c.updates }
 
 func (c *commonMetadata) FormatVersion() int         { return c.FormatVersionValue }
 func (c *commonMetadata) ViewUUID() uuid.UUID        { return c.UUID }
@@ -702,12 +735,20 @@ func (c *commonMetadata) Properties() iceberg.Properties {
 }
 
 func (c *commonMetadata) validate() error {
+	if len(c.Loc) == 0 {
+		return errors.New("invalid location: null")
+	}
+
 	if len(c.VersionList) == 0 {
 		return errors.New("invalid view: no versions were added")
 	}
 
 	if len(c.SchemaList) == 0 {
 		return errors.New("invalid view: no schemas were added")
+	}
+
+	if len(c.VersionHistoryList) == 0 {
+		return errors.New("invalid view: empty version history")
 	}
 
 	return nil
@@ -765,14 +806,14 @@ func NewMetadata(sc *iceberg.Schema, location string, props iceberg.Properties) 
 }
 
 // NewMetadataWithUUID is like NewMetadata, but allows the caller to specify the UUID of the view rather than creating a new one.
-func NewMetadataWithUUID(sc *iceberg.Schema, location string, props iceberg.Properties, tableUuid uuid.UUID) (Metadata, error) {
+func NewMetadataWithUUID(sc *iceberg.Schema, location string, props iceberg.Properties, viewUUID uuid.UUID) (Metadata, error) {
 	freshSchema, err := iceberg.AssignFreshSchemaIDs(sc, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if tableUuid == uuid.Nil {
-		tableUuid = uuid.New()
+	if viewUUID == uuid.Nil {
+		viewUUID = uuid.New()
 	}
 
 	formatVersion := DefaultViewFormatVersion
@@ -788,7 +829,7 @@ func NewMetadataWithUUID(sc *iceberg.Schema, location string, props iceberg.Prop
 
 	common := commonMetadata{
 		FormatVersionValue:    formatVersion,
-		UUID:                  tableUuid,
+		UUID:                  viewUUID,
 		Loc:                   location,
 		SchemaList:            []*iceberg.Schema{freshSchema},
 		CurrentVersionIDValue: freshSchema.ID,
