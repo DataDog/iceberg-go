@@ -97,6 +97,29 @@ func TestParseRequirementBytes(t *testing.T) {
 	}
 }
 
+func TestParseViewRequirementBytes(t *testing.T) {
+	testCases := []struct {
+		name        string
+		data        []byte
+		expected    table.ViewRequirement
+		expectedErr error
+	}{
+		{
+			name:        "Should parse an assert view uuid",
+			data:        []byte(`{"type": "assert-view-uuid", "uuid": "550e8400-e29b-41d4-a716-446655440000"}`),
+			expected:    table.AssertViewUUID(uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")),
+			expectedErr: nil,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := table.ParseRequirementBytes(tc.data)
+			assert.Equal(t, tc.expected, actual)
+			assert.Equal(t, tc.expectedErr, err)
+		})
+	}
+}
+
 func TestParseRequirementList(t *testing.T) {
 	t.Run("should parse a list of requirements", func(t *testing.T) {
 		jsonData := []byte(`[

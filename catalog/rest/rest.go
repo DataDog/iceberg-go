@@ -40,6 +40,7 @@ import (
 	"github.com/DataDog/iceberg-go/catalog"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/view"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -1164,78 +1165,103 @@ func (r *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifi
 	return true, nil
 }
 
-type viewVersion struct {
-	VersionID       int64             `json:"version-id"`
-	TimestampMs     int64             `json:"timestamp-ms"`
-	SchemaID        int               `json:"schema-id"`
-	Summary         map[string]string `json:"summary"`
-	Representations []struct {
-		Type    string `json:"type"`
-		SQL     string `json:"sql"`
-		Dialect string `json:"dialect"`
-	} `json:"representations"`
-	DefaultCatalog   string   `json:"default-catalog"`
-	DefaultNamespace []string `json:"default-namespace"`
-}
-
 type createViewRequest struct {
 	Name        string             `json:"name"`
 	Schema      *iceberg.Schema    `json:"schema"`
 	Location    string             `json:"location,omitempty"`
 	Props       iceberg.Properties `json:"properties,omitempty"`
 	SQL         string             `json:"sql"`
-	ViewVersion viewVersion        `json:"view-version"`
+	ViewVersion *view.Version      `json:"view-version"`
 }
 
 type viewResponse struct {
 	MetadataLoc string             `json:"metadata-location"`
 	RawMetadata json.RawMessage    `json:"metadata"`
 	Config      iceberg.Properties `json:"config"`
-	Metadata    table.Metadata     `json:"-"`
+	Metadata    view.Metadata      `json:"-"`
+}
+
+func (v *viewResponse) UnmarshalJSON(b []byte) (err error) {
+	type Alias viewResponse
+	if err = json.Unmarshal(b, (*Alias)(v)); err != nil {
+		return err
+	}
+
+	v.Metadata, err = view.ParseMetadataBytes(v.RawMetadata)
+
+	return
+}
+
+// LoadView loads a view from the catalog
+func (r *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(identifier)
+	if err != nil {
+		return nil, err
+	}
+
+	ret, err := doGet[viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", viewName},
+		r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchView})
+	if err != nil {
+		return nil, err
+	}
+
+	return view.New(identifier, ret.Metadata, ret.MetadataLoc), nil
 }
 
 // CreateView creates a new view in the catalog.
-func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, schema *iceberg.Schema, sql string, props iceberg.Properties) error {
-	ns, view, err := splitIdentForPath(identifier)
+func (r *Catalog) CreateView(ctx context.Context, identifier table.Identifier, version *view.Version, schema *iceberg.Schema, props iceberg.Properties) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(identifier)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	freshSchema, err := iceberg.AssignFreshSchemaIDs(schema, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	payload := createViewRequest{
-		Name:   view,
-		Schema: freshSchema,
-		SQL:    sql,
-		Props:  props,
-		ViewVersion: viewVersion{
-			VersionID:   1,
-			TimestampMs: time.Now().UnixMilli(),
-			SchemaID:    freshSchema.ID,
-			Summary:     map[string]string{"sql": sql},
-			Representations: []struct {
-				Type    string `json:"type"`
-				SQL     string `json:"sql"`
-				Dialect string `json:"dialect"`
-			}{
-				{Type: "sql", SQL: sql, Dialect: "default"},
-			},
-			DefaultCatalog:   r.name,
-			DefaultNamespace: strings.Split(ns, namespaceSeparator),
-		},
+		Name:        viewName,
+		Schema:      freshSchema,
+		Props:       props,
+		ViewVersion: version,
 	}
 
-	_, err = doPost[createViewRequest, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views"}, payload,
+	ret, err := doPost[createViewRequest, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views"}, payload,
 		r.cl, map[int]error{
 			http.StatusNotFound: catalog.ErrNoSuchNamespace,
 			http.StatusConflict: catalog.ErrViewAlreadyExists,
 		})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return view.New(identifier, ret.Metadata, ret.MetadataLoc), nil
+}
+
+// UpdateView updates a view in the catalog.
+func (r *Catalog) UpdateView(ctx context.Context, ident table.Identifier, requirements []view.Requirement, updates []view.Update) (*view.View, error) {
+	ns, viewName, err := splitIdentForPath(ident)
+	if err != nil {
+		return nil, err
+	}
+
+	restIdentifier := identifier{
+		Namespace: catalog.NamespaceFromIdent(ident),
+		Name:      viewName,
+	}
+	type payload struct {
+		Identifier   identifier         `json:"identifier"`
+		Requirements []view.Requirement `json:"requirements"`
+		Updates      []view.Update      `json:"updates"`
+	}
+	ret, err := doPost[payload, viewResponse](ctx, r.baseURI, []string{"namespaces", ns, "views", viewName},
+		payload{Identifier: restIdentifier, Requirements: requirements, Updates: updates}, r.cl,
+		map[int]error{http.StatusNotFound: catalog.ErrNoSuchView, http.StatusConflict: ErrCommitFailed})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return view.New(ident, ret.Metadata, ret.MetadataLoc), nil
 }
