@@ -18,8 +18,10 @@ git rm .github/labeler.yml
 go mod edit -module github.com/DataDog/iceberg-go
 go run github.com/sirkon/go-imports-rename@latest --save 'github.com/apache/iceberg-go => github.com/DataDog/iceberg-go'
 
-# Apply a patch for a special link name
-git apply ./initialize-fork.patch
+# Apply a patch for link directives
+find . -name '*.go' -print0 | while IFS= read -r -d '' file; do
+  sed -i '' '/^\/\/go:linkname/ s,github.com/apache/iceberg-go,github.com/DataDog/iceberg-go,g' "$file"
+done
 
 # Replace all gocloud.dev import paths to the inlined subtree of the repo (effectivement vendoring gocloud.dev)
 go run github.com/sirkon/go-imports-rename@latest --save 'gocloud.dev => github.com/DataDog/iceberg-go/go-cloud'
