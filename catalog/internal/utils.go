@@ -31,10 +31,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	icebergio "github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/table"
+	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/catalog"
+	icebergio "github.com/DataDog/iceberg-go/io"
+	"github.com/DataDog/iceberg-go/table"
 	"github.com/google/uuid"
 )
 

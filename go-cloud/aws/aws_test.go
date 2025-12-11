@@ -23,7 +23,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
-	gcaws "gocloud.dev/aws"
+	gcaws "github.com/DataDog/iceberg-go/go-cloud/aws"
 )
 
 func TestV2ConfigFromURLParams(t *testing.T) {

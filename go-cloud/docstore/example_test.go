@@ -23,11 +23,11 @@ import (
 
 	firestore "cloud.google.com/go/firestore/apiv1"
 	"github.com/aws/smithy-go"
-	"gocloud.dev/docstore"
-	_ "gocloud.dev/docstore/awsdynamodb/v2"
-	_ "gocloud.dev/docstore/gcpfirestore"
-	"gocloud.dev/docstore/memdocstore"
-	"gocloud.dev/gcerrors"
+	"github.com/DataDog/iceberg-go/go-cloud/docstore"
+	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb/v2"
+	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/gcpfirestore"
+	"github.com/DataDog/iceberg-go/go-cloud/docstore/memdocstore"
+	"github.com/DataDog/iceberg-go/go-cloud/gcerrors"
 )
 
 type Player struct {

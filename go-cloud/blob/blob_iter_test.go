@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"gocloud.dev/blob/memblob"
+	"github.com/DataDog/iceberg-go/go-cloud/blob/memblob"
 )
 
 // Verify ListIterator.All.

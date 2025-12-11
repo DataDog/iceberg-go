@@ -24,11 +24,11 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/aws/smithy-go"
-	"gocloud.dev/blob"
-	"gocloud.dev/blob/fileblob"
+	"github.com/DataDog/iceberg-go/go-cloud/blob"
+	"github.com/DataDog/iceberg-go/go-cloud/blob/fileblob"
 
-	_ "gocloud.dev/blob/gcsblob"
-	_ "gocloud.dev/blob/s3blob"
+	_ "github.com/DataDog/iceberg-go/go-cloud/blob/gcsblob"
+	_ "github.com/DataDog/iceberg-go/go-cloud/blob/s3blob"
 )
 
 func ExampleBucket_NewReader() {

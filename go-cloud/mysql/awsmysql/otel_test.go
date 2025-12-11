@@ -23,9 +23,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"go.opentelemetry.io/otel/attribute"
-	"gocloud.dev/internal/testing/oteltest"
-	"gocloud.dev/internal/testing/terraform"
-	"gocloud.dev/mysql"
+	"github.com/DataDog/iceberg-go/go-cloud/internal/testing/oteltest"
+	"github.com/DataDog/iceberg-go/go-cloud/internal/testing/terraform"
+	"github.com/DataDog/iceberg-go/go-cloud/mysql"
 )
 
 func TestOpenTelemetry(t *testing.T) {

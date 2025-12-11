@@ -18,9 +18,9 @@ import (
 	"context"
 	"log"
 
-	"gocloud.dev/gcp"
-	"gocloud.dev/pubsub"
-	"gocloud.dev/pubsub/gcppubsubv2"
+	"github.com/DataDog/iceberg-go/go-cloud/gcp"
+	"github.com/DataDog/iceberg-go/go-cloud/pubsub"
+	"github.com/DataDog/iceberg-go/go-cloud/pubsub/gcppubsubv2"
 )
 
 func ExampleOpenTopic() {
