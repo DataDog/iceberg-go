@@ -17,7 +17,7 @@
 
 module github.com/DataDog/iceberg-go
 
-go 1.24.9
+go 1.25.7
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0
