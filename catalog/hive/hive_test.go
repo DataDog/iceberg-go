@@ -22,9 +22,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/table"
+	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/catalog"
+	"github.com/DataDog/iceberg-go/table"
 	"github.com/beltran/gohive/hive_metastore"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"

@@ -24,7 +24,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gocloud.dev/blob/memblob"
+	"github.com/DataDog/iceberg-go/go-cloud/blob/memblob"
 )
 
 func TestDefaultKeyExtractor(t *testing.T) {

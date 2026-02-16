@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/iceberg-go"
+	"github.com/DataDog/iceberg-go"
 )
 
 // WriterFactory manages the creation and lifecycle of RollingDataWriter instances
