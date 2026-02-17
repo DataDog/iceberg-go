@@ -109,6 +109,9 @@ func startRecordFeeder(ctx context.Context, itr iter.Seq2[arrow.RecordBatch, err
 }
 
 func (p *partitionedFanoutWriter) fanout(ctx context.Context, inputRecordsCh <-chan arrow.RecordBatch, dataFilesChannel chan<- iceberg.DataFile) error {
+	if r := recover(); r != nil {
+		return errors.New("panic fanning out tasks")
+	}
 	for {
 		select {
 		case <-ctx.Done():

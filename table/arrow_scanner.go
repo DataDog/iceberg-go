@@ -20,8 +20,10 @@ package table
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
+	"log"
 	"strconv"
 	"sync"
 
@@ -79,8 +81,11 @@ func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, 
 	perFileChan := make(chan map[string]*arrow.Chunked, concurrency)
 	go func() {
 		defer close(perFileChan)
-		for _, v := range uniqueDeletes {
-			g.Go(func() error {
+		for df, v := range uniqueDeletes {
+			g.Go(func() (err error) {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panicked reading deletes for file '%s'", df)
+				}
 				deletes, err := readDeletes(ctx, fs, v)
 				if deletes != nil {
 					perFileChan <- deletes
@@ -693,6 +698,9 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
+			if r := recover(); r != nil {
+				cancel(errors.New("panic reading scan tasks"))
+			}
 			for {
 				select {
 				case <-ctx.Done():
@@ -702,6 +710,7 @@ func (as *arrowScan) recordBatchesFromTasksAndDeletes(ctx context.Context, tasks
 						return
 					}
 
+					log.Printf("resolving deletes for file scan task '%s'\n", task.Value.File.FilePath())
 					if err := as.recordsFromTask(ctx, task, records,
 						deletesPerFile[task.Value.File.FilePath()]); err != nil {
 						cancel(err)
