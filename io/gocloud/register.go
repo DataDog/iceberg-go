@@ -21,8 +21,8 @@ import (
 	"context"
 	"net/url"
 
-	icebergio "github.com/apache/iceberg-go/io"
-	"gocloud.dev/blob/memblob"
+	icebergio "github.com/DataDog/iceberg-go/io"
+	"github.com/DataDog/iceberg-go/go-cloud/blob/memblob"
 )
 
 func init() {
