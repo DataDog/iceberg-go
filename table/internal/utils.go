@@ -31,9 +31,9 @@ import (
 	"unicode/utf8"
 	_ "unsafe"
 
+	"github.com/DataDog/iceberg-go"
 	"github.com/apache/arrow-go/v18/arrow/decimal"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
-	"github.com/DataDog/iceberg-go"
 	"github.com/hamba/avro/v2"
 	"golang.org/x/sync/errgroup"
 )
@@ -530,7 +530,15 @@ func MapExec[T, S any](nWorkers int, slice iter.Seq[T], fn func(T) (S, error)) i
 	out := make(chan S, nWorkers)
 
 	for range nWorkers {
-		g.Go(func() error {
+		g.Go(func() (err error) {
+			defer func() {
+				// drain out if we exit early with an error
+				if err != nil {
+					for range ch {
+					}
+				}
+			}()
+
 			for v := range ch {
 				result, err := fn(v)
 				if err != nil {
