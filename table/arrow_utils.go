@@ -27,6 +27,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/config"
+	"github.com/DataDog/iceberg-go/internal"
+	iceio "github.com/DataDog/iceberg-go/io"
+	tblutils "github.com/DataDog/iceberg-go/table/internal"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/bitutil"
@@ -35,11 +40,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/arrow/scalar"
-	"github.com/DataDog/iceberg-go"
-	"github.com/DataDog/iceberg-go/config"
-	"github.com/DataDog/iceberg-go/internal"
-	iceio "github.com/DataDog/iceberg-go/io"
-	tblutils "github.com/DataDog/iceberg-go/table/internal"
 	"github.com/google/uuid"
 	"github.com/pterm/pterm"
 	"golang.org/x/sync/errgroup"
@@ -1368,7 +1368,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 				}
 			}()
 
-			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.props)
+			dataFiles[i] = FileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.props)
 
 			return nil
 		})
@@ -1381,7 +1381,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 	return dataFiles, nil
 }
 
-func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, props iceberg.Properties) iceberg.DataFile {
+func FileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, props iceberg.Properties) iceberg.DataFile {
 	format := tblutils.FormatFromFileName(filePath)
 	rdr := must(format.Open(ctx, fileIO, filePath))
 	defer rdr.Close()
