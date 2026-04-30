@@ -21,7 +21,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/apache/iceberg-go"
+	"github.com/DataDog/iceberg-go"
 )
 
 // RewriteResult summarizes a completed compaction.

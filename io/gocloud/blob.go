@@ -27,9 +27,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	icebergio "github.com/apache/iceberg-go/io"
-	"gocloud.dev/blob"
-	"gocloud.dev/gcerrors"
+	icebergio "github.com/DataDog/iceberg-go/io"
+	"github.com/DataDog/iceberg-go/go-cloud/blob"
+	"github.com/DataDog/iceberg-go/go-cloud/gcerrors"
 )
 
 // blobOpenFile describes a single open blob as a File.
