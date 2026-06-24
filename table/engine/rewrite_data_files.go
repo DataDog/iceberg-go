@@ -183,6 +183,40 @@ func RewriteDataFiles(ctx context.Context, t *Transaction, groups []CompactionTa
 	return result, nil
 }
 
+// ExecuteCompactionGroup reads the tasks in group, writes consolidated output
+// files, and returns a [CompactionGroupResult] for the leader to stage via
+// [table.RewriteFiles.ApplyResult]. It is the distributed-worker half of the
+// compaction pipeline; the leader calls [RewriteDataFiles] (or drives a
+// [table.RewriteFiles] builder manually) once all workers have returned.
+func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTaskGroup) (CompactionGroupResult, error) {
+	result := CompactionGroupResult{PartitionKey: group.PartitionKey}
+
+	if len(group.Tasks) == 0 {
+		return result, nil
+	}
+
+	scan := tbl.Scan()
+	arrowSchema, records, err := ReadTasks(ctx, scan, group.Tasks)
+	if err != nil {
+		return result, fmt.Errorf("read tasks for compaction group %q: %w", group.PartitionKey, err)
+	}
+
+	for df, err := range WriteRecords(ctx, tbl, arrowSchema, records) {
+		if err != nil {
+			return result, fmt.Errorf("write compacted files for group %q: %w", group.PartitionKey, err)
+		}
+		result.NewDataFiles = append(result.NewDataFiles, df)
+	}
+
+	result.OldDataFiles = make([]iceberg.DataFile, 0, len(group.Tasks))
+	for _, task := range group.Tasks {
+		result.OldDataFiles = append(result.OldDataFiles, task.File)
+	}
+	result.SafePosDeletes = collectSafePositionDeletes(group.Tasks)
+
+	return result, nil
+}
+
 // collectSafePositionDeletes returns position delete files from the given
 // tasks that are safe to remove during compaction.
 //

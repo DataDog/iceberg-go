@@ -225,9 +225,13 @@ func (t Table) executeOrphanCleanup(ctx context.Context, cfg *orphanCleanupConfi
 	return result, nil
 }
 
-// getReferencedFiles collects all files referenced by table metadata: previous metadata
+// GetReferencedFiles collects all files referenced by table metadata: previous metadata
 // files, statistics and partition-statistics paths (Puffin, etc.), and all paths reachable
 // from current snapshots (manifest lists, manifests, data files).
+func (t Table) GetReferencedFiles(fs iceio.IO) (map[string]bool, error) {
+	return t.getReferencedFiles(fs)
+}
+
 func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 	referenced := make(map[string]bool)
 	metadata := t.metadata
@@ -268,12 +272,16 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		for _, manifest := range manifestFiles {
 			referenced[manifest.FilePath()] = true
 
-			entries, err := manifest.FetchEntries(fs, false)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read manifest entries: %w", err)
-			}
-
-			for _, entry := range entries {
+			// discardDeleted=true: skip DELETED-status entries when
+			// computing the reachable file set. A DELETED entry is
+			// not live in this snapshot and should not pin the file
+			// against orphan cleanup once the snapshot that
+			// originally held it live has been expired.
+			// This matches iceberg-java and pyiceberg behavior.
+			for entry, err := range manifest.Entries(fs, true) {
+				if err != nil {
+					return nil, fmt.Errorf("failed to read manifest entries: %w", err)
+				}
 				referenced[entry.DataFile().FilePath()] = true
 			}
 		}

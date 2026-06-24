@@ -55,6 +55,11 @@ type Config struct {
 	// before evicting. Higher values produce better packing at the cost
 	// of memory. Default: DefaultPackingLookback.
 	PackingLookback uint
+
+	// PreserveDeadEqualityDeletes, when true, retains equality delete
+	// files that are provably dead after the rewrite.
+	// Zero value (false) is the recommended default.
+	PreserveDeadEqualityDeletes bool
 }
 
 const (

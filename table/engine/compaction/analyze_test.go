@@ -32,7 +32,8 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
-	"github.com/DataDog/iceberg-go/table/compaction"
+	"github.com/DataDog/iceberg-go/table/engine"
+	"github.com/DataDog/iceberg-go/table/engine/compaction"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -104,7 +105,7 @@ func writeTestParquetFile(t testing.TB, path string, sc *arrow.Schema, jsonData 
 func TestAnalyze_SmallFiles(t *testing.T) {
 	tbl := newAnalyzeTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 5 {
@@ -113,7 +114,7 @@ func TestAnalyze_SmallFiles(t *testing.T) {
 			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -140,14 +141,14 @@ func TestAnalyze_SmallFiles(t *testing.T) {
 func TestAnalyze_AllOptimal(t *testing.T) {
 	tbl := newAnalyzeTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	dataPath := tbl.Location() + "/data/file-0.parquet"
 	writeTestParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "hello"}]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 

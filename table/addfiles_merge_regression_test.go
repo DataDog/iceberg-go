@@ -46,6 +46,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -139,7 +140,7 @@ func TestAddFilesRespectsMergeEnabled(t *testing.T) {
 		writeParquet(filePath)
 
 		txn := tbl.NewTransaction()
-		require.NoError(t, txn.AddFiles(ctx, []string{filePath}, nil, false),
+		require.NoError(t, engine.AddFiles(ctx, txn, []string{filePath}, nil, false),
 			"AddFiles commit %d failed", i+1)
 
 		tbl, err = txn.Commit(ctx)

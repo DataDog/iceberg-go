@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -34,7 +34,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/config"
-
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
@@ -343,7 +342,7 @@ func (s *FanoutWriterTestSuite) TestPartitionedLogicalTypesRequireIntFieldIDCase
 	s.Require().NoError(err)
 
 	tbl := New(
-		Identifier{"test", "table"},
+		[]string{"test", "table"},
 		meta,
 		filepath.Join(loc, "metadata", "v1.metadata.json"),
 		func(ctx context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
@@ -364,7 +363,7 @@ func (s *FanoutWriterTestSuite) TestPartitionedLogicalTypesRequireIntFieldIDCase
 
 	batchSize := int64(record.NumRows())
 	txn := tbl.NewTransaction()
-	err = txn.AppendTable(s.ctx, arrowTable, batchSize, snapshotProps)
+	err = AppendTable(s.ctx, txn, arrowTable, batchSize, snapshotProps)
 	s.Require().NoError(err, "AppendTable should succeed with all primitive types")
 }
 

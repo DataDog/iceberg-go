@@ -31,6 +31,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 )
 
 // gatedReader is a RecordReader whose Next() blocks on a channel, giving
@@ -167,7 +168,7 @@ func BenchmarkFanoutMemory(b *testing.B) {
 		// Run Append in the background — it blocks on the gated reader.
 		errCh := make(chan error, 1)
 		go func() {
-			_, err := tbl.Append(ctx, reader, iceberg.Properties{})
+			_, err := engine.TableAppend(ctx, tbl, reader, iceberg.Properties{})
 			errCh <- err
 		}()
 

@@ -135,9 +135,10 @@ func (p *positionDeletePartitionedFanoutWriter) partitionPath(partitionContext p
 		return "", fmt.Errorf("unexpected missing partition spec in metadata for spec id %d", partitionContext.specID)
 	}
 
-	data := newPartitionRecord(partitionContext.partitionData, spec.PartitionType(p.schema))
+	tableSchema := p.metadata.CurrentSchema()
+	data := newPartitionRecord(partitionContext.partitionData, spec.PartitionType(tableSchema))
 
-	return spec.PartitionToPath(data, p.schema), nil
+	return spec.PartitionToPath(data, tableSchema), nil
 }
 
 func (p *positionDeletePartitionedFanoutWriter) yieldDataFiles(fanoutWorkers *errgroup.Group, outputDataFilesCh chan iceberg.DataFile) iter.Seq2[iceberg.DataFile, error] {

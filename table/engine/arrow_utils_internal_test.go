@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"bytes"
@@ -31,14 +31,15 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/metadata"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/table"
 	"github.com/DataDog/iceberg-go/table/internal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
-func constructTestTable(t *testing.T, writeStats []string) (*metadata.FileMetaData, Metadata) {
-	tableMeta, err := ParseMetadataString(`{
+func constructTestTable(t *testing.T, writeStats []string) (*metadata.FileMetaData, table.Metadata) {
+	tableMeta, err := table.ParseMetadataString(`{
 		"format-version": 2,
         "location": "s3://bucket/test/location",
         "last-column-id": 7,

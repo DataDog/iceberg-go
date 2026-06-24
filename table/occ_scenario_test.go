@@ -37,6 +37,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -198,7 +199,7 @@ func (s *OCCScenarioTestSuite) TestManifestListInheritedAfterConflict() {
 	defer rowB.Release()
 
 	txB := emptyTbl.NewTransaction()
-	s.Require().NoError(txB.AppendTable(s.ctx, rowB, rowB.NumRows(), nil))
+	s.Require().NoError(engine.AppendTable(s.ctx, txB, rowB, rowB.NumRows(), nil))
 
 	_, err := txB.Commit(s.ctx)
 	s.Require().NoError(err, "Writer B must commit successfully")
@@ -228,7 +229,7 @@ func (s *OCCScenarioTestSuite) TestManifestListInheritedAfterConflict() {
 	defer rowA.Release()
 
 	txA := writerATable.NewTransaction()
-	s.Require().NoError(txA.AppendTable(s.ctx, rowA, rowA.NumRows(), nil))
+	s.Require().NoError(engine.AppendTable(s.ctx, txA, rowA, rowA.NumRows(), nil))
 
 	_, err = txA.Commit(s.ctx)
 	s.Require().NoError(err, "Writer A must succeed after one conflict retry")
@@ -285,7 +286,7 @@ func (s *OCCScenarioTestSuite) TestV3RowLineageCorrectAfterOCCRetry() {
 	defer rowB.Release()
 
 	txB := emptyTbl.NewTransaction()
-	s.Require().NoError(txB.AppendTable(s.ctx, rowB, rowB.NumRows(), nil))
+	s.Require().NoError(engine.AppendTable(s.ctx, txB, rowB, rowB.NumRows(), nil))
 
 	_, err := txB.Commit(s.ctx)
 	s.Require().NoError(err, "Writer B must commit successfully")
@@ -320,7 +321,7 @@ func (s *OCCScenarioTestSuite) TestV3RowLineageCorrectAfterOCCRetry() {
 	defer rowA.Release()
 
 	txA := writerATable.NewTransaction()
-	s.Require().NoError(txA.AppendTable(s.ctx, rowA, rowA.NumRows(), nil))
+	s.Require().NoError(engine.AppendTable(s.ctx, txA, rowA, rowA.NumRows(), nil))
 
 	_, err = txA.Commit(s.ctx)
 	s.Require().NoError(err, "Writer A must succeed after one conflict retry")
@@ -391,7 +392,7 @@ func (s *OCCScenarioTestSuite) TestV3MergeAppendRowLineageAfterOCCRetry() {
 	defer rowB.Release()
 
 	txB := emptyTbl.NewTransaction()
-	s.Require().NoError(txB.AppendTable(s.ctx, rowB, rowB.NumRows(), nil))
+	s.Require().NoError(engine.AppendTable(s.ctx, txB, rowB, rowB.NumRows(), nil))
 	_, err := txB.Commit(s.ctx)
 	s.Require().NoError(err, "Writer B must commit")
 
@@ -417,7 +418,7 @@ func (s *OCCScenarioTestSuite) TestV3MergeAppendRowLineageAfterOCCRetry() {
 	defer rowA.Release()
 
 	txA := writerATable.NewTransaction()
-	s.Require().NoError(txA.AppendTable(s.ctx, rowA, rowA.NumRows(), nil))
+	s.Require().NoError(engine.AppendTable(s.ctx, txA, rowA, rowA.NumRows(), nil))
 	_, err = txA.Commit(s.ctx)
 	s.Require().NoError(err, "Writer A (merge-append) must succeed after retry")
 

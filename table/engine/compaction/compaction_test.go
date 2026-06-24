@@ -24,7 +24,7 @@ import (
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/table"
-	"github.com/DataDog/iceberg-go/table/compaction"
+	"github.com/DataDog/iceberg-go/table/engine/compaction"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

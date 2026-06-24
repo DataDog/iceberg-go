@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -30,8 +30,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/DataDog/iceberg-go"
-	"github.com/DataDog/iceberg-go/internal"
-	"github.com/DataDog/iceberg-go/io"
+	iceinternal "github.com/DataDog/iceberg-go/internal"
+	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -128,14 +128,14 @@ func TestPositionDeletePartitionedFanoutWriterProcessBatch(t *testing.T) {
 			require.NoError(t, err)
 
 			writeUUID := uuid.New()
-			cw := newConcurrentDataFileWriter(func(rootLocation string, fs io.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
+			cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
 				return newPositionDeleteWriter(rootLocation, fs, meta, props, opts...)
 			})
 			factory, err := newWriterFactory(t.TempDir(), recordWritingArgs{
-				fs:        &io.LocalFS{},
+				fs:        &iceio.LocalFS{},
 				sc:        PositionalDeleteArrowSchema,
 				writeUUID: &writeUUID,
-				counter:   internal.Counter(0),
+				counter:   iceinternal.Counter(0),
 			}, metadataBuilder, iceberg.PositionalDeleteSchema, 1024*1024,
 				withContentType(iceberg.EntryContentPosDeletes),
 				withFactoryFileSchema(iceberg.PositionalDeleteSchema))
@@ -364,14 +364,14 @@ func TestPositionDeletePartitionedFanoutWriterRoutesPartitionsIndependently(t *t
 	}
 
 	writeUUID := uuid.New()
-	cw := newConcurrentDataFileWriter(func(rootLocation string, fs io.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
+	cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
 		return newPositionDeleteWriter(rootLocation, fs, meta, props, opts...)
 	})
 	factory, err := newWriterFactory(t.TempDir(), recordWritingArgs{
-		fs:        &io.LocalFS{},
+		fs:        &iceio.LocalFS{},
 		sc:        PositionalDeleteArrowSchema,
 		writeUUID: &writeUUID,
-		counter:   internal.Counter(0),
+		counter:   iceinternal.Counter(0),
 	}, metadataBuilder, iceberg.PositionalDeleteSchema, 1024*1024,
 		withContentType(iceberg.EntryContentPosDeletes),
 		withFactoryFileSchema(iceberg.PositionalDeleteSchema))
@@ -457,9 +457,9 @@ func TestPositionDeletePartitionedNoGoroutineLeak(t *testing.T) {
 			map[string]partitionContext{}, recordWritingArgs{
 				sc:        PositionalDeleteArrowSchema,
 				itr:       emptyItr,
-				fs:        &io.LocalFS{},
+				fs:        &iceio.LocalFS{},
 				writeUUID: &writeUUID,
-				counter:   internal.Counter(0),
+				counter:   iceinternal.Counter(0),
 			})
 
 		for range itr {
@@ -708,9 +708,9 @@ func TestPositionDeleteUnpartitionedSortOrderID(t *testing.T) {
 	seq := positionDeleteRecordsToDataFiles(t.Context(), t.TempDir(), metadataBuilder, nil, recordWritingArgs{
 		sc:        PositionalDeleteArrowSchema,
 		itr:       itr,
-		fs:        &io.LocalFS{},
+		fs:        &iceio.LocalFS{},
 		writeUUID: &writeUUID,
-		counter:   internal.Counter(0),
+		counter:   iceinternal.Counter(0),
 	})
 
 	var files []iceberg.DataFile
@@ -770,9 +770,9 @@ func TestEqualityDeleteUnpartitionedSortOrderID(t *testing.T) {
 	seq, err := equalityDeleteRecordsToDataFiles(t.Context(), t.TempDir(), metadataBuilder, delSchema, []int{1}, recordWritingArgs{
 		sc:        delArrowSc,
 		itr:       itr,
-		fs:        &io.LocalFS{},
+		fs:        &iceio.LocalFS{},
 		writeUUID: &writeUUID,
-		counter:   internal.Counter(0),
+		counter:   iceinternal.Counter(0),
 	})
 	require.NoError(t, err)
 

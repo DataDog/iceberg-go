@@ -29,6 +29,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/DataDog/iceberg-go/table/internal"
 )
 
@@ -99,7 +100,7 @@ func runBenchmark(b *testing.B, icebergSchema *iceberg.Schema, arrSchema *arrow.
 					b.Fatalf("Failed to create reader: %v", err)
 				}
 
-				newTable, err := tbl.Append(ctx, reader, iceberg.Properties{})
+				newTable, err := engine.TableAppend(ctx, tbl, reader, iceberg.Properties{})
 				if err != nil {
 					reader.Release()
 					b.Fatalf("Append error: %v", err)
@@ -596,7 +597,7 @@ func BenchmarkPartitionedWriteThroughput_PartitionCount(b *testing.B) {
 					b.Fatalf("Failed to create reader: %v", err)
 				}
 
-				newTable, err := tbl.Append(ctx, reader, iceberg.Properties{})
+				newTable, err := engine.TableAppend(ctx, tbl, reader, iceberg.Properties{})
 				if err != nil {
 					reader.Release()
 					b.Fatalf("Append error: %v", err)

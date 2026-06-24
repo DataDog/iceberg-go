@@ -33,6 +33,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -464,7 +465,7 @@ func TestRowDeltaIntegrationPosDeleteRoundTrip(t *testing.T) {
 	)
 
 	// Step 1: Append 5 rows via normal append
-	arrowSc, err := table.SchemaToArrowSchema(iceSchema, nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(iceSchema, nil, false, false)
 	require.NoError(t, err)
 
 	dataPath := location + "/data/data-001.parquet"
@@ -477,7 +478,7 @@ func TestRowDeltaIntegrationPosDeleteRoundTrip(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	err = tx.AddFiles(t.Context(), []string{dataPath}, nil, false)
+	err = engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false)
 	require.NoError(t, err)
 
 	tbl, err = tx.Commit(t.Context())
@@ -488,7 +489,7 @@ func TestRowDeltaIntegrationPosDeleteRoundTrip(t *testing.T) {
 
 	// Step 2: Commit a position delete via RowDelta that removes rows 1 and 3
 	// (0-indexed: positions 1 and 3 → "beta" and "delta")
-	posDelArrowSc := table.PositionalDeleteArrowSchema
+	posDelArrowSc := engine.PositionalDeleteArrowSchema
 	posDelPath := location + "/data/pos-del-001.parquet"
 	writeParquetFile(t, posDelPath, posDelArrowSc, `[
 		{"file_path": "`+dataPath+`", "pos": 1},
@@ -514,7 +515,7 @@ func TestRowDeltaIntegrationPosDeleteRoundTrip(t *testing.T) {
 	assertRowCount(t, tbl, 3)
 
 	// Verify the actual values
-	_, itr, err := tbl.Scan(table.WithSelectedFields("id", "data")).ToArrowRecords(t.Context())
+	_, itr, err := engine.ToArrowRecords(t.Context(), tbl.Scan(table.WithSelectedFields("id", "data")))
 	require.NoError(t, err)
 
 	var ids []int64
@@ -533,7 +534,7 @@ func TestRowDeltaIntegrationPosDeleteRoundTrip(t *testing.T) {
 func assertRowCount(t *testing.T, tbl *table.Table, expected int64) {
 	t.Helper()
 
-	_, itr, err := tbl.Scan().ToArrowRecords(t.Context())
+	_, itr, err := engine.ToArrowRecords(t.Context(), tbl.Scan())
 	require.NoError(t, err)
 
 	var total int64

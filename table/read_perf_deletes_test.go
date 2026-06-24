@@ -31,6 +31,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,7 +53,7 @@ func TestReadPerfUnderDeletePressure(t *testing.T) {
 
 	tbl := newReadPerfTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Write a data file with 1000 rows
@@ -61,7 +62,7 @@ func TestReadPerfUnderDeletePressure(t *testing.T) {
 	writeParquetFile(t, dataPath, arrowSc, generateRowsJSON(numRows))
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -74,7 +75,7 @@ func TestReadPerfUnderDeletePressure(t *testing.T) {
 	delSchema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
 	)
-	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	delArrowSc, err := engine.SchemaToArrowSchema(delSchema, nil, true, false)
 	require.NoError(t, err)
 
 	// Progressive delete pressure: add individual equality delete files
@@ -98,7 +99,7 @@ func TestReadPerfUnderDeletePressure(t *testing.T) {
 			}
 
 			tx := tbl.NewTransaction()
-			deleteFiles, err := tx.WriteEqualityDeletes(t.Context(), []int{1}, records)
+			deleteFiles, err := engine.WriteEqualityDeletes(t.Context(), tx, []int{1}, records)
 			require.NoError(t, err)
 			rec.Release()
 
@@ -150,7 +151,7 @@ func BenchmarkScanWithEqualityDeletes(b *testing.B) {
 
 			b.ResetTimer()
 			for b.Loop() {
-				_, itr, err := tbl.Scan().ToArrowRecords(ctx)
+				_, itr, err := engine.ToArrowRecords(ctx, tbl.Scan())
 				require.NoError(b, err)
 
 				var rows int64
@@ -202,7 +203,7 @@ func setupTableWithDeletes(tb testing.TB, numRows, numDeletes int) *table.Table 
 
 	tbl := newReadPerfTestTable(tb)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(tb, err)
 
 	dataPath := tbl.Location() + "/data/data-001.parquet"
@@ -210,7 +211,7 @@ func setupTableWithDeletes(tb testing.TB, numRows, numDeletes int) *table.Table 
 
 	ctx := context.Background()
 	tx := tbl.NewTransaction()
-	require.NoError(tb, tx.AddFiles(ctx, []string{dataPath}, nil, false))
+	require.NoError(tb, engine.AddFiles(ctx, tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(ctx)
 	require.NoError(tb, err)
 
@@ -221,7 +222,7 @@ func setupTableWithDeletes(tb testing.TB, numRows, numDeletes int) *table.Table 
 	delSchema := iceberg.NewSchema(0,
 		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
 	)
-	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	delArrowSc, err := engine.SchemaToArrowSchema(delSchema, nil, true, false)
 	require.NoError(tb, err)
 
 	for i := range numDeletes {
@@ -234,7 +235,7 @@ func setupTableWithDeletes(tb testing.TB, numRows, numDeletes int) *table.Table 
 		}
 
 		tx = tbl.NewTransaction()
-		deleteFiles, err := tx.WriteEqualityDeletes(ctx, []int{1}, records)
+		deleteFiles, err := engine.WriteEqualityDeletes(ctx, tx, []int{1}, records)
 		require.NoError(tb, err)
 		rec.Release()
 
@@ -255,7 +256,7 @@ func scanAndMeasure(tb testing.TB, ctx context.Context, tbl *table.Table) (time.
 	tb.Helper()
 
 	start := time.Now()
-	_, itr, err := tbl.Scan().ToArrowRecords(ctx)
+	_, itr, err := engine.ToArrowRecords(ctx, tbl.Scan())
 	require.NoError(tb, err)
 
 	var total int64

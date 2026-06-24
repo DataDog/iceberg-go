@@ -30,6 +30,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 )
@@ -102,7 +103,7 @@ func (s *WriteRecordsTestSuite) TestBasicWrite() {
 	}
 
 	var dataFiles []iceberg.DataFile
-	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+	for df, err := range engine.WriteRecords(s.ctx, tbl, schema, records) {
 		s.Require().NoError(err)
 		dataFiles = append(dataFiles, df)
 	}
@@ -130,7 +131,7 @@ func (s *WriteRecordsTestSuite) TestSmallTargetFileSizeProducesMultipleFiles() {
 
 	var totalRows int64
 	var dataFiles []iceberg.DataFile
-	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records, table.WithTargetFileSize(1)) {
+	for df, err := range engine.WriteRecords(s.ctx, tbl, schema, records, engine.WithTargetFileSize(1)) {
 		s.Require().NoError(err)
 		dataFiles = append(dataFiles, df)
 		totalRows += df.Count()
@@ -151,7 +152,7 @@ func (s *WriteRecordsTestSuite) TestWithWriteUUID() {
 		yield(rec, nil)
 	}
 
-	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records, table.WithWriteUUID(writeID)) {
+	for df, err := range engine.WriteRecords(s.ctx, tbl, schema, records, engine.WithWriteUUID(writeID)) {
 		s.Require().NoError(err)
 		s.Contains(df.FilePath(), writeID.String())
 	}
@@ -168,8 +169,8 @@ func (s *WriteRecordsTestSuite) TestClusteredWithMaxWriteWorkersIsRejected() {
 		dataFiles []iceberg.DataFile
 		writeErr  error
 	)
-	for df, err := range table.WriteRecords(s.ctx, tbl, schema, records,
-		table.WithClusteredWrite(), table.WithMaxWriteWorkers(4)) {
+	for df, err := range engine.WriteRecords(s.ctx, tbl, schema, records,
+		engine.WithClusteredWrite(), engine.WithMaxWriteWorkers(4)) {
 		if err != nil {
 			writeErr = err
 
@@ -205,7 +206,7 @@ func (s *WriteRecordsTestSuite) TestFSNotWritable() {
 	}, nil)
 	records := func(yield func(arrow.RecordBatch, error) bool) {}
 
-	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+	for _, err := range engine.WriteRecords(s.ctx, tbl, schema, records) {
 		s.Require().ErrorIs(err, iceberg.ErrNotImplemented)
 	}
 }
@@ -232,7 +233,7 @@ func (s *WriteRecordsTestSuite) TestFSError() {
 	}, nil)
 	records := func(yield func(arrow.RecordBatch, error) bool) {}
 
-	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+	for _, err := range engine.WriteRecords(s.ctx, tbl, schema, records) {
 		s.Require().ErrorIs(err, fsErr)
 	}
 }
@@ -245,7 +246,7 @@ func (s *WriteRecordsTestSuite) TestEmptyInput() {
 	records := func(yield func(arrow.RecordBatch, error) bool) {}
 
 	count := 0
-	for _, err := range table.WriteRecords(s.ctx, tbl, schema, records) {
+	for _, err := range engine.WriteRecords(s.ctx, tbl, schema, records) {
 		s.Require().NoError(err)
 		count++
 	}

@@ -18,7 +18,7 @@
 package table_test
 
 // Black-box coverage for the [table.RewriteFiles] snapshot-operation
-// builder, including the supporting [table.ExecuteCompactionGroup]
+// builder, including the supporting [engine.ExecuteCompactionGroup]
 // worker function and the [table.CollectSafePositionDeletes]
 // predicate. Tests cover the in-process path (one transaction stages
 // and commits) and the distributed-coordinator path (workers produce
@@ -35,6 +35,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -158,8 +159,8 @@ func TestCollectSafePositionDeletes_EmptyTasks(t *testing.T) {
 func TestExecuteCompactionGroup_EmptyGroup(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	got, err := table.ExecuteCompactionGroup(t.Context(), tbl,
-		table.CompactionTaskGroup{PartitionKey: "p"})
+	got, err := engine.ExecuteCompactionGroup(t.Context(), tbl,
+		engine.CompactionTaskGroup{PartitionKey: "p"})
 	require.NoError(t, err)
 	assert.Equal(t, "p", got.PartitionKey)
 	assert.Empty(t, got.OldDataFiles)
@@ -195,7 +196,7 @@ func TestRewriteFiles_AddDataFile_RejectsNonDataFile(t *testing.T) {
 func TestRewriteFiles_Commit_SingleShot(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 2 {
@@ -203,7 +204,7 @@ func TestRewriteFiles_Commit_SingleShot(t *testing.T) {
 		writeParquetFile(t, dataPath, arrowSc,
 			fmt.Sprintf(`[{"id": %d, "data": "seed"}]`, i+1))
 		seedTx := tbl.NewTransaction()
-		require.NoError(t, seedTx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), seedTx, []string{dataPath}, nil, false))
 		tbl, err = seedTx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -219,7 +220,7 @@ func TestRewriteFiles_Commit_SingleShot(t *testing.T) {
 
 	results := make([]table.CompactionGroupResult, 0, len(groups))
 	for _, g := range groups {
-		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		gr, err := engine.ExecuteCompactionGroup(t.Context(), tbl, g)
 		require.NoError(t, err)
 		results = append(results, gr)
 	}
@@ -304,12 +305,12 @@ func TestRewriteFiles_DeleteFile_RoutesByContentType(t *testing.T) {
 	//   Commit, so it would mask the routing error.)
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 	dataPath := tbl.Location() + "/data/seed.parquet"
 	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "seed"}]`)
 	seedTx := tbl.NewTransaction()
-	require.NoError(t, seedTx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), seedTx, []string{dataPath}, nil, false))
 	tbl, err = seedTx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -382,7 +383,7 @@ func TestRewriteFiles_RejectsNilDataFile(t *testing.T) {
 
 // TestRewriteFiles_DistributedEquivalence proves the worker+coordinator
 // pipeline lands at the same end state as the bundled in-process
-// [Transaction.RewriteDataFiles]: workers run [table.ExecuteCompactionGroup]
+// [Transaction.RewriteDataFiles]: workers run [engine.ExecuteCompactionGroup]
 // per group (here inline; in distributed compaction this happens on
 // remote peers and the results travel over the wire), then a single
 // leader transaction stages [table.RewriteFiles.Apply] +
@@ -390,7 +391,7 @@ func TestRewriteFiles_RejectsNilDataFile(t *testing.T) {
 func TestRewriteFiles_DistributedEquivalence(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 4 {
@@ -398,7 +399,7 @@ func TestRewriteFiles_DistributedEquivalence(t *testing.T) {
 		writeParquetFile(t, dataPath, arrowSc,
 			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -415,7 +416,7 @@ func TestRewriteFiles_DistributedEquivalence(t *testing.T) {
 
 	results := make([]table.CompactionGroupResult, 0, len(groups))
 	for _, g := range groups {
-		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		gr, err := engine.ExecuteCompactionGroup(t.Context(), tbl, g)
 		require.NoError(t, err)
 		require.NotEmpty(t, gr.NewDataFiles)
 		results = append(results, gr)
@@ -464,7 +465,7 @@ func TestRewriteFiles_DistributedEquivalence(t *testing.T) {
 func TestRewriteFiles_DropsSafePositionDeletes(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 3 {
@@ -472,14 +473,14 @@ func TestRewriteFiles_DropsSafePositionDeletes(t *testing.T) {
 		writeParquetFile(t, dataPath, arrowSc, fmt.Sprintf(
 			`[{"id": %d, "data": "a"}, {"id": %d, "data": "b"}]`, i*2+1, i*2+2))
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
 
 	firstDataPath := tbl.Location() + "/data/file-0.parquet"
 	posDelPath := tbl.Location() + "/data/pos-del-001.parquet"
-	writeParquetFile(t, posDelPath, table.PositionalDeleteArrowSchema,
+	writeParquetFile(t, posDelPath, engine.PositionalDeleteArrowSchema,
 		fmt.Sprintf(`[{"file_path": "%s", "pos": 0}]`, firstDataPath))
 
 	posDelBuilder, err := iceberg.NewDataFileBuilder(
@@ -509,7 +510,7 @@ func TestRewriteFiles_DropsSafePositionDeletes(t *testing.T) {
 	results := make([]table.CompactionGroupResult, 0, len(groups))
 	totalSafe := 0
 	for _, g := range groups {
-		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		gr, err := engine.ExecuteCompactionGroup(t.Context(), tbl, g)
 		require.NoError(t, err)
 		results = append(results, gr)
 		totalSafe += len(gr.SafePosDeletes)
@@ -568,7 +569,7 @@ func TestRewriteFiles_DropsSafePositionDeletes(t *testing.T) {
 func TestRewriteFiles_RejectsConcurrentEqDelete(t *testing.T) {
 	tbl, cat := newConcurrentRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 3 {
@@ -576,7 +577,7 @@ func TestRewriteFiles_RejectsConcurrentEqDelete(t *testing.T) {
 		writeParquetFile(t, dataPath, arrowSc,
 			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -592,7 +593,7 @@ func TestRewriteFiles_RejectsConcurrentEqDelete(t *testing.T) {
 
 	results := make([]table.CompactionGroupResult, 0, len(groups))
 	for _, g := range groups {
-		gr, err := table.ExecuteCompactionGroup(t.Context(), tbl, g)
+		gr, err := engine.ExecuteCompactionGroup(t.Context(), tbl, g)
 		require.NoError(t, err)
 		require.NotEmpty(t, gr.OldDataFiles)
 		results = append(results, gr)

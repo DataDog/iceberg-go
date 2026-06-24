@@ -26,6 +26,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,7 +59,7 @@ func newReplaceFilesTestTable(t *testing.T) *table.Table {
 func TestReplaceFiles_DataAndDeleteFiles(t *testing.T) {
 	tbl := newReplaceFilesTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Step 1: Write and commit a data file with 3 rows
@@ -70,14 +71,14 @@ func TestReplaceFiles_DataAndDeleteFiles(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 	assertRowCount(t, tbl, 3)
 
 	// Step 2: Add a position delete file via RowDelta
 	posDelPath := tbl.Location() + "/data/pos-del-001.parquet"
-	writeParquetFile(t, posDelPath, table.PositionalDeleteArrowSchema,
+	writeParquetFile(t, posDelPath, engine.PositionalDeleteArrowSchema,
 		fmt.Sprintf(`[{"file_path": "%s", "pos": 1}]`, dataPath))
 
 	posDelBuilder, err := iceberg.NewDataFileBuilder(
@@ -142,14 +143,14 @@ func TestReplaceFiles_DataAndDeleteFiles(t *testing.T) {
 func TestReplaceFiles_DelegatesToReplaceDataFilesWhenNoDeleteFiles(t *testing.T) {
 	tbl := newReplaceFilesTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	dataPath := tbl.Location() + "/data/data-001.parquet"
 	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "hello"}]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -182,14 +183,14 @@ func TestReplaceFiles_DelegatesToReplaceDataFilesWhenNoDeleteFiles(t *testing.T)
 func TestReplaceFiles_ValidationErrors(t *testing.T) {
 	tbl := newReplaceFilesTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	dataPath := tbl.Location() + "/data/data-001.parquet"
 	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "hello"}]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 

@@ -51,6 +51,18 @@ type (
 	perFilePosDeletes = map[string]positionDeletes
 )
 
+// releasePerFilePosDeletes releases all Arrow chunks held in a perFilePosDeletes
+// map. It is nil-safe and skips nil chunks within each positionDeletes slice.
+func releasePerFilePosDeletes(m perFilePosDeletes) {
+	for _, v := range m {
+		for _, chunk := range v {
+			if chunk != nil {
+				chunk.Release()
+			}
+		}
+	}
+}
+
 func readAllDeleteFiles(ctx context.Context, fs iceio.IO, tasks []FileScanTask, concurrency int) (perFilePosDeletes, error) {
 	var (
 		deletesPerFile = make(perFilePosDeletes)
@@ -751,11 +763,7 @@ func createIterator(ctx context.Context, numWorkers uint, records <-chan enumera
 				}
 			}
 
-			for _, v := range deletesPerFile {
-				for _, chunk := range v {
-					chunk.Release()
-				}
-			}
+			releasePerFilePosDeletes(deletesPerFile)
 		}()
 
 		defer cancel(nil)

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/DataDog/iceberg-go"
@@ -263,7 +264,92 @@ func (scan *Scan) Projection() (*iceberg.Schema, error) {
 		return curSchema, nil
 	}
 
+	caseSensitive := scan.caseSensitive
+	curVersion := scan.metadata.Version()
+	selectedFieldsMeta := metaFieldsFromSelectedFields(scan.selectedFields, caseSensitive)
+	schemaMeta := metaFieldsFromSchema(curSchema)
+	synthesisMeta := synthesizeMeta(selectedFieldsMeta, schemaMeta)
+	if len(synthesisMeta) > 0 && curVersion >= minFormatVersionRowLineage {
+		removedMetaSlice, missingMetaFields := removeMetadataFromSelectedFields(scan.selectedFields, synthesisMeta)
+		sch, err := curSchema.Select(caseSensitive, removedMetaSlice...)
+		if err != nil {
+			return nil, err
+		}
+
+		return iceberg.NewSchemaWithIdentifiers(sch.ID, sch.IdentifierFieldIDs, append(sch.Fields(), missingMetaFields...)...), nil
+	}
+
 	return curSchema.Select(scan.caseSensitive, scan.selectedFields...)
+}
+
+func removeMetadataFromSelectedFields(selectedFields []string, metaFields []string) ([]string, []iceberg.NestedField) {
+	filteredFields := []string{}
+	meta := []iceberg.NestedField{}
+
+	for _, field := range selectedFields {
+		if slices.Contains(metaFields, strings.ToLower(field)) {
+			switch strings.ToLower(field) {
+			case iceberg.LastUpdatedSequenceNumberColumnName:
+				meta = append(meta, iceberg.LastUpdatedSequenceNumber())
+			case iceberg.RowIDColumnName:
+				meta = append(meta, iceberg.RowID())
+			}
+
+			continue
+		}
+
+		filteredFields = append(filteredFields, field)
+	}
+
+	return filteredFields, meta
+}
+
+func metaFieldsFromSelectedFields(selectedFields []string, caseSensitive bool) []string {
+	meta := []string{}
+	if !caseSensitive {
+		for _, field := range selectedFields {
+			if strings.EqualFold(field, iceberg.RowIDColumnName) || strings.EqualFold(field, iceberg.LastUpdatedSequenceNumberColumnName) {
+				meta = append(meta, strings.ToLower(field))
+			}
+		}
+
+		return meta
+	}
+
+	for _, field := range selectedFields {
+		if field == iceberg.RowIDColumnName || field == iceberg.LastUpdatedSequenceNumberColumnName {
+			meta = append(meta, strings.ToLower(field))
+		}
+	}
+
+	return meta
+}
+
+func metaFieldsFromSchema(sch *iceberg.Schema) []string {
+	meta := []string{}
+	_, hasRowIDMeta := sch.FindFieldByName(iceberg.RowIDColumnName)
+	_, hasSeqMeta := sch.FindFieldByName(iceberg.LastUpdatedSequenceNumberColumnName)
+
+	if hasRowIDMeta {
+		meta = append(meta, iceberg.RowIDColumnName)
+	}
+	if hasSeqMeta {
+		meta = append(meta, iceberg.LastUpdatedSequenceNumberColumnName)
+	}
+
+	return meta
+}
+
+func synthesizeMeta(selectedFieldsMeta []string, schemaMeta []string) []string {
+	synthesis := []string{}
+
+	for _, f := range selectedFieldsMeta {
+		if !slices.Contains(schemaMeta, f) {
+			synthesis = append(synthesis, f)
+		}
+	}
+
+	return synthesis
 }
 
 func (scan *Scan) buildPartitionProjection(specID int) (iceberg.BooleanExpression, error) {
@@ -638,3 +724,30 @@ func (scan *Scan) ScanOptions() iceberg.Properties { return scan.options }
 
 // ScanConcurrency returns the scan's configured concurrency.
 func (scan *Scan) ScanConcurrency() int { return scan.concurrency }
+
+// CollectSafePositionDeletes returns position delete files from the given tasks
+// that are safe to remove during compaction. A pos-delete file is safe when it
+// was matched to a data file that is being rewritten: the reader will apply the
+// deletes, so the new files will not contain those rows. Duplicates are removed.
+// Only EntryContentPosDeletes files are included; equality deletes are skipped.
+func CollectSafePositionDeletes(tasks []FileScanTask) []iceberg.DataFile {
+	seen := make(map[string]bool)
+	var safe []iceberg.DataFile
+
+	for _, task := range tasks {
+		for _, df := range task.DeleteFiles {
+			if df.ContentType() != iceberg.EntryContentPosDeletes {
+				continue
+			}
+
+			path := df.FilePath()
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			safe = append(safe, df)
+		}
+	}
+
+	return safe
+}

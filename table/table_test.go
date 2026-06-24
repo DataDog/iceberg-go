@@ -49,6 +49,7 @@ import (
 	"github.com/DataDog/iceberg-go/internal"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pterm/pterm"
@@ -535,7 +536,7 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -560,7 +561,7 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitioned() {
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
 
-	contents, err := scan.ToArrowTable(context.Background())
+	contents, err := engine.ToArrowTable(context.Background(), scan)
 	t.Require().NoError(err)
 	defer contents.Release()
 
@@ -583,7 +584,7 @@ func (t *TableWritingTestSuite) TestAddFilesFileNotFound() {
 
 	files = append(files, t.location+"/unpartitioned_file_not_found/unknown.parquet")
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, files, nil, false)
+	err := engine.AddFiles(t.ctx, tx, files, nil, false)
 	t.Error(err)
 	t.ErrorIs(err, fs.ErrNotExist)
 }
@@ -602,7 +603,7 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitionedHasFieldIDs() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -611,7 +612,7 @@ func (t *TableWritingTestSuite) TestAddFilesUnpartitionedHasFieldIDs() {
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
 
-	contents, err := scan.ToArrowTable(context.Background())
+	contents, err := engine.ToArrowTable(context.Background(), scan)
 	t.Require().NoError(err)
 	defer contents.Release()
 
@@ -657,7 +658,7 @@ func (t *TableWritingTestSuite) TestAddFilesFieldIDsWithDifferentNames() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -666,7 +667,7 @@ func (t *TableWritingTestSuite) TestAddFilesFieldIDsWithDifferentNames() {
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
 
-	contents, err := scan.ToArrowTable(context.Background())
+	contents, err := engine.ToArrowTable(context.Background(), scan)
 	t.Require().NoError(err)
 	defer contents.Release()
 
@@ -716,7 +717,7 @@ func (t *TableWritingTestSuite) TestAddFilesFailsSchemaMismatch() {
 	defer pterm.EnableOutput()
 
 	tx := tbl.NewTransaction()
-	err = tx.AddFiles(t.ctx, files, nil, false)
+	err = engine.AddFiles(t.ctx, tx, files, nil, false)
 	t.Error(err)
 	t.EqualError(err, `error encountered during file conversion: invalid schema: mismatch in fields:
    | Table Field              | Requested Field         
@@ -756,7 +757,7 @@ func (t *TableWritingTestSuite) TestAddFilesPartitionedTable() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 
 	stagedTbl, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -812,7 +813,7 @@ func (t *TableWritingTestSuite) TestAddFilesToBucketPartitionedTableFails() {
 	}
 
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, files, nil, false)
+	err := engine.AddFiles(t.ctx, tx, files, nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "cannot infer partition value from parquet metadata for a non-linear partition field: baz_bucket_3 with transform bucket[3]")
 }
@@ -840,7 +841,7 @@ func (t *TableWritingTestSuite) TestAddFilesToPartitionedTableFailsLowerAndUpper
 	}
 
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, files, nil, false)
+	err := engine.AddFiles(t.ctx, tx, files, nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "cannot infer partition value from parquet metadata as there is more than one value for partition field: baz. (low: 123, high: 124)")
 }
@@ -878,14 +879,14 @@ func (t *TableWritingTestSuite) TestAddFilesWithLargeAndRegular() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePathLarge, arrTableLarge)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath, filePathLarge}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{filePath, filePathLarge}, nil, false))
 
 	scan, err := tx.Scan(table.WithOptions(iceberg.Properties{
-		table.ScanOptionArrowUseLargeTypes: "true",
+		engine.ScanOptionArrowUseLargeTypes: "true",
 	}))
 	t.Require().NoError(err)
 
-	result, err := scan.ToArrowTable(context.Background())
+	result, err := engine.ToArrowTable(context.Background(), scan)
 	t.Require().NoError(err)
 	defer result.Release()
 
@@ -901,12 +902,12 @@ func (t *TableWritingTestSuite) TestAddFilesValidUpcast() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTablePromotedTypes)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{filePath}, nil, false))
 
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
 
-	written, err := scan.ToArrowTable(context.Background())
+	written, err := engine.ToArrowTable(context.Background(), scan)
 	t.Require().NoError(err)
 	defer written.Release()
 
@@ -949,12 +950,12 @@ func (t *TableWritingTestSuite) TestAddFilesSubsetOfSchema() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, withoutCol)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{filePath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{filePath}, nil, false))
 
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
 
-	written, err := scan.ToArrowTable(context.Background())
+	written, err := engine.ToArrowTable(context.Background(), scan)
 	t.Require().NoError(err)
 	defer written.Release()
 
@@ -984,7 +985,7 @@ func (t *TableWritingTestSuite) TestAddFilesDuplicateFilesInFilePaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), filePath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	err := tx.AddFiles(t.ctx, []string{filePath, filePath}, nil, false)
+	err := engine.AddFiles(t.ctx, tx, []string{filePath, filePath}, nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "file paths must be unique for AddFiles")
 }
@@ -1004,9 +1005,9 @@ func (t *TableWritingTestSuite) TestAddFilesReferencedByCurrentSnapshot() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 
-	err := tx.AddFiles(t.ctx, files[len(files)-1:], nil, false)
+	err := engine.AddFiles(t.ctx, tx, files[len(files)-1:], nil, false)
 	t.Error(err)
 	t.ErrorContains(err, "cannot add files that are already referenced by table, files:")
 }
@@ -1026,9 +1027,9 @@ func (t *TableWritingTestSuite) TestAddFilesReferencedCurrentSnapshotIgnoreDupli
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 
-	t.Require().NoError(tx.AddFiles(t.ctx, files[len(files)-1:], nil, true))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files[len(files)-1:], nil, true))
 	staged, err := tx.StagedTable()
 	t.Require().NoError(err)
 
@@ -1094,7 +1095,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 	)
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -1124,7 +1125,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFiles() {
 	t.writeParquet(fs, combinedFilePath, combined)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.ReplaceDataFiles(ctx, files[:2], []string{combinedFilePath}, nil))
+	t.Require().NoError(engine.ReplaceDataFiles(ctx, tx, files[:2], []string{combinedFilePath}, nil))
 
 	staged, err := tx.StagedTable()
 	t.Require().NoError(err)
@@ -1252,7 +1253,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFiles() {
 	}
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, files, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, files, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1286,7 +1287,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1316,7 +1317,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesValidatesPartit
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1451,7 +1452,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateAddPat
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1473,7 +1474,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDuplicateDelete
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1497,7 +1498,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesAddAlreadyRefer
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath2, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath1, existingPath2}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath1, existingPath2}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1518,7 +1519,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesDeleteNotInTabl
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1541,7 +1542,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilDeleteFile()
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1562,7 +1563,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesNilAddFile() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1597,7 +1598,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesWithDataFilesInvalidAddConte
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1658,7 +1659,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1666,7 +1667,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateDeletePaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath, existingPath}, []string{newPath}, nil)
+	err = engine.ReplaceDataFiles(t.ctx, tx, []string{existingPath, existingPath}, []string{newPath}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "delete file paths must be unique for ReplaceDataFiles")
 }
@@ -1679,7 +1680,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1687,7 +1688,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDuplicateAddPaths() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), newPath, t.arrTbl)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath}, []string{newPath, newPath}, nil)
+	err = engine.ReplaceDataFiles(t.ctx, tx, []string{existingPath}, []string{newPath, newPath}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "add file paths must be unique for ReplaceDataFiles")
 }
@@ -1702,12 +1703,12 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesAddAlreadyReferenced() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath2, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath1, existingPath2}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath1, existingPath2}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{existingPath1}, []string{existingPath2}, nil)
+	err = engine.ReplaceDataFiles(t.ctx, tx, []string{existingPath1}, []string{existingPath2}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot add files that are already referenced by table")
 }
@@ -1720,7 +1721,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
 	t.writeParquet(mustFS(t.T(), tbl).(iceio.WriteFileIO), existingPath, t.arrTbl)
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.AddFiles(t.ctx, []string{existingPath}, nil, false))
+	t.Require().NoError(engine.AddFiles(t.ctx, tx, []string{existingPath}, nil, false))
 	tbl, err := tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -1730,7 +1731,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesDeleteNotInTable() {
 	nonExistentPath := fmt.Sprintf("%s/replace_data_files_del_not_in_table_v%d/nonexistent.parquet", t.location, t.formatVersion)
 
 	tx = tbl.NewTransaction()
-	err = tx.ReplaceDataFiles(t.ctx, []string{nonExistentPath}, []string{newPath}, nil)
+	err = engine.ReplaceDataFiles(t.ctx, tx, []string{nonExistentPath}, []string{newPath}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot delete files that do not belong to the table")
 }
@@ -1740,7 +1741,7 @@ func (t *TableWritingTestSuite) TestReplaceDataFilesNoSnapshot() {
 	tbl := t.createTable(ident, t.formatVersion, *iceberg.UnpartitionedSpec, t.tableSchema)
 
 	tx := tbl.NewTransaction()
-	err := tx.ReplaceDataFiles(t.ctx, []string{"delete.parquet"}, []string{"add.parquet"}, nil)
+	err := engine.ReplaceDataFiles(t.ctx, tx, []string{"delete.parquet"}, []string{"add.parquet"}, nil)
 	t.Error(err)
 	t.ErrorContains(err, "cannot replace files in a table without an existing snapshot")
 }
@@ -1778,7 +1779,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshots() {
 
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -1829,7 +1830,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsNoOpWhenNothingToExpire() {
 	// Create 3 snapshots
 	for i := range 3 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -1895,7 +1896,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsUsesTableProperties() {
 
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -1947,7 +1948,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsWithMissingParent() {
 	// Create 5 snapshots, each one with a parent pointing to the previous
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2067,7 +2068,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefRollback() {
 	// Create 5 snapshots
 	for i := range 5 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2137,7 +2138,7 @@ func (t *TableWritingTestSuite) TestExpireSnapshotsRejectsOnRefUpdate() {
 	// Create 3 snapshots
 	for i := range 3 {
 		tx := tbl.NewTransaction()
-		t.Require().NoError(tx.AddFiles(ctx, files[i:i+1], nil, false))
+		t.Require().NoError(engine.AddFiles(ctx, tx, files[i:i+1], nil, false))
 		tbl, err = tx.Commit(ctx)
 		t.Require().NoError(err)
 	}
@@ -2248,12 +2249,12 @@ func (t *TableWritingTestSuite) TestWriteSpecialCharacterColumn() {
 	defer rdr.Release()
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.Append(t.ctx, rdr, nil))
+	t.Require().NoError(engine.Append(t.ctx, tx, rdr, nil))
 
 	scan, err := tx.Scan()
 	t.Require().NoError(err)
 
-	result, err := scan.ToArrowTable(t.ctx)
+	result, err := engine.ToArrowTable(t.ctx, scan)
 	t.Require().NoError(err)
 	defer result.Release()
 
@@ -2310,7 +2311,7 @@ func tableSchema() *iceberg.Schema {
 }
 
 func arrowTableWithNull() arrow.Table {
-	sc, err := table.SchemaToArrowSchema(tableSchema(), nil, true, false)
+	sc, err := engine.SchemaToArrowSchema(tableSchema(), nil, true, false)
 	if err != nil {
 		panic(err)
 	}
@@ -2424,27 +2425,27 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 
 	var err error
 	// tblA should merge all manifests into 1
-	tblA, err = tblA.AppendTable(t.ctx, arrTable, 1, nil)
+	tblA, err = engine.TableAppendTable(t.ctx, tblA, arrTable, 1, nil)
 	t.Require().NoError(err)
-	tblA, err = tblA.AppendTable(t.ctx, arrTable, 1, nil)
+	tblA, err = engine.TableAppendTable(t.ctx, tblA, arrTable, 1, nil)
 	t.Require().NoError(err)
-	tblA, err = tblA.AppendTable(t.ctx, arrTable, 1, nil)
+	tblA, err = engine.TableAppendTable(t.ctx, tblA, arrTable, 1, nil)
 	t.Require().NoError(err)
 
 	// tblB should not merge any manifests because the target size is too small
-	tblB, err = tblB.AppendTable(t.ctx, arrTable, 1, nil)
+	tblB, err = engine.TableAppendTable(t.ctx, tblB, arrTable, 1, nil)
 	t.Require().NoError(err)
-	tblB, err = tblB.AppendTable(t.ctx, arrTable, 1, nil)
+	tblB, err = engine.TableAppendTable(t.ctx, tblB, arrTable, 1, nil)
 	t.Require().NoError(err)
-	tblB, err = tblB.AppendTable(t.ctx, arrTable, 1, nil)
+	tblB, err = engine.TableAppendTable(t.ctx, tblB, arrTable, 1, nil)
 	t.Require().NoError(err)
 
 	// tblC should not merge any manifests because merging is disabled
-	tblC, err = tblC.AppendTable(t.ctx, arrTable, 1, nil)
+	tblC, err = engine.TableAppendTable(t.ctx, tblC, arrTable, 1, nil)
 	t.Require().NoError(err)
-	tblC, err = tblC.AppendTable(t.ctx, arrTable, 1, nil)
+	tblC, err = engine.TableAppendTable(t.ctx, tblC, arrTable, 1, nil)
 	t.Require().NoError(err)
-	tblC, err = tblC.AppendTable(t.ctx, arrTable, 1, nil)
+	tblC, err = engine.TableAppendTable(t.ctx, tblC, arrTable, 1, nil)
 	t.Require().NoError(err)
 
 	manifestList, err := tblA.CurrentSnapshot().Manifests(mustFS(t.T(), tblA))
@@ -2485,15 +2486,15 @@ func (t *TableWritingTestSuite) TestMergeManifests() {
 		t.validateManifestFileLength(mustFS(t.T(), tblC), m)
 	}
 
-	resultA, err := tblA.Scan().ToArrowTable(t.ctx)
+	resultA, err := engine.ToArrowTable(t.ctx, tblA.Scan())
 	t.Require().NoError(err)
 	defer resultA.Release()
 
-	resultB, err := tblB.Scan().ToArrowTable(t.ctx)
+	resultB, err := engine.ToArrowTable(t.ctx, tblB.Scan())
 	t.Require().NoError(err)
 	defer resultB.Release()
 
-	resultC, err := tblC.Scan().ToArrowTable(t.ctx)
+	resultC, err := engine.ToArrowTable(t.ctx, tblC.Scan())
 	t.Require().NoError(err)
 	defer resultC.Release()
 
@@ -2512,7 +2513,7 @@ func (t *TableWritingTestSuite) TestOverwriteTable() {
 	})
 	t.Require().NoError(err)
 	defer newTable.Release()
-	resultTbl, err := tbl.OverwriteTable(t.ctx, newTable, 1, nil)
+	resultTbl, err := engine.TableOverwriteTable(t.ctx, tbl, newTable, 1, nil)
 	t.Require().NoError(err)
 	t.NotNil(resultTbl)
 
@@ -2537,7 +2538,7 @@ func (t *TableWritingTestSuite) TestOverwriteRecord() {
 	defer rdr.Release()
 
 	// Test that Table.Overwrite works (delegates to transaction)
-	resultTbl, err := tbl.Overwrite(t.ctx, rdr, nil, table.WithOverwriteConcurrency(1))
+	resultTbl, err := engine.TableOverwrite(t.ctx, tbl, rdr, nil, engine.WithOverwriteConcurrency(1))
 	t.Require().NoError(err)
 	t.NotNil(resultTbl)
 
@@ -2561,7 +2562,7 @@ func (t *TableWritingTestSuite) TestOverwriteRowCountWarning() {
 	t.Require().NoError(err)
 	defer initialData.Release()
 
-	tbl, err = tbl.Append(t.ctx, array.NewTableReader(initialData, -1), nil)
+	tbl, err = engine.TableAppend(t.ctx, tbl, array.NewTableReader(initialData, -1), nil)
 	t.Require().NoError(err)
 
 	// Capture slog output by installing a temporary handler on the default logger.
@@ -2578,7 +2579,7 @@ func (t *TableWritingTestSuite) TestOverwriteRowCountWarning() {
 	defer oneRow.Release()
 
 	tx := tbl.NewTransaction()
-	t.Require().NoError(tx.Overwrite(t.ctx, array.NewTableReader(oneRow, -1), nil))
+	t.Require().NoError(engine.Overwrite(t.ctx, tx, array.NewTableReader(oneRow, -1), nil))
 	_, err = tx.Commit(t.ctx)
 	t.Require().NoError(err)
 
@@ -2694,15 +2695,15 @@ func (t *TableWritingTestSuite) TestDelete() {
 			t.Require().NoError(err)
 			defer newTable.Release()
 
-			tbl, err := tc.table.OverwriteTable(t.ctx, newTable, 1, nil)
+			tbl, err := engine.TableOverwriteTable(t.ctx, tc.table, newTable, 1, nil)
 			t.Require().NoError(err)
 
 			// Validate the pre-requisite that data is present on the table before we go ahead and delete it
-			arrowTable, err := tbl.Scan().ToArrowTable(t.ctx)
+			arrowTable, err := engine.ToArrowTable(t.ctx, tbl.Scan())
 			t.Require().NoError(err)
 			t.Equal(int64(2), arrowTable.NumRows())
 
-			tbl, err = tbl.Delete(t.ctx, iceberg.EqualTo(iceberg.Reference("bar"), "wrapper_test"), nil)
+			tbl, err = engine.TableDelete(t.ctx, tbl, iceberg.EqualTo(iceberg.Reference("bar"), "wrapper_test"), nil)
 			// If an error was expected, check that it's the correct one and abort validating the operation
 			if tc.expectedErr != nil {
 				t.Require().ErrorContains(err, tc.expectedErr.Error())
@@ -2714,7 +2715,7 @@ func (t *TableWritingTestSuite) TestDelete() {
 			t.NotNil(snapshot)
 			t.NoError(equalSnapshotSummary(tc.expectedSnapshotSummary, snapshot.Summary))
 
-			arrowTable, err = tbl.Scan().ToArrowTable(t.ctx)
+			arrowTable, err = engine.ToArrowTable(t.ctx, tbl.Scan())
 			t.Require().NoError(err)
 
 			t.Equal(int64(1), arrowTable.NumRows())
@@ -2730,7 +2731,7 @@ func (t *TableWritingTestSuite) TestScanPanicOnMapStringKeyStringListValue() {
 			Nullable: true,
 		},
 	}, nil)
-	toIceberg, err := table.ArrowSchemaToIcebergWithFreshIDs(schema, false)
+	toIceberg, err := engine.ArrowSchemaToIcebergWithFreshIDs(schema, false)
 	t.Require().NoError(err)
 
 	tbl := t.createTable(
@@ -2751,11 +2752,11 @@ func (t *TableWritingTestSuite) TestScanPanicOnMapStringKeyStringListValue() {
 	reader, err := array.NewRecordReader(schema, []arrow.RecordBatch{batch})
 	t.Require().NoError(err)
 
-	tbl, err = tbl.Append(t.ctx, reader, nil)
+	tbl, err = engine.TableAppend(t.ctx, tbl, reader, nil)
 	t.Require().NoError(err)
 
 	scan := tbl.Scan()
-	arrowTable, err := scan.ToArrowTable(t.ctx)
+	arrowTable, err := engine.ToArrowTable(t.ctx, scan)
 	t.Require().NoError(err)
 
 	t.Require().Equal(int64(1), arrowTable.NumRows())
@@ -2804,7 +2805,7 @@ func TestNullableStructRequiredField(t *testing.T) {
 		{Name: "uid", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, nil)
 
-	sc, err := table.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, false)
+	sc, err := engine.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, false)
 	require.NoError(t, err)
 
 	require.NoError(t, cat.CreateNamespace(context.Background(), table.Identifier{"testing"}, nil))
@@ -2828,7 +2829,7 @@ func TestNullableStructRequiredField(t *testing.T) {
 	defer arrTable.Release()
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AppendTable(t.Context(), arrTable, N, nil))
+	require.NoError(t, engine.AppendTable(t.Context(), tx, arrTable, N, nil))
 	stagedTbl, err := tx.StagedTable()
 	require.NoError(t, err)
 	require.NotNil(t, stagedTbl)
@@ -2916,13 +2917,13 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
 
 	// transaction 1 to create metadata file
 	tx := tbl.NewTransaction()
-	tx.AddFiles(ctx, files[0:1], nil, false)
+	engine.AddFiles(ctx, tx, files[0:1], nil, false)
 	tbl_new, err := tx.Commit(ctx)
 	t.Require().NoError(err)
 
 	// transaction 2 to add files
 	tx_new := tbl_new.NewTransaction()
-	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	engine.AddFiles(ctx, tx_new, files[1:2], nil, false)
 
 	_, err = tx_new.Commit(ctx)
 	t.Require().NoError(err)
@@ -2969,7 +2970,7 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 
 	// transaction 1 to create metadata file
 	tx := tbl.NewTransaction()
-	tx.AddFiles(ctx, files[0:1], nil, false)
+	engine.AddFiles(ctx, tx, files[0:1], nil, false)
 	tbl_new, err := tx.Commit(ctx)
 	t.Require().NoError(err)
 
@@ -2981,7 +2982,7 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
 
 	// transaction 2 to add files
 	tx_new := tbl_new.NewTransaction()
-	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	engine.AddFiles(ctx, tx_new, files[1:2], nil, false)
 	_, err = tx_new.Commit(ctx)
 	t.Require().NoError(err)
 
@@ -3027,7 +3028,7 @@ func TestWriteMapType(t *testing.T) {
 	tbl, err := cat.CreateTable(ctx, ident, iceSch, catalog.WithLocation(loc))
 	require.NoError(t, err)
 
-	arrowSch, err := table.SchemaToArrowSchema(iceSch, nil, true, false)
+	arrowSch, err := engine.SchemaToArrowSchema(iceSch, nil, true, false)
 	require.NoError(t, err)
 
 	bldr := array.NewRecordBuilder(mem, arrowSch)
@@ -3055,14 +3056,14 @@ func TestWriteMapType(t *testing.T) {
 	require.NoError(t, err)
 	defer rr.Release()
 
-	result, err := tbl.Append(ctx, rr, nil)
+	result, err := engine.TableAppend(ctx, tbl, rr, nil)
 	require.NoError(t, err)
 
-	resultTbl, err := result.Scan().ToArrowTable(ctx)
+	resultTbl, err := engine.ToArrowTable(ctx, result.Scan())
 	require.NoError(t, err)
 	defer resultTbl.Release()
 
-	expectedSchema, err := table.SchemaToArrowSchema(iceSch, nil, false, false)
+	expectedSchema, err := engine.SchemaToArrowSchema(iceSch, nil, false, false)
 	require.NoError(t, err)
 	expected, err := array.TableFromJSON(mem, expectedSchema, []string{
 		`[

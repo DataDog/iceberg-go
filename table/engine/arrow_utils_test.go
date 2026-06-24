@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table_test
+package engine_test
 
 import (
 	"bufio"
@@ -32,14 +32,14 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/DataDog/iceberg-go"
-	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func fieldIDMeta(id string) arrow.Metadata {
-	return arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: id})
+	return arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: id})
 }
 
 func TestArrowToIceberg(t *testing.T) {
@@ -96,7 +96,7 @@ func TestArrowToIceberg(t *testing.T) {
 			Type:     arrow.BinaryTypes.String,
 			Nullable: true,
 			Metadata: arrow.MetadataFrom(map[string]string{
-				table.ArrowParquetFieldIDKey: "1", table.ArrowFieldDocKey: "foo doc",
+				engine.ArrowParquetFieldIDKey: "1", engine.ArrowFieldDocKey: "foo doc",
 			}),
 		}, arrow.Field{
 			Name:     "bar",
@@ -172,7 +172,7 @@ func TestArrowToIceberg(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.dt.String(), func(t *testing.T) {
-			out, err := table.ArrowTypeToIceberg(tt.dt, false)
+			out, err := engine.ArrowTypeToIceberg(tt.dt, false)
 			if tt.err == "" {
 				require.NoError(t, err)
 				assert.True(t, out.Equals(tt.ice), out.String(), tt.ice.String())
@@ -181,7 +181,7 @@ func TestArrowToIceberg(t *testing.T) {
 			}
 
 			if tt.reciprocal {
-				result, err := table.TypeToArrowType(tt.ice, true, false)
+				result, err := engine.TypeToArrowType(tt.ice, true, false)
 				require.NoError(t, err)
 				assert.True(t, arrow.TypeEqual(tt.dt, result), tt.dt.String(), result.String())
 			}
@@ -270,7 +270,7 @@ func TestArrowSchemaToIceberg(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := table.ArrowSchemaToIceberg(tt.sc, true, nil)
+			out, err := engine.ArrowSchemaToIceberg(tt.sc, true, nil)
 			if tt.err == "" {
 				require.NoError(t, err)
 				assert.Equal(t, tt.expected, out.String())
@@ -355,10 +355,10 @@ func TestArrowSchemaRoundTripConversion(t *testing.T) {
 	}
 
 	for _, tt := range schemas {
-		sc, err := table.SchemaToArrowSchema(tt, nil, true, false)
+		sc, err := engine.SchemaToArrowSchema(tt, nil, true, false)
 		require.NoError(t, err)
 
-		ice, err := table.ArrowSchemaToIceberg(sc, false, nil)
+		ice, err := engine.ArrowSchemaToIceberg(sc, false, nil)
 		require.NoError(t, err)
 
 		assert.True(t, tt.Equals(ice), tt.String(), ice.String())
@@ -372,7 +372,7 @@ func TestVariantArrowConversion(t *testing.T) {
 	)
 
 	t.Run("round trip with field ids", func(t *testing.T) {
-		arrowSc, err := table.SchemaToArrowSchema(sc, nil, true, false)
+		arrowSc, err := engine.SchemaToArrowSchema(sc, nil, true, false)
 		require.NoError(t, err)
 
 		assert.Equal(t, 2, arrowSc.NumFields())
@@ -382,14 +382,14 @@ func TestVariantArrowConversion(t *testing.T) {
 		require.True(t, ok, "expected extension type, got %T", dataField.Type)
 		assert.Equal(t, "parquet.variant", ext.ExtensionName())
 
-		ice, err := table.ArrowSchemaToIceberg(arrowSc, false, nil)
+		ice, err := engine.ArrowSchemaToIceberg(arrowSc, false, nil)
 		require.NoError(t, err)
 		assert.True(t, ice.Field(1).Type.Equals(iceberg.VariantType{}))
 		assert.True(t, ice.Field(0).Type.Equals(iceberg.PrimitiveTypes.Timestamp))
 	})
 
 	t.Run("large binary storage", func(t *testing.T) {
-		arrowSc, err := table.SchemaToArrowSchema(sc, nil, true, true)
+		arrowSc, err := engine.SchemaToArrowSchema(sc, nil, true, true)
 		require.NoError(t, err)
 
 		dataField := arrowSc.Field(1)
@@ -411,7 +411,7 @@ func TestVariantArrowConversion(t *testing.T) {
 			iceberg.NestedField{ID: 3, Name: "v2", Type: iceberg.VariantType{}},
 		)
 
-		arrowSc, err := table.SchemaToArrowSchema(multiSc, nil, true, false)
+		arrowSc, err := engine.SchemaToArrowSchema(multiSc, nil, true, false)
 		require.NoError(t, err)
 		assert.Equal(t, 3, arrowSc.NumFields())
 
@@ -421,7 +421,7 @@ func TestVariantArrowConversion(t *testing.T) {
 			assert.Equal(t, "parquet.variant", ext.ExtensionName())
 		}
 
-		ice, err := table.ArrowSchemaToIceberg(arrowSc, false, nil)
+		ice, err := engine.ArrowSchemaToIceberg(arrowSc, false, nil)
 		require.NoError(t, err)
 		assert.True(t, ice.Field(1).Type.Equals(iceberg.VariantType{}))
 		assert.True(t, ice.Field(2).Type.Equals(iceberg.VariantType{}))
@@ -439,7 +439,7 @@ func TestVariantProjectionExclusion(t *testing.T) {
 	assert.Equal(t, 1, projected.NumFields())
 	assert.Equal(t, "id", projected.Field(0).Name)
 
-	arrowSc, err := table.SchemaToArrowSchema(projected, nil, true, false)
+	arrowSc, err := engine.SchemaToArrowSchema(projected, nil, true, false)
 	require.NoError(t, err)
 	assert.Equal(t, 1, arrowSc.NumFields())
 	assert.Equal(t, "id", arrowSc.Field(0).Name)
@@ -514,7 +514,7 @@ func TestArrowSchemaWithNameMapping(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := table.ArrowSchemaToIceberg(tt.schema, false, tt.mapping)
+			out, err := engine.ArrowSchemaToIceberg(tt.schema, false, tt.mapping)
 			if tt.err != "" {
 				assert.ErrorContains(t, err, tt.err)
 			} else {
@@ -616,7 +616,7 @@ func TestToRequestedSchemaTimestamps(t *testing.T) {
 	requestedSchema := TableSchemaWithAllMicrosecondsTimestampPrec
 	fileSchema := requestedSchema
 
-	converted, err := table.ToRequestedSchema(ctx, requestedSchema, fileSchema, batch, table.SchemaOptions{DowncastTimestamp: true})
+	converted, err := engine.ToRequestedSchema(ctx, requestedSchema, fileSchema, batch, engine.SchemaOptions{DowncastTimestamp: true})
 	require.NoError(t, err)
 	defer converted.Release()
 
@@ -644,9 +644,9 @@ func TestToRequestedSchema(t *testing.T) {
 		{
 			Name: "nested", Type: arrow.ListOfField(arrow.Field{
 				Name: "element", Type: arrow.PrimitiveTypes.Int32, Nullable: false,
-				Metadata: arrow.NewMetadata([]string{table.ArrowParquetFieldIDKey}, []string{"2"}),
+				Metadata: arrow.NewMetadata([]string{engine.ArrowParquetFieldIDKey}, []string{"2"}),
 			}),
-			Metadata: arrow.NewMetadata([]string{table.ArrowParquetFieldIDKey}, []string{"1"}),
+			Metadata: arrow.NewMetadata([]string{engine.ArrowParquetFieldIDKey}, []string{"1"}),
 		},
 	}, nil)
 
@@ -663,10 +663,10 @@ func TestToRequestedSchema(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	icesc, err := table.ArrowSchemaToIceberg(schema, false, nil)
+	icesc, err := engine.ArrowSchemaToIceberg(schema, false, nil)
 	require.NoError(t, err)
 
-	rec2, err := table.ToRequestedSchema(context.Background(), icesc, icesc, rec, table.SchemaOptions{DowncastTimestamp: true, IncludeFieldIDs: true})
+	rec2, err := engine.ToRequestedSchema(context.Background(), icesc, icesc, rec, engine.SchemaOptions{DowncastTimestamp: true, IncludeFieldIDs: true})
 	require.NoError(t, err)
 	defer rec2.Release()
 
@@ -692,7 +692,7 @@ func TestToRequestedSchemaWriteDefaults(t *testing.T) {
 			Name:     "id",
 			Type:     arrow.PrimitiveTypes.Int32,
 			Nullable: false,
-			Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+			Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 		},
 	}, nil)
 	bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -701,7 +701,7 @@ func TestToRequestedSchemaWriteDefaults(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{UseWriteDefault: true})
+	result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{UseWriteDefault: true})
 	require.NoError(t, err)
 	defer result.Release()
 
@@ -735,7 +735,7 @@ func TestToRequestedSchemaRequiredFieldWithWriteDefault(t *testing.T) {
 			Name:     "id",
 			Type:     arrow.PrimitiveTypes.Int32,
 			Nullable: false,
-			Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+			Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 		},
 	}, nil)
 	bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -744,7 +744,7 @@ func TestToRequestedSchemaRequiredFieldWithWriteDefault(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{UseWriteDefault: true})
+	result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{UseWriteDefault: true})
 	require.NoError(t, err)
 	defer result.Release()
 
@@ -778,7 +778,7 @@ func TestToRequestedSchemaRequiredFieldMissingNoDefault(t *testing.T) {
 			Name:     "id",
 			Type:     arrow.PrimitiveTypes.Int32,
 			Nullable: false,
-			Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+			Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 		},
 	}, nil)
 	bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -787,7 +787,7 @@ func TestToRequestedSchemaRequiredFieldMissingNoDefault(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	_, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{UseWriteDefault: true})
+	_, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{UseWriteDefault: true})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "required field is missing and has no default value")
 }
@@ -812,7 +812,7 @@ func TestToRequestedSchemaRequiredFieldWithInitialDefault(t *testing.T) {
 			Name:     "id",
 			Type:     arrow.PrimitiveTypes.Int32,
 			Nullable: false,
-			Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+			Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 		},
 	}, nil)
 	bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -821,7 +821,7 @@ func TestToRequestedSchemaRequiredFieldWithInitialDefault(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{UseWriteDefault: false})
+	result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{UseWriteDefault: false})
 	require.NoError(t, err)
 	defer result.Release()
 
@@ -844,7 +844,7 @@ func TestToRequestedSchemaWriteDefaultsTypes(t *testing.T) {
 				Name:     "id",
 				Type:     arrow.PrimitiveTypes.Int32,
 				Nullable: false,
-				Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+				Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 			},
 		}, nil)
 		bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -992,7 +992,7 @@ func TestToRequestedSchemaWriteDefaultsTypes(t *testing.T) {
 			rec := buildBaseRecord(mem)
 			defer rec.Release()
 
-			result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{UseWriteDefault: true})
+			result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{UseWriteDefault: true})
 			require.NoError(t, err)
 			defer result.Release()
 
@@ -1024,7 +1024,7 @@ func TestToRequestedSchemaInitialDefaults(t *testing.T) {
 			Name:     "id",
 			Type:     arrow.PrimitiveTypes.Int32,
 			Nullable: false,
-			Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+			Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 		},
 	}, nil)
 	bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -1033,7 +1033,7 @@ func TestToRequestedSchemaInitialDefaults(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{})
+	result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{})
 	require.NoError(t, err)
 	defer result.Release()
 
@@ -1059,7 +1059,7 @@ func TestToRequestedSchemaInitialDefaultTypes(t *testing.T) {
 				Name:     "id",
 				Type:     arrow.PrimitiveTypes.Int32,
 				Nullable: false,
-				Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+				Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 			},
 		}, nil)
 		bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -1277,7 +1277,7 @@ func TestToRequestedSchemaInitialDefaultTypes(t *testing.T) {
 			rec := buildBaseRecord(mem)
 			defer rec.Release()
 
-			result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{})
+			result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{})
 			require.NoError(t, err)
 			defer result.Release()
 
@@ -1304,7 +1304,7 @@ func TestToRequestedSchemaInitialDefaultJSONRoundTrip(t *testing.T) {
 				Name:     "id",
 				Type:     arrow.PrimitiveTypes.Int32,
 				Nullable: false,
-				Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+				Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 			},
 		}, nil)
 		bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -1533,7 +1533,7 @@ func TestToRequestedSchemaInitialDefaultJSONRoundTrip(t *testing.T) {
 			rec := buildBaseRecord(mem)
 			defer rec.Release()
 
-			result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{})
+			result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{})
 			require.NoError(t, err)
 			defer result.Release()
 
@@ -1561,7 +1561,7 @@ func TestToRequestedSchemaWriteDefaultJSONRoundTrip(t *testing.T) {
 				Name:     "id",
 				Type:     arrow.PrimitiveTypes.Int32,
 				Nullable: false,
-				Metadata: arrow.MetadataFrom(map[string]string{table.ArrowParquetFieldIDKey: "1"}),
+				Metadata: arrow.MetadataFrom(map[string]string{engine.ArrowParquetFieldIDKey: "1"}),
 			},
 		}, nil)
 		bldr := array.NewRecordBuilder(mem, arrowSchema)
@@ -1778,7 +1778,7 @@ func TestToRequestedSchemaWriteDefaultJSONRoundTrip(t *testing.T) {
 			rec := buildBaseRecord(mem)
 			defer rec.Release()
 
-			result, err := table.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, table.SchemaOptions{UseWriteDefault: true})
+			result, err := engine.ToRequestedSchema(ctx, requestedIceSchema, fileIceSchema, rec, engine.SchemaOptions{UseWriteDefault: true})
 			require.NoError(t, err)
 			defer result.Release()
 

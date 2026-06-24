@@ -43,14 +43,24 @@ type (
 	FSysF            = tbl.FSysF
 	RowGroupStats    = tbl.RowGroupStats
 
-	SnapshotProducer     = tbl.SnapshotProducer
+	SnapshotProducer      = tbl.SnapshotProducer
 	ConflictValidatorFunc = tbl.ConflictValidatorFunc
+	CompactionGroupResult = tbl.CompactionGroupResult
+
+	SortField     = tbl.SortField
+	SortDirection = tbl.SortDirection
+	NullOrder     = tbl.NullOrder
+	SortOrder     = tbl.SortOrder
 )
 
 // Re-exported functions and constructors.
 var (
 	LoadLocationProvider    = tbl.LoadLocationProvider
 	MetadataBuilderFromBase = tbl.MetadataBuilderFromBase
+	NewMetadata             = tbl.NewMetadata
+	NewMetadataBuilder      = tbl.NewMetadataBuilder
+	NewSortOrder            = tbl.NewSortOrder
+	UnsortedSortOrder       = tbl.UnsortedSortOrder
 	New                     = tbl.New
 	GetPartitionRecord      = tbl.GetPartitionRecord
 	NewRowGroupStatsEvaluator = tbl.NewRowGroupStatsEvaluator
@@ -71,6 +81,14 @@ var (
 // Re-exported constants.
 const (
 	ScanNoLimit = tbl.ScanNoLimit
+
+	SortASC  SortDirection = tbl.SortASC
+	SortDESC SortDirection = tbl.SortDESC
+
+	NullsFirst NullOrder = tbl.NullsFirst
+	NullsLast  NullOrder = tbl.NullsLast
+
+	UnsortedSortOrderID = tbl.UnsortedSortOrderID
 
 	OpAppend    = tbl.OpAppend
 	OpOverwrite = tbl.OpOverwrite

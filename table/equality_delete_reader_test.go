@@ -26,6 +26,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,7 +59,7 @@ func newEqDeleteReadTestTable(t *testing.T) *table.Table {
 func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 	tbl := newEqDeleteReadTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Step 1: Append 5 rows.
@@ -72,14 +73,14 @@ func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 	assertRowCount(t, tbl, 5)
 
 	// Step 2: Write equality delete file that removes id=2 and id=4.
 	eqDelPath := tbl.Location() + "/data/eq-del-001.parquet"
-	delArrowSc, err := table.SchemaToArrowSchema(
+	delArrowSc, err := engine.SchemaToArrowSchema(
 		iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true}),
 		nil, true, false)
 	require.NoError(t, err)
@@ -103,7 +104,7 @@ func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 	// Step 3: Scan and verify rows id=2 and id=4 are deleted.
 	assertRowCount(t, tbl, 3)
 
-	_, itr, err := tbl.Scan(table.WithSelectedFields("id")).ToArrowRecords(t.Context())
+	_, itr, err := engine.ToArrowRecords(t.Context(), tbl.Scan(table.WithSelectedFields("id")))
 	require.NoError(t, err)
 
 	var ids []int64
@@ -122,7 +123,7 @@ func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 func TestEqualityDeleteDoesNotAffectSameSnapshot(t *testing.T) {
 	tbl := newEqDeleteReadTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Append data file and equality delete in the SAME snapshot via RowDelta.
@@ -135,7 +136,7 @@ func TestEqualityDeleteDoesNotAffectSameSnapshot(t *testing.T) {
 	]`)
 
 	eqDelPath := tbl.Location() + "/data/eq-del-001.parquet"
-	delArrowSc, err := table.SchemaToArrowSchema(
+	delArrowSc, err := engine.SchemaToArrowSchema(
 		iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true}),
 		nil, true, false)
 	require.NoError(t, err)
@@ -144,7 +145,7 @@ func TestEqualityDeleteDoesNotAffectSameSnapshot(t *testing.T) {
 
 	// Build data file
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 
 	// Build equality delete file
 	eqDelBuilder, err := iceberg.NewDataFileBuilder(
@@ -169,7 +170,7 @@ func TestEqualityDeleteDoesNotAffectSameSnapshot(t *testing.T) {
 	// sequence number from the first update; the RowDelta data has
 	// the same snapshot's sequence number. The equality delete also
 	// has the same sequence number, so it should not apply to either.
-	_, itr, err := tbl.Scan(table.WithSelectedFields("id")).ToArrowRecords(t.Context())
+	_, itr, err := engine.ToArrowRecords(t.Context(), tbl.Scan(table.WithSelectedFields("id")))
 	require.NoError(t, err)
 
 	var ids []int64
@@ -213,7 +214,7 @@ func TestEqualityDeleteMultiColumnKey(t *testing.T) {
 		&rowDeltaCatalog{metadata: meta},
 	)
 
-	arrowSc, err := table.SchemaToArrowSchema(iceSchema, nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(iceSchema, nil, false, false)
 	require.NoError(t, err)
 
 	// Append data.
@@ -225,13 +226,13 @@ func TestEqualityDeleteMultiColumnKey(t *testing.T) {
 	]`)
 
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
 	// Delete by composite key (id=1, name="alice"). Should only remove
 	// the first row, not the third (id=1, name="charlie").
-	delArrowSc, err := table.SchemaToArrowSchema(
+	delArrowSc, err := engine.SchemaToArrowSchema(
 		iceberg.NewSchema(0,
 			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
 			iceberg.NestedField{ID: 2, Name: "name", Type: iceberg.PrimitiveTypes.String, Required: true},
@@ -256,7 +257,7 @@ func TestEqualityDeleteMultiColumnKey(t *testing.T) {
 
 	assertRowCount(t, tbl, 2)
 
-	_, itr, err := tbl.Scan(table.WithSelectedFields("id", "name")).ToArrowRecords(t.Context())
+	_, itr, err := engine.ToArrowRecords(t.Context(), tbl.Scan(table.WithSelectedFields("id", "name")))
 	require.NoError(t, err)
 
 	type row struct {

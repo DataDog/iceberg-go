@@ -19,6 +19,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"strconv"
@@ -34,8 +35,10 @@ import (
 type WriteRecordOption func(*writeRecordConfig)
 
 type writeRecordConfig struct {
-	targetFileSize int64
-	writeUUID      *uuid.UUID
+	targetFileSize  int64
+	writeUUID       *uuid.UUID
+	maxWriteWorkers int
+	clustered       bool
 }
 
 // WithTargetFileSize overrides the table's default target file size.
@@ -49,6 +52,24 @@ func WithTargetFileSize(size int64) WriteRecordOption {
 func WithWriteUUID(id uuid.UUID) WriteRecordOption {
 	return func(c *writeRecordConfig) {
 		c.writeUUID = &id
+	}
+}
+
+// WithMaxWriteWorkers overrides the default number of fanout workers used for
+// partitioned writes. A value of 0 uses the default. Incompatible with
+// [WithClusteredWrite].
+func WithMaxWriteWorkers(n int) WriteRecordOption {
+	return func(c *writeRecordConfig) {
+		c.maxWriteWorkers = n
+	}
+}
+
+// WithClusteredWrite enables the memory-efficient clustered write path for
+// partitioned tables. The input must be clustered by partition across batches.
+// Incompatible with [WithMaxWriteWorkers].
+func WithClusteredWrite() WriteRecordOption {
+	return func(c *writeRecordConfig) {
+		c.clustered = true
 	}
 }
 
@@ -78,6 +99,11 @@ func WriteRecords(ctx context.Context, tbl *Table,
 	cfg := writeRecordConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+
+	if cfg.clustered && cfg.maxWriteWorkers > 0 {
+		return internal.SingleErrorIter[iceberg.DataFile](
+			errors.New("WithClusteredWrite and WithMaxWriteWorkers are incompatible: the clustered write path is single-threaded"))
 	}
 
 	fs, err := tbl.FS(ctx)
@@ -116,10 +142,12 @@ func WriteRecords(ctx context.Context, tbl *Table,
 	}
 
 	args := recordWritingArgs{
-		sc:        schema,
-		itr:       releasing,
-		fs:        writeFS,
-		writeUUID: cfg.writeUUID,
+		sc:              schema,
+		itr:             releasing,
+		fs:              writeFS,
+		writeUUID:       cfg.writeUUID,
+		maxWriteWorkers: cfg.maxWriteWorkers,
+		clustered:       cfg.clustered,
 	}
 
 	return recordsToDataFiles(ctx, tbl.Location(), meta, args)

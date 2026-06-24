@@ -144,6 +144,12 @@ func (t *Transaction) appendSnapshotProducer(afs io.IO, props iceberg.Properties
 	return updateSnapshot.fastAppend()
 }
 
+func (t *Transaction) addValidator(v conflictValidatorFunc) {
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	t.validators = append(t.validators, v)
+}
+
 func (t *Transaction) updateSnapshot(fs io.IO, props iceberg.Properties, operation Operation) snapshotUpdate {
 	return snapshotUpdate{
 		txn:           t,
@@ -414,6 +420,12 @@ func (t *Transaction) validateDataFilesToAdd(dataFiles []iceberg.DataFile, opera
 		if err := validateDataFilePartitionData(df, currentSpec); err != nil {
 			return nil, fmt.Errorf("data file %s has invalid partition data for %s: %w", path, operation, err)
 		}
+
+		if t.meta.formatVersion >= 3 && df.FirstRowID() == nil {
+			return nil, fmt.Errorf(
+				"data file %s is missing first_row_id which is required for v3 tables for %s: use DataFileBuilder.FirstRowID() to set it explicitly",
+				path, operation)
+		}
 	}
 
 	return setToAdd, nil
@@ -647,7 +659,11 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID, nil)
+	op := OpOverwrite
+	if cfg.rewriteSemantics {
+		op = OpReplace
+	}
+	updater := t.updateSnapshot(fs, snapshotProps, op).mergeOverwrite(&commitUUID, nil)
 	if cfg.rewriteSemantics {
 		// mergeOverwrite guarantees an *overwriteFiles producerImpl.
 		updater.producerImpl.(*overwriteFiles).skipDefaultValidator = true
@@ -764,7 +780,11 @@ func (t *Transaction) ReplaceFiles(ctx context.Context, dataFilesToDelete, dataF
 	}
 
 	commitUUID := uuid.New()
-	updater := t.updateSnapshot(fs, snapshotProps, OpOverwrite).mergeOverwrite(&commitUUID, nil)
+	op := OpOverwrite
+	if cfg.rewriteSemantics {
+		op = OpReplace
+	}
+	updater := t.updateSnapshot(fs, snapshotProps, op).mergeOverwrite(&commitUUID, nil)
 	if cfg.rewriteSemantics {
 		// mergeOverwrite guarantees an *overwriteFiles producerImpl.
 		updater.producerImpl.(*overwriteFiles).skipDefaultValidator = true
@@ -868,5 +888,39 @@ type StagedTable struct {
 
 func (s *StagedTable) Refresh(ctx context.Context) (*Table, error) {
 	return nil, fmt.Errorf("%w: cannot refresh a staged table", ErrInvalidOperation)
+}
+
+// rewriteRefSnapshotRequirements returns a copy of reqs where any
+// assertRefSnapshotID requirement that matches branch has its SnapshotID
+// updated to point at the branch's current head in fresh. All other
+// requirements are returned unchanged. If branch is empty, fresh is nil,
+// or branch does not exist in fresh, the original slice is returned as-is.
+func rewriteRefSnapshotRequirements(reqs []Requirement, branch string, fresh Metadata) []Requirement {
+	if branch == "" || fresh == nil {
+		return reqs
+	}
+
+	snap := fresh.SnapshotByName(branch)
+	if snap == nil {
+		return reqs
+	}
+
+	out := make([]Requirement, len(reqs))
+	copy(out, reqs)
+
+	for i, req := range out {
+		a, ok := req.(*assertRefSnapshotID)
+		if !ok || a.Ref != branch {
+			continue
+		}
+		id := snap.SnapshotID
+		out[i] = &assertRefSnapshotID{
+			baseRequirement: baseRequirement{Type: reqAssertRefSnapshotID},
+			Ref:             branch,
+			SnapshotID:      &id,
+		}
+	}
+
+	return out
 }
 

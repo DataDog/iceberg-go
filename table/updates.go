@@ -39,22 +39,24 @@ const (
 
 	UpdateAssignUUID = "assign-uuid"
 
-	UpdateAddEncryptionKey    = "add-encryption-key"
-	UpdateRemoveEncryptionKey = "remove-encryption-key"
-	UpdateRemoveProperties    = "remove-properties"
-	UpdateRemoveSchemas       = "remove-schemas"
-	UpdateRemoveSnapshots     = "remove-snapshots"
-	UpdateRemoveSnapshotRef   = "remove-snapshot-ref"
-	UpdateRemoveSpec          = "remove-partition-specs"
-	UpdateRemoveStatistics    = "remove-statistics"
+	UpdateAddEncryptionKey          = "add-encryption-key"
+	UpdateRemoveEncryptionKey       = "remove-encryption-key"
+	UpdateRemovePartitionStatistics = "remove-partition-statistics"
+	UpdateRemoveProperties          = "remove-properties"
+	UpdateRemoveSchemas             = "remove-schemas"
+	UpdateRemoveSnapshots           = "remove-snapshots"
+	UpdateRemoveSnapshotRef         = "remove-snapshot-ref"
+	UpdateRemoveSpec                = "remove-partition-specs"
+	UpdateRemoveStatistics          = "remove-statistics"
 
-	UpdateSetCurrentSchema    = "set-current-schema"
-	UpdateSetDefaultSortOrder = "set-default-sort-order"
-	UpdateSetDefaultSpec      = "set-default-spec"
-	UpdateSetLocation         = "set-location"
-	UpdateSetProperties       = "set-properties"
-	UpdateSetSnapshotRef      = "set-snapshot-ref"
-	UpdateSetStatistics       = "set-statistics"
+	UpdateSetCurrentSchema       = "set-current-schema"
+	UpdateSetDefaultSortOrder    = "set-default-sort-order"
+	UpdateSetDefaultSpec         = "set-default-spec"
+	UpdateSetLocation            = "set-location"
+	UpdateSetPartitionStatistics = "set-partition-statistics"
+	UpdateSetProperties          = "set-properties"
+	UpdateSetSnapshotRef         = "set-snapshot-ref"
+	UpdateSetStatistics          = "set-statistics"
 
 	UpdateUpgradeFormatVersion = "upgrade-format-version"
 )
@@ -123,6 +125,10 @@ func (u *Updates) UnmarshalJSON(data []byte) error {
 			upd = &setStatisticsUpdate{}
 		case UpdateRemoveStatistics:
 			upd = &removeStatisticsUpdate{}
+		case UpdateSetPartitionStatistics:
+			upd = &setPartitionStatisticsUpdate{}
+		case UpdateRemovePartitionStatistics:
+			upd = &removePartitionStatisticsUpdate{}
 		case UpdateAddEncryptionKey:
 			upd = &addEncryptionKeyUpdate{}
 		case UpdateRemoveEncryptionKey:
@@ -305,6 +311,18 @@ func (u *setDefaultSortOrderUpdate) Apply(builder *MetadataBuilder) error {
 type addSnapshotUpdate struct {
 	baseUpdate
 	Snapshot *Snapshot `json:"snapshot"`
+
+	// ownManifests holds the manifests written by this producer (those
+	// NOT inherited from the parent snapshot). Populated by
+	// snapshotProducer.commit and used by rebuildManifestList below.
+	ownManifests []iceberg.ManifestFile
+
+	// rebuildManifestList, when non-nil, regenerates the snapshot's
+	// manifest list to inherit from freshParent and combines it with
+	// ownManifests. Called by doCommit on every retry attempt so that
+	// each retry snapshot correctly inherits all files committed by
+	// concurrent writers since the original build.
+	rebuildManifestList func(ctx context.Context, freshMeta Metadata, freshParent *Snapshot, fio io.WriteFileIO, attempt int) (*Snapshot, error)
 }
 
 // NewAddSnapshotUpdate creates a new update that adds the given snapshot to the table metadata.
@@ -315,8 +333,14 @@ func NewAddSnapshotUpdate(snapshot *Snapshot) *addSnapshotUpdate {
 	}
 }
 
+// Apply records this snapshot in the metadata builder. It delegates to
+// MetadataBuilder.AddSnapshotUpdate so that runtime-only fields
+// (ownManifests and rebuildManifestList) are preserved on the stored update
+// without reaching back into builder.updates after the fact. doCommit's retry
+// loop relies on these fields to regenerate the manifest list after an OCC
+// conflict.
 func (u *addSnapshotUpdate) Apply(builder *MetadataBuilder) error {
-	return builder.AddSnapshot(u.Snapshot)
+	return builder.AddSnapshotUpdate(u)
 }
 
 type setSnapshotRefUpdate struct {
@@ -496,12 +520,10 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		for _, man := range mans {
 			filesToDelete[man.FilePath()] = struct{}{}
 
-			entries, err := man.FetchEntries(prefs, false)
-			if err != nil {
-				return err
-			}
-
-			for _, entry := range entries {
+			for entry, err := range man.Entries(prefs, false) {
+				if err != nil {
+					return err
+				}
 				filesToDelete[entry.DataFile().FilePath()] = struct{}{}
 			}
 		}
@@ -516,12 +538,10 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		for _, man := range mans {
 			delete(filesToDelete, man.FilePath())
 
-			entries, err := man.FetchEntries(prefs, false)
-			if err != nil {
-				return err
-			}
-
-			for _, entry := range entries {
+			for entry, err := range man.Entries(prefs, false) {
+				if err != nil {
+					return err
+				}
 				if entry.Status() != iceberg.EntryStatusDELETED {
 					delete(filesToDelete, entry.DataFile().FilePath())
 				}
@@ -665,6 +685,42 @@ func NewRemoveStatisticsUpdate(snapshotID int64) *removeStatisticsUpdate {
 
 func (u *removeStatisticsUpdate) Apply(builder *MetadataBuilder) error {
 	return builder.RemoveStatistics(u.SnapshotID)
+}
+
+type setPartitionStatisticsUpdate struct {
+	baseUpdate
+	PartitionStatistics PartitionStatisticsFile `json:"partition-statistics"`
+}
+
+// NewSetPartitionStatisticsUpdate creates a new Update that adds or replaces the partition
+// statistics file for the given snapshot ID in the table metadata.
+func NewSetPartitionStatisticsUpdate(stats PartitionStatisticsFile) *setPartitionStatisticsUpdate {
+	return &setPartitionStatisticsUpdate{
+		baseUpdate:          baseUpdate{ActionName: UpdateSetPartitionStatistics},
+		PartitionStatistics: stats,
+	}
+}
+
+func (u *setPartitionStatisticsUpdate) Apply(builder *MetadataBuilder) error {
+	return builder.SetPartitionStatistics(u.PartitionStatistics)
+}
+
+type removePartitionStatisticsUpdate struct {
+	baseUpdate
+	SnapshotID int64 `json:"snapshot-id"`
+}
+
+// NewRemovePartitionStatisticsUpdate creates a new Update that removes the partition statistics
+// file for the given snapshot ID from the table metadata.
+func NewRemovePartitionStatisticsUpdate(snapshotID int64) *removePartitionStatisticsUpdate {
+	return &removePartitionStatisticsUpdate{
+		baseUpdate: baseUpdate{ActionName: UpdateRemovePartitionStatistics},
+		SnapshotID: snapshotID,
+	}
+}
+
+func (u *removePartitionStatisticsUpdate) Apply(builder *MetadataBuilder) error {
+	return builder.RemovePartitionStatistics(u.SnapshotID)
 }
 
 type addEncryptionKeyUpdate struct {

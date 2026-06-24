@@ -309,7 +309,7 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 	var currentWriter tblutils.FileWriter
 	defer func() {
 		if currentWriter != nil {
-			currentWriter.Close()
+			currentWriter.Abort()
 		}
 	}()
 

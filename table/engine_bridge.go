@@ -129,6 +129,11 @@ func RewriteValidatorFor(rewrittenPaths []string) ConflictValidatorFunc {
 	}
 }
 
+// rewriteValidator is the unexported alias used by internal tests.
+func rewriteValidator(rewrittenPaths []string) conflictValidatorFunc {
+	return RewriteValidatorFor(rewrittenPaths)
+}
+
 // WithRewriteSemantics marks an overwrite/replace as a rewrite (compaction),
 // bypassing the overwrite producer's default isolation validator.
 func WithRewriteSemantics() WriteOption { return withRewriteSemantics() }

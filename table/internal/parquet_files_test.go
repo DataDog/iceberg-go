@@ -39,6 +39,7 @@ import (
 	"github.com/DataDog/iceberg-go"
 	internal2 "github.com/DataDog/iceberg-go/internal"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/DataDog/iceberg-go/table/internal"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -84,7 +85,7 @@ func constructTestTablePrimitiveTypes(t *testing.T) (*metadata.FileMetaData, tab
 	}`)
 	require.NoError(t, err)
 
-	arrowSchema, err := table.SchemaToArrowSchema(tableMeta.Schemas()[0], nil, true, false)
+	arrowSchema, err := engine.SchemaToArrowSchema(tableMeta.Schemas()[0], nil, true, false)
 	require.NoError(t, err)
 
 	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, arrowSchema, strings.NewReader(`[
@@ -375,7 +376,7 @@ func TestNanosecondTimestampMetrics(t *testing.T) {
 	}`)
 	require.NoError(t, err)
 
-	arrowSchema, err := table.SchemaToArrowSchema(tableMeta.Schemas()[0], nil, true, false)
+	arrowSchema, err := engine.SchemaToArrowSchema(tableMeta.Schemas()[0], nil, true, false)
 	require.NoError(t, err)
 
 	// Build records manually using Arrow builders since JSON parsing for
@@ -621,9 +622,9 @@ func TestWriteDataFileErrOnClose(t *testing.T) {
 			Name: "nested",
 			Type: arrow.ListOfField(arrow.Field{
 				Name: "element", Type: arrow.PrimitiveTypes.Int32, Nullable: false,
-				Metadata: arrow.NewMetadata([]string{table.ArrowParquetFieldIDKey}, []string{"2"}),
+				Metadata: arrow.NewMetadata([]string{engine.ArrowParquetFieldIDKey}, []string{"2"}),
 			}),
-			Metadata: arrow.NewMetadata([]string{table.ArrowParquetFieldIDKey}, []string{"1"}),
+			Metadata: arrow.NewMetadata([]string{engine.ArrowParquetFieldIDKey}, []string{"1"}),
 		},
 	}, nil)
 
@@ -634,7 +635,7 @@ func TestWriteDataFileErrOnClose(t *testing.T) {
 	rec := bldr.NewRecordBatch()
 	defer rec.Release()
 
-	icesc, err := table.ArrowSchemaToIceberg(schema, false, nil)
+	icesc, err := engine.ArrowSchemaToIceberg(schema, false, nil)
 	require.NoError(t, err)
 
 	_, err = fm.WriteDataFile(ctx, &mockfs, nil, internal.WriteFileInfo{
@@ -863,7 +864,7 @@ func TestBloomFilterRowGroupPruning(t *testing.T) {
 		rdr := openBloomTestReader(t, data)
 		tester := &internal.ParquetRowGroupTester{
 			StatsFn: alwaysKeep,
-			BloomPreds: []internal.RowGroupBloomPred{
+			BloomPreds: []internal2.RowGroupBloomPred{
 				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(50)}}, // 50 is in RG0
 			},
 		}
@@ -877,7 +878,7 @@ func TestBloomFilterRowGroupPruning(t *testing.T) {
 		rdr := openBloomTestReader(t, data)
 		tester := &internal.ParquetRowGroupTester{
 			StatsFn: alwaysKeep,
-			BloomPreds: []internal.RowGroupBloomPred{
+			BloomPreds: []internal2.RowGroupBloomPred{
 				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(150)}}, // 150 is in RG1
 			},
 		}
@@ -891,7 +892,7 @@ func TestBloomFilterRowGroupPruning(t *testing.T) {
 		rdr := openBloomTestReader(t, data)
 		tester := &internal.ParquetRowGroupTester{
 			StatsFn: alwaysKeep,
-			BloomPreds: []internal.RowGroupBloomPred{
+			BloomPreds: []internal2.RowGroupBloomPred{
 				{FieldID: 1, PhysBytes: [][]byte{int32PhysBytes(999)}}, // 999 not in either RG
 			},
 		}
@@ -905,7 +906,7 @@ func TestBloomFilterRowGroupPruning(t *testing.T) {
 		rdr := openBloomTestReader(t, data)
 		tester := &internal.ParquetRowGroupTester{
 			StatsFn: alwaysKeep,
-			BloomPreds: []internal.RowGroupBloomPred{
+			BloomPreds: []internal2.RowGroupBloomPred{
 				{
 					FieldID: 1,
 					PhysBytes: [][]byte{
@@ -937,7 +938,7 @@ func TestBloomFilterRowGroupPruning(t *testing.T) {
 		rdr := openBloomTestReader(t, data)
 		tester := &internal.ParquetRowGroupTester{
 			StatsFn: alwaysKeep,
-			BloomPreds: []internal.RowGroupBloomPred{
+			BloomPreds: []internal2.RowGroupBloomPred{
 				{FieldID: 999, PhysBytes: [][]byte{int32PhysBytes(50)}}, // field 999 does not exist
 			},
 		}

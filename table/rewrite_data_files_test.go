@@ -30,7 +30,8 @@ import (
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
-	"github.com/DataDog/iceberg-go/table/compaction"
+	"github.com/DataDog/iceberg-go/table/engine"
+	"github.com/DataDog/iceberg-go/table/engine/compaction"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,13 +61,13 @@ func newRewriteTestTable(t *testing.T) *table.Table {
 	)
 }
 
-// toTaskGroups converts compaction.Plan groups to table.CompactionTaskGroup.
+// toTaskGroups converts compaction.Plan groups to engine.CompactionTaskGroup.
 // This bridge is needed because table/ cannot import table/compaction/
 // (circular dependency).
-func toTaskGroups(groups []compaction.Group) []table.CompactionTaskGroup {
-	out := make([]table.CompactionTaskGroup, len(groups))
+func toTaskGroups(groups []compaction.Group) []engine.CompactionTaskGroup {
+	out := make([]engine.CompactionTaskGroup, len(groups))
 	for i, g := range groups {
-		out[i] = table.CompactionTaskGroup{
+		out[i] = engine.CompactionTaskGroup{
 			PartitionKey:   g.PartitionKey,
 			Tasks:          g.Tasks,
 			TotalSizeBytes: g.TotalSizeBytes,
@@ -79,12 +80,12 @@ func toTaskGroups(groups []compaction.Group) []table.CompactionTaskGroup {
 // runRewriteWithCleanup is the test-side orchestration: compute dead
 // eq-deletes against the current snapshot, then invoke the executor.
 // Mirrors what cmd/iceberg/compact.go does.
-func runRewriteWithCleanup(t *testing.T, tbl *table.Table, groups []table.CompactionTaskGroup, partialProgress bool) (*table.RewriteResult, *table.Table) {
+func runRewriteWithCleanup(t *testing.T, tbl *table.Table, groups []engine.CompactionTaskGroup, partialProgress bool) (*engine.RewriteResult, *table.Table) {
 	t.Helper()
 
 	tx := tbl.NewTransaction()
 
-	rewriteOpts := table.RewriteDataFilesOptions{PartialProgress: partialProgress}
+	var deadEqDeletes []iceberg.DataFile
 	if !partialProgress {
 		snap := tbl.CurrentSnapshot()
 		if snap != nil {
@@ -94,15 +95,20 @@ func runRewriteWithCleanup(t *testing.T, tbl *table.Table, groups []table.Compac
 					rewrittenSet[task.File.FilePath()] = struct{}{}
 				}
 			}
-			deadEqDeletes, err := compaction.CollectDeadEqualityDeletes(
+			var err error
+			deadEqDeletes, err = compaction.CollectDeadEqualityDeletes(
 				t.Context(), iceio.LocalFS{}, snap, rewrittenSet)
 			require.NoError(t, err)
-			rewriteOpts.ExtraDeleteFilesToRemove = deadEqDeletes
 		}
 	}
 
-	result, err := tx.RewriteDataFiles(t.Context(), groups, rewriteOpts)
+	result, err := engine.RewriteDataFiles(t.Context(), tx, groups, partialProgress, nil)
 	require.NoError(t, err)
+
+	if len(deadEqDeletes) > 0 {
+		require.NoError(t, tx.ReplaceFiles(t.Context(), nil, nil, deadEqDeletes, nil))
+		result.RemovedDeleteFiles += len(deadEqDeletes)
+	}
 
 	out, err := tx.Commit(t.Context())
 	require.NoError(t, err)
@@ -122,7 +128,7 @@ var defaultTestCompactionCfg = compaction.Config{
 func TestRewriteDataFiles_SmallFiles(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Write 5 small data files, one per commit.
@@ -132,7 +138,7 @@ func TestRewriteDataFiles_SmallFiles(t *testing.T) {
 			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -168,7 +174,7 @@ func TestRewriteDataFiles_SmallFiles(t *testing.T) {
 func TestRewriteDataFiles_WithPositionDeletes(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Write 3 data files with 2 rows each.
@@ -178,7 +184,7 @@ func TestRewriteDataFiles_WithPositionDeletes(t *testing.T) {
 			`[{"id": %d, "data": "a"}, {"id": %d, "data": "b"}]`, i*2+1, i*2+2))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -188,7 +194,7 @@ func TestRewriteDataFiles_WithPositionDeletes(t *testing.T) {
 	// Add a position delete targeting the first data file.
 	firstDataPath := tbl.Location() + "/data/file-0.parquet"
 	posDelPath := tbl.Location() + "/data/pos-del-001.parquet"
-	writeParquetFile(t, posDelPath, table.PositionalDeleteArrowSchema,
+	writeParquetFile(t, posDelPath, engine.PositionalDeleteArrowSchema,
 		fmt.Sprintf(`[{"file_path": "%s", "pos": 0}]`, firstDataPath))
 
 	posDelBuilder, err := iceberg.NewDataFileBuilder(
@@ -220,7 +226,7 @@ func TestRewriteDataFiles_WithPositionDeletes(t *testing.T) {
 
 	// After compaction: delete is applied, 5 rows remain, delete file removed.
 	assertRowCount(t, tbl, 5)
-	assert.Greater(t, result.RemovedPositionDeleteFiles, 0)
+	assert.Greater(t, result.RemovedDeleteFiles, 0)
 
 	// Verify no delete files remain.
 	newTasks, err := tbl.Scan().PlanFiles(t.Context())
@@ -234,7 +240,7 @@ func TestRewriteDataFiles_EmptyPlan(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
 	tx := tbl.NewTransaction()
-	result, err := tx.RewriteDataFiles(t.Context(), nil, table.RewriteDataFilesOptions{})
+	result, err := engine.RewriteDataFiles(t.Context(), tx, nil, false, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 0, result.RewrittenGroups)
@@ -243,152 +249,16 @@ func TestRewriteDataFiles_EmptyPlan(t *testing.T) {
 	assert.Equal(t, int64(0), result.BytesBefore)
 }
 
-// TestExecuteCompactionGroup_TargetFileSizeForwarded verifies that
-// WithCompactionTargetFileSize reaches the underlying WriteRecords
-// call: a tiny target size on a multi-row group must force the
-// writer to emit more than one output file.
-func TestExecuteCompactionGroup_TargetFileSizeForwarded(t *testing.T) {
-	tbl := newRewriteTestTable(t)
-
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
-	require.NoError(t, err)
-
-	for i := range 5 {
-		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
-		writeParquetFile(t, dataPath, arrowSc,
-			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
-		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
-		tbl, err = tx.Commit(t.Context())
-		require.NoError(t, err)
-	}
-
-	tasks, err := tbl.Scan().PlanFiles(t.Context())
-	require.NoError(t, err)
-	require.Len(t, tasks, 5)
-
-	// Build the group manually so option-forwarding is decoupled from
-	// the planner's bin-packing / MinInputFiles knobs.
-	scanTasks := make([]table.FileScanTask, len(tasks))
-	var totalSize int64
-	for i, st := range tasks {
-		scanTasks[i] = st
-		totalSize += st.File.FileSizeBytes()
-	}
-	group := table.CompactionTaskGroup{
-		PartitionKey:   "single",
-		Tasks:          scanTasks,
-		TotalSizeBytes: totalSize,
-	}
-
-	withTiny, err := table.ExecuteCompactionGroup(t.Context(), tbl, group,
-		table.WithCompactionTargetFileSize(1))
-	require.NoError(t, err)
-	assert.Greater(t, len(withTiny.NewDataFiles), 1,
-		"WithCompactionTargetFileSize(1) must force the writer to roll over per row")
-
-	withDefault, err := table.ExecuteCompactionGroup(t.Context(), tbl, group)
-	require.NoError(t, err)
-	assert.Len(t, withDefault.NewDataFiles, 1,
-		"without the option, the same group consolidates into a single file")
-}
-
-// TestExecuteCompactionGroup_ScanConcurrencyForwarded is a smoke test
-// confirming WithCompactionScanConcurrency is wired through without
-// breaking the read path. We can't easily observe scan parallelism
-// from the result, so the assertion is correctness equivalence with a
-// no-option baseline: same group → same files in / out.
-func TestExecuteCompactionGroup_ScanConcurrencyForwarded(t *testing.T) {
-	tbl := newRewriteTestTable(t)
-
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
-	require.NoError(t, err)
-
-	for i := range 3 {
-		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
-		writeParquetFile(t, dataPath, arrowSc,
-			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
-		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
-		tbl, err = tx.Commit(t.Context())
-		require.NoError(t, err)
-	}
-
-	tasks, err := tbl.Scan().PlanFiles(t.Context())
-	require.NoError(t, err)
-
-	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
-	require.NoError(t, err)
-	require.NotEmpty(t, plan.Groups)
-
-	group := toTaskGroups(plan.Groups)[0]
-
-	withOption, err := table.ExecuteCompactionGroup(t.Context(), tbl, group,
-		table.WithCompactionScanConcurrency(1))
-	require.NoError(t, err)
-
-	baseline, err := table.ExecuteCompactionGroup(t.Context(), tbl, group)
-	require.NoError(t, err)
-
-	assert.Equal(t, len(baseline.OldDataFiles), len(withOption.OldDataFiles),
-		"setting scan concurrency must not change the set of old files read")
-	assert.Equal(t, len(baseline.NewDataFiles), len(withOption.NewDataFiles),
-		"setting scan concurrency must not change the set of consolidated outputs")
-}
-
-// TestRewriteDataFiles_GroupOptionsForwarded verifies that
-// RewriteDataFilesOptions.GroupOptions are piped through to every
-// ExecuteCompactionGroup call.
-func TestRewriteDataFiles_GroupOptionsForwarded(t *testing.T) {
-	tbl := newRewriteTestTable(t)
-
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
-	require.NoError(t, err)
-
-	for i := range 5 {
-		dataPath := tbl.Location() + fmt.Sprintf("/data/file-%d.parquet", i)
-		writeParquetFile(t, dataPath, arrowSc,
-			fmt.Sprintf(`[{"id": %d, "data": "row-%d"}]`, i+1, i+1))
-		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
-		tbl, err = tx.Commit(t.Context())
-		require.NoError(t, err)
-	}
-
-	tasks, err := tbl.Scan().PlanFiles(t.Context())
-	require.NoError(t, err)
-
-	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
-	require.NoError(t, err)
-
-	tx := tbl.NewTransaction()
-	result, err := tx.RewriteDataFiles(t.Context(), toTaskGroups(plan.Groups), table.RewriteDataFilesOptions{
-		GroupOptions: []table.CompactionGroupOption{
-			table.WithCompactionTargetFileSize(1),
-		},
-	})
-	require.NoError(t, err)
-
-	assert.Greater(t, result.AddedDataFiles, 1,
-		"GroupOptions must reach ExecuteCompactionGroup; tiny target size should split output")
-
-	// Drive the commit through to catch regressions that break
-	// ReplaceFiles under tiny-target rewrites — the in-process counter
-	// above only proves the option reached the writer.
-	committed, err := tx.Commit(t.Context())
-	require.NoError(t, err)
-	assertRowCount(t, committed, 5)
-}
 
 func TestRewriteDataFiles_EmptyGroupSkipped(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	groups := []table.CompactionTaskGroup{
+	groups := []engine.CompactionTaskGroup{
 		{PartitionKey: "empty", Tasks: nil, TotalSizeBytes: 0},
 	}
 
 	tx := tbl.NewTransaction()
-	result, err := tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{})
+	result, err := engine.RewriteDataFiles(t.Context(), tx, groups, false, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, 0, result.RewrittenGroups)
@@ -397,7 +267,7 @@ func TestRewriteDataFiles_EmptyGroupSkipped(t *testing.T) {
 func TestRewriteDataFiles_PartialProgress(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Write 6 small files.
@@ -407,7 +277,7 @@ func TestRewriteDataFiles_PartialProgress(t *testing.T) {
 			fmt.Sprintf(`[{"id": %d, "data": "row"}]`, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -428,7 +298,7 @@ func TestRewriteDataFiles_PartialProgress(t *testing.T) {
 func TestRewriteDataFiles_ContextCancellation(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Write 3 files.
@@ -438,7 +308,7 @@ func TestRewriteDataFiles_ContextCancellation(t *testing.T) {
 			fmt.Sprintf(`[{"id": %d, "data": "row"}]`, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -455,7 +325,7 @@ func TestRewriteDataFiles_ContextCancellation(t *testing.T) {
 	cancel()
 
 	tx := tbl.NewTransaction()
-	_, err = tx.RewriteDataFiles(ctx, toTaskGroups(plan.Groups), table.RewriteDataFilesOptions{})
+	_, err = engine.RewriteDataFiles(ctx, tx, toTaskGroups(plan.Groups), false, nil)
 	require.Error(t, err)
 }
 
@@ -466,7 +336,7 @@ func TestRewriteDataFiles_ContextCancellation(t *testing.T) {
 func TestRewriteDataFiles_DeadEqualityDeletesDropped(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// Write 3 data files with 2 rows each.
@@ -476,7 +346,7 @@ func TestRewriteDataFiles_DeadEqualityDeletesDropped(t *testing.T) {
 			`[{"id": %d, "data": "a"}, {"id": %d, "data": "b"}]`, i*2+1, i*2+2))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -505,12 +375,12 @@ func TestRewriteDataFiles_DeadEqualityDeletesDropped(t *testing.T) {
 	// file it could have applied to has been rewritten, so it must be
 	// dropped from the new snapshot.
 	assertRowCount(t, tbl, 5)
-	assert.Equal(t, 1, result.RemovedEqualityDeleteFiles,
+	assert.Equal(t, 1, result.RemovedDeleteFiles,
 		"dead equality delete file should be removed by compaction")
 	assert.Greater(t, result.RemovedDataFiles, 0)
 
 	// The deleted row (id=2) must not reappear after compaction.
-	_, itr, err := tbl.Scan(table.WithSelectedFields("id")).ToArrowRecords(t.Context())
+	_, itr, err := engine.ToArrowRecords(t.Context(), tbl.Scan(table.WithSelectedFields("id")))
 	require.NoError(t, err)
 
 	var ids []int64
@@ -551,7 +421,7 @@ func TestRewriteDataFiles_DeadEqualityDeletesDropped(t *testing.T) {
 func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	// commit 1, 2: small data files.
@@ -561,7 +431,7 @@ func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 			`[{"id": %d, "data": "a"}]`, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -573,7 +443,7 @@ func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 	preserveDataPath := tbl.Location() + "/data/preserve.parquet"
 	writeParquetFile(t, preserveDataPath, arrowSc, `[{"id": 50, "data": "preserved"}]`)
 	tx := tbl.NewTransaction()
-	require.NoError(t, tx.AddFiles(t.Context(), []string{preserveDataPath}, nil, false))
+	require.NoError(t, engine.AddFiles(t.Context(), tx, []string{preserveDataPath}, nil, false))
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -601,7 +471,7 @@ func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 
 	// Build a single-task group manually (bypass the planner so we can
 	// force a partial-partition rewrite).
-	groups := []table.CompactionTaskGroup{
+	groups := []engine.CompactionTaskGroup{
 		{
 			PartitionKey:   "force-partial",
 			Tasks:          []table.FileScanTask{preserveTask},
@@ -613,7 +483,7 @@ func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 
 	// The eq-delete must still be present — it applies to the unrewritten
 	// small-0 / small-1 files (seq 1 and 2), and eq-delete.seq=3 > 2.
-	assert.Equal(t, 0, result.RemovedEqualityDeleteFiles,
+	assert.Equal(t, 0, result.RemovedDeleteFiles,
 		"eq-delete must be preserved when an unrewritten low-seq data file remains in its partition")
 
 	// Sanity: the eq-delete is still attached to the surviving data
@@ -637,7 +507,7 @@ func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 func TestRewriteDataFiles_PreserveDeadEqualityDeletesOptOut(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 3 {
@@ -646,7 +516,7 @@ func TestRewriteDataFiles_PreserveDeadEqualityDeletesOptOut(t *testing.T) {
 			`[{"id": %d, "data": "a"}]`, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -671,14 +541,13 @@ func TestRewriteDataFiles_PreserveDeadEqualityDeletesOptOut(t *testing.T) {
 	// Opt-out path: do NOT compute / pass dead eq-deletes. Mirrors the
 	// CLI behavior when --preserve-dead-equality-deletes is set.
 	tx := tbl.NewTransaction()
-	result, err := tx.RewriteDataFiles(t.Context(), toTaskGroups(plan.Groups),
-		table.RewriteDataFilesOptions{PartialProgress: false})
+	result, err := engine.RewriteDataFiles(t.Context(), tx, toTaskGroups(plan.Groups), false, nil)
 	require.NoError(t, err)
 
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
-	assert.Equal(t, 0, result.RemovedEqualityDeleteFiles,
+	assert.Equal(t, 0, result.RemovedDeleteFiles,
 		"opt-out: dead eq-deletes must be preserved")
 
 	// The eq-delete file must still exist in the new snapshot's
@@ -743,7 +612,7 @@ func collectEqDeletePaths(tasks []table.FileScanTask) []string {
 func TestRewriteDataFiles_PartialProgressPreservesEqDeletes(t *testing.T) {
 	tbl := newRewriteTestTable(t)
 
-	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	arrowSc, err := engine.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
 	require.NoError(t, err)
 
 	for i := range 3 {
@@ -752,7 +621,7 @@ func TestRewriteDataFiles_PartialProgressPreservesEqDeletes(t *testing.T) {
 			`[{"id": %d, "data": "a"}]`, i+1))
 
 		tx := tbl.NewTransaction()
-		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		require.NoError(t, engine.AddFiles(t.Context(), tx, []string{dataPath}, nil, false))
 		tbl, err = tx.Commit(t.Context())
 		require.NoError(t, err)
 	}
@@ -768,10 +637,10 @@ func TestRewriteDataFiles_PartialProgressPreservesEqDeletes(t *testing.T) {
 	require.NoError(t, err)
 
 	result, _ := runRewriteWithCleanup(t, tbl, toTaskGroups(plan.Groups), true)
-	// runRewriteWithCleanup skips ExtraDeleteFilesToRemove for
+	// runRewriteWithCleanup skips dead eq-delete removal for
 	// partial-progress mode, mirroring the documented limitation:
 	// per-group eq-delete cleanup is a follow-up.
-	assert.Equal(t, 0, result.RemovedEqualityDeleteFiles,
+	assert.Equal(t, 0, result.RemovedDeleteFiles,
 		"partial-progress mode does not drop eq-deletes (yet)")
 }
 
@@ -829,7 +698,7 @@ func appendEqualityDelete(t *testing.T, tbl *table.Table, equalityFieldIDs []int
 		delFields = append(delFields, f)
 	}
 	delSchema := iceberg.NewSchema(0, delFields...)
-	delArrowSc, err := table.SchemaToArrowSchema(delSchema, nil, true, false)
+	delArrowSc, err := engine.SchemaToArrowSchema(delSchema, nil, true, false)
 	require.NoError(t, err)
 
 	rec, _, err := array.RecordFromJSON(memory.DefaultAllocator, delArrowSc, strings.NewReader(recordsJSON))
@@ -841,7 +710,7 @@ func appendEqualityDelete(t *testing.T, tbl *table.Table, equalityFieldIDs []int
 	}
 
 	tx := tbl.NewTransaction()
-	deleteFiles, err := tx.WriteEqualityDeletes(t.Context(), equalityFieldIDs, records)
+	deleteFiles, err := engine.WriteEqualityDeletes(t.Context(), tx, equalityFieldIDs, records)
 	require.NoError(t, err)
 
 	rd := tx.NewRowDelta(nil)

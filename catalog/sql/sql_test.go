@@ -37,6 +37,7 @@ import (
 	"github.com/DataDog/iceberg-go/catalog/internal"
 	sqlcat "github.com/DataDog/iceberg-go/catalog/sql"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/uptrace/bun/driver/sqliteshim"
@@ -995,7 +996,7 @@ func (s *SqliteCatalogTestSuite) TestCommitTable() {
 		{s.getCatalogSqlite(), s.randomHierarchicalIdentifier()},
 	}
 
-	arrSchema, err := table.SchemaToArrowSchema(tableSchemaNested, nil, false, false)
+	arrSchema, err := engine.SchemaToArrowSchema(tableSchemaNested, nil, false, false)
 	s.Require().NoError(err)
 
 	table, err := array.TableFromJSON(memory.DefaultAllocator, arrSchema,
@@ -1036,7 +1037,7 @@ func (s *SqliteCatalogTestSuite) TestCommitTable() {
 		s.EqualValues(0, tbl.Metadata().CurrentSchema().ID)
 
 		tx := tbl.NewTransaction()
-		s.Require().NoError(tx.AddFiles(ctx, []string{pqfile}, nil, false))
+		s.Require().NoError(engine.AddFiles(ctx, tx, []string{pqfile}, nil, false))
 		updated, err := tx.Commit(ctx)
 		s.Require().NoError(err)
 
