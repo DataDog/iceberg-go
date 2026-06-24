@@ -23,9 +23,8 @@ import (
 	"math"
 	"slices"
 
-	"github.com/apache/arrow-go/v18/parquet/metadata"
 	"github.com/DataDog/iceberg-go"
-	"github.com/DataDog/iceberg-go/table/internal"
+	"github.com/DataDog/iceberg-go/internal"
 	"github.com/google/uuid"
 )
 
@@ -673,6 +672,22 @@ func (m *metricsEvaluator) isNan(v iceberg.Literal) bool {
 	}
 }
 
+// NewInclusiveMetricsEvaluator is the exported constructor for the inclusive
+// metrics evaluator used by the engine package's deletion-classification path.
+func NewInclusiveMetricsEvaluator(s *iceberg.Schema, expr iceberg.BooleanExpression,
+	caseSensitive bool, includeEmptyFiles bool,
+) (func(iceberg.DataFile) (bool, error), error) {
+	return newInclusiveMetricsEvaluator(s, expr, caseSensitive, includeEmptyFiles)
+}
+
+// NewStrictMetricsEvaluator is the exported constructor for the strict metrics
+// evaluator used by the engine package's deletion-classification path.
+func NewStrictMetricsEvaluator(s *iceberg.Schema, expr iceberg.BooleanExpression,
+	caseSensitive bool, includeEmptyFiles bool,
+) (func(iceberg.DataFile) (bool, error), error) {
+	return newStrictMetricsEvaluator(s, expr, caseSensitive, includeEmptyFiles)
+}
+
 func newInclusiveMetricsEvaluator(s *iceberg.Schema, expr iceberg.BooleanExpression,
 	caseSensitive bool, includeEmptyFiles bool,
 ) (func(iceberg.DataFile) (bool, error), error) {
@@ -693,19 +708,50 @@ func newInclusiveMetricsEvaluator(s *iceberg.Schema, expr iceberg.BooleanExpress
 	}).Eval, nil
 }
 
-func newParquetRowGroupStatsEvaluator(fileSchema *iceberg.Schema, expr iceberg.BooleanExpression,
+// RowGroupStats carries the per-row-group statistics needed to evaluate an
+// inclusive metrics predicate without importing arrow into the table package.
+// The engine package extracts these from a Parquet row group and passes them
+// to the evaluator returned by [NewRowGroupStatsEvaluator].
+type RowGroupStats struct {
+	NumRows     int64
+	ValueCounts map[int]int64
+	NullCounts  map[int]int64
+	LowerBounds map[int][]byte
+	UpperBounds map[int][]byte
+}
+
+// NewRowGroupStatsEvaluator returns a predicate testing whether a Parquet row
+// group (described by its [RowGroupStats]) might contain rows matching expr.
+// It is arrow-free; the engine package supplies the extracted stats.
+func NewRowGroupStatsEvaluator(fileSchema *iceberg.Schema, expr iceberg.BooleanExpression,
 	includeEmptyFiles bool,
-) (func(*metadata.RowGroupMetaData, []int) (bool, error), error) {
+) (func(RowGroupStats) (bool, error), error) {
 	rewritten, err := iceberg.RewriteNotExpr(expr)
 	if err != nil {
 		return nil, err
 	}
 
-	return (&inclusiveMetricsEval{
+	ev := &inclusiveMetricsEval{
 		st:                fileSchema.AsStruct(),
 		includeEmptyFiles: includeEmptyFiles,
 		expr:              rewritten,
-	}).TestRowGroup, nil
+	}
+
+	return ev.testRowGroup, nil
+}
+
+func (m *inclusiveMetricsEval) testRowGroup(rg RowGroupStats) (bool, error) {
+	if !m.includeEmptyFiles && rg.NumRows == 0 {
+		return rowsCannotMatch, nil
+	}
+
+	m.valueCounts = rg.ValueCounts
+	m.nullCounts = rg.NullCounts
+	m.nanCounts = nil
+	m.lowerBounds = rg.LowerBounds
+	m.upperBounds = rg.UpperBounds
+
+	return iceberg.VisitExpr(m.expr, m)
 }
 
 type inclusiveMetricsEval struct {
@@ -714,50 +760,6 @@ type inclusiveMetricsEval struct {
 	st                iceberg.StructType
 	expr              iceberg.BooleanExpression
 	includeEmptyFiles bool
-}
-
-func (m *inclusiveMetricsEval) TestRowGroup(rgmeta *metadata.RowGroupMetaData, colIndices []int) (bool, error) {
-	if !m.includeEmptyFiles && rgmeta.NumRows() == 0 {
-		return rowsCannotMatch, nil
-	}
-
-	m.valueCounts = make(map[int]int64)
-	m.nullCounts = make(map[int]int64)
-	m.nanCounts = nil
-	m.lowerBounds = make(map[int][]byte)
-	m.upperBounds = make(map[int][]byte)
-
-	for _, c := range colIndices {
-		colMeta, err := rgmeta.ColumnChunk(c)
-		if err != nil {
-			return false, err
-		}
-
-		if ok, err := colMeta.StatsSet(); !ok || err != nil {
-			continue
-		}
-
-		stats, err := colMeta.Statistics()
-		if err != nil {
-			return false, err
-		}
-
-		if stats == nil {
-			continue
-		}
-
-		fieldID := int(stats.Descr().SchemaNode().FieldID())
-		m.valueCounts[fieldID] = stats.NumValues()
-		if stats.HasNullCount() {
-			m.nullCounts[fieldID] = stats.NullCount()
-		}
-		if stats.HasMinMax() {
-			m.lowerBounds[fieldID] = stats.EncodeMin()
-			m.upperBounds[fieldID] = stats.EncodeMax()
-		}
-	}
-
-	return iceberg.VisitExpr(m.expr, m)
 }
 
 func (m *inclusiveMetricsEval) Eval(file iceberg.DataFile) (bool, error) {
@@ -1308,7 +1310,7 @@ func (m *strictMetricsEval) VisitLess(t iceberg.BoundTerm, lit iceberg.Literal) 
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.mayContainNulls(field) || m.mayContainNans(field) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMightNotMatch
 	}
 
@@ -1330,7 +1332,7 @@ func (m *strictMetricsEval) VisitLessEqual(t iceberg.BoundTerm, lit iceberg.Lite
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.mayContainNulls(field) || m.mayContainNans(field) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMightNotMatch
 	}
 
@@ -1352,7 +1354,7 @@ func (m *strictMetricsEval) VisitGreater(t iceberg.BoundTerm, lit iceberg.Litera
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.mayContainNulls(field) || m.mayContainNans(field) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMightNotMatch
 	}
 
@@ -1379,7 +1381,7 @@ func (m *strictMetricsEval) VisitGreaterEqual(t iceberg.BoundTerm, lit iceberg.L
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.mayContainNulls(field) || m.mayContainNans(field) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMightNotMatch
 	}
 
@@ -1406,7 +1408,7 @@ func (m *strictMetricsEval) VisitEqual(t iceberg.BoundTerm, lit iceberg.Literal)
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.mayContainNulls(field) || m.mayContainNans(field) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMightNotMatch
 	}
 
@@ -1436,7 +1438,7 @@ func (m *strictMetricsEval) VisitNotEqual(t iceberg.BoundTerm, lit iceberg.Liter
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.containsNullsOnly(fieldID) || m.containsNansOnly(fieldID) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMustMatch
 	}
 
@@ -1480,7 +1482,7 @@ func (m *strictMetricsEval) VisitIn(t iceberg.BoundTerm, s iceberg.Set[iceberg.L
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.mayContainNulls(field) || m.mayContainNans(field) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMightNotMatch
 	}
 
@@ -1518,7 +1520,7 @@ func (m *strictMetricsEval) VisitNotIn(t iceberg.BoundTerm, s iceberg.Set[iceber
 	field := t.Ref().Field()
 	fieldID := field.ID
 
-	if m.containsNullsOnly(fieldID) || m.containsNansOnly(fieldID) {
+	if m.canContainNulls(fieldID) || m.canContainNans(fieldID) {
 		return rowsMustMatch
 	}
 
@@ -1562,27 +1564,16 @@ func (m *strictMetricsEval) VisitNotStartsWith(iceberg.BoundTerm, iceberg.Litera
 	return rowsMightNotMatch
 }
 
-func (m *strictMetricsEval) mayContainNulls(field iceberg.NestedField) bool {
-	cnt, exists := m.nullCounts[field.ID]
-	if !exists {
-		return !field.Required
-	}
+func (m *strictMetricsEval) canContainNulls(fieldID int) bool {
+	cnt, exists := m.nullCounts[fieldID]
 
-	return cnt > 0
+	return exists && cnt > 0
 }
 
-func (m *strictMetricsEval) mayContainNans(field iceberg.NestedField) bool {
-	switch field.Type.(type) {
-	case iceberg.Float32Type, iceberg.Float64Type:
-		cnt, exists := m.nanCounts[field.ID]
-		if !exists {
-			return true
-		}
+func (m *strictMetricsEval) canContainNans(fieldID int) bool {
+	cnt, exists := m.nanCounts[fieldID]
 
-		return cnt > 0
-	default:
-		return false
-	}
+	return exists && cnt > 0
 }
 
 // literalToPhysBytes converts an Iceberg literal to the physical byte
@@ -1761,6 +1752,11 @@ func (c *bloomPredicateCollector) VisitNotStartsWith(_ iceberg.BoundTerm, _ iceb
 // newBloomFilterPredicates walks expr and returns bloom-filter-checkable
 // predicates for row group pruning. Returns nil (no predicates) for
 // AlwaysTrue or any expression with no EqualTo/In conjuncts.
+// NewBloomFilterPredicates is the exported entry point for the engine package.
+func NewBloomFilterPredicates(expr iceberg.BooleanExpression) ([]internal.RowGroupBloomPred, error) {
+	return newBloomFilterPredicates(expr)
+}
+
 func newBloomFilterPredicates(expr iceberg.BooleanExpression) ([]internal.RowGroupBloomPred, error) {
 	return iceberg.VisitExpr(expr, &bloomPredicateCollector{})
 }

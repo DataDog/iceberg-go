@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"iter"
 	"strconv"
@@ -35,10 +34,8 @@ import (
 type WriteRecordOption func(*writeRecordConfig)
 
 type writeRecordConfig struct {
-	targetFileSize  int64
-	writeUUID       *uuid.UUID
-	maxWriteWorkers int
-	clustered       bool
+	targetFileSize int64
+	writeUUID      *uuid.UUID
 }
 
 // WithTargetFileSize overrides the table's default target file size.
@@ -52,45 +49,6 @@ func WithTargetFileSize(size int64) WriteRecordOption {
 func WithWriteUUID(id uuid.UUID) WriteRecordOption {
 	return func(c *writeRecordConfig) {
 		c.writeUUID = &id
-	}
-}
-
-// WithMaxWriteWorkers overrides the default number of fanout workers
-// used for partitioned writes. Each worker processes record batches,
-// partitions them, and writes to the appropriate partition files.
-// Fewer workers means fewer concurrent parquet writers compressing
-// pages simultaneously, which reduces peak memory. A value of 0
-// (the default) uses [config.EnvConfig.MaxWorkers].
-//
-// Combining this option with [WithClusteredWrite] is rejected by
-// [WriteRecords]: the clustered write path is single-threaded by
-// design, so the two options have no meaningful interaction.
-func WithMaxWriteWorkers(n int) WriteRecordOption {
-	return func(c *writeRecordConfig) {
-		c.maxWriteWorkers = n
-	}
-}
-
-// WithClusteredWrite enables the memory-efficient clustered write
-// path for partitioned tables. It keeps at most one partition writer
-// open at a time: when a record arrives for a new partition, the
-// current writer is flushed and closed before a new one is opened.
-//
-// The input must be clustered by partition across batches: once a
-// partition's writer has been closed, encountering further records
-// for that partition returns an error. Within a single batch the
-// writer reclusters rows by partition, so interleaved values like
-// [a,b,a,b] are accepted; the strict check fires only across batch
-// boundaries. This is the natural order for compaction, where each
-// source data file typically belongs to a single partition. If the
-// input is not clustered across batches, use the fanout writer (the
-// default) instead.
-//
-// Combining this option with [WithMaxWriteWorkers] is rejected by
-// [WriteRecords]: the clustered path is single-threaded by design.
-func WithClusteredWrite() WriteRecordOption {
-	return func(c *writeRecordConfig) {
-		c.clustered = true
 	}
 }
 
@@ -122,12 +80,7 @@ func WriteRecords(ctx context.Context, tbl *Table,
 		opt(&cfg)
 	}
 
-	if cfg.clustered && cfg.maxWriteWorkers > 0 {
-		return internal.SingleErrorIter[iceberg.DataFile](
-			errors.New("WithClusteredWrite and WithMaxWriteWorkers are incompatible: the clustered write path is single-threaded"))
-	}
-
-	fs, err := tbl.fsF(ctx)
+	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return internal.SingleErrorIter[iceberg.DataFile](err)
 	}
@@ -137,16 +90,13 @@ func WriteRecords(ctx context.Context, tbl *Table,
 		return internal.SingleErrorIter[iceberg.DataFile](fmt.Errorf("%w: filesystem does not support writing", iceberg.ErrNotImplemented))
 	}
 
-	meta, err := MetadataBuilderFromBase(tbl.metadata, tbl.metadataLocation)
+	meta, err := MetadataBuilderFromBase(tbl.Metadata(), tbl.MetadataLocation())
 	if err != nil {
 		return internal.SingleErrorIter[iceberg.DataFile](fmt.Errorf("failed to build metadata: %w", err))
 	}
 
 	if cfg.targetFileSize > 0 {
-		if meta.props == nil {
-			meta.props = make(iceberg.Properties)
-		}
-		meta.props[WriteTargetFileSizeBytesKey] = strconv.FormatInt(cfg.targetFileSize, 10)
+		meta.SetProp(WriteTargetFileSizeBytesKey, strconv.FormatInt(cfg.targetFileSize, 10))
 	}
 
 	releasing := func(yield func(arrow.RecordBatch, error) bool) {
@@ -166,12 +116,10 @@ func WriteRecords(ctx context.Context, tbl *Table,
 	}
 
 	args := recordWritingArgs{
-		sc:              schema,
-		itr:             releasing,
-		fs:              writeFS,
-		writeUUID:       cfg.writeUUID,
-		maxWriteWorkers: cfg.maxWriteWorkers,
-		clustered:       cfg.clustered,
+		sc:        schema,
+		itr:       releasing,
+		fs:        writeFS,
+		writeUUID: cfg.writeUUID,
 	}
 
 	return recordsToDataFiles(ctx, tbl.Location(), meta, args)

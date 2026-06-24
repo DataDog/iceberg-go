@@ -38,6 +38,7 @@ import (
 	"github.com/DataDog/iceberg-go/catalog/rest"
 	"github.com/DataDog/iceberg-go/config"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/engine"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 )
@@ -819,10 +820,10 @@ func schemaFromParquetFile(path string) (*iceberg.Schema, error) {
 	// Prefer existing field IDs from the Parquet file (written by Iceberg-aware
 	// tools like Spark or PyIceberg). Fall back to fresh sequential IDs only
 	// when the error is specifically about missing field IDs.
-	schema, err := table.ArrowSchemaToIceberg(arrowSchema, true, nil)
+	schema, err := engine.ArrowSchemaToIceberg(arrowSchema, true, nil)
 	if err != nil {
 		if errors.Is(err, iceberg.ErrInvalidSchema) && strings.Contains(err.Error(), "field-id") {
-			return table.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, true)
+			return engine.ArrowSchemaToIcebergWithFreshIDs(arrowSchema, true)
 		}
 
 		return nil, fmt.Errorf("failed to convert parquet schema to iceberg: %w", err)

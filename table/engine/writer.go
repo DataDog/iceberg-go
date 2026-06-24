@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -133,7 +133,7 @@ func (w *defaultDataFileWriter) writeFile(ctx context.Context, partitionValues m
 		defer rec.Release()
 	}
 
-	statsCols, err := computeStatsPlan(w.fileSchema, w.meta.props)
+	statsCols, err := computeStatsPlan(w.fileSchema, w.meta.Props())
 	if err != nil {
 		return nil, err
 	}

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -34,17 +34,19 @@ import (
 type positionDeletePartitionedFanoutWriter struct {
 	partitionContextByFilePath map[string]partitionContext
 	metadata                   Metadata
+	schema                     *iceberg.Schema
 	itr                        iter.Seq2[arrow.RecordBatch, error]
 	writerFactory              *writerFactory
 	concurrentDataFileWriter   *concurrentDataFileWriter
 }
 
 // newPositionDeletePartitionedFanoutWriter creates a new PartitionedFanoutWriter with the specified
-// metadata, partition context, and record iterator.
+// partition specification, schema, and record iterator.
 func newPositionDeletePartitionedFanoutWriter(metadata Metadata, concurrentWriter *concurrentDataFileWriter, partitionContextByFilePath map[string]partitionContext, itr iter.Seq2[arrow.RecordBatch, error], writerFactory *writerFactory) *positionDeletePartitionedFanoutWriter {
 	return &positionDeletePartitionedFanoutWriter{
 		partitionContextByFilePath: partitionContextByFilePath,
 		metadata:                   metadata,
+		schema:                     iceberg.PositionalDeleteSchema,
 		itr:                        itr,
 		writerFactory:              writerFactory,
 		concurrentDataFileWriter:   concurrentWriter,
@@ -133,15 +135,9 @@ func (p *positionDeletePartitionedFanoutWriter) partitionPath(partitionContext p
 		return "", fmt.Errorf("unexpected missing partition spec in metadata for spec id %d", partitionContext.specID)
 	}
 
-	// Resolve the schema at call time, not at construction. Unlike partitionedFanoutWriter
-	// (which always writes against the current spec), this writer fans out across historic
-	// specIDs from the target data files; callers must ensure those specIDs resolve against
-	// fields still present in CurrentSchema. Dropped partition source columns are assumed to
-	// be void-transformed per the Iceberg spec.
-	schema := p.metadata.CurrentSchema()
-	data := newPartitionRecord(partitionContext.partitionData, spec.PartitionType(schema))
+	data := newPartitionRecord(partitionContext.partitionData, spec.PartitionType(p.schema))
 
-	return spec.PartitionToPath(data, schema), nil
+	return spec.PartitionToPath(data, p.schema), nil
 }
 
 func (p *positionDeletePartitionedFanoutWriter) yieldDataFiles(fanoutWorkers *errgroup.Group, outputDataFilesCh chan iceberg.DataFile) iter.Seq2[iceberg.DataFile, error] {

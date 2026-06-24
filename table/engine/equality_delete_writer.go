@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -75,18 +75,19 @@ func equalityDeleteSchema(tableSchema *iceberg.Schema, fieldIDs []int) (*iceberg
 //	rd := tx.NewRowDelta(nil)
 //	rd.AddDeletes(deleteFiles...)
 //	err = rd.Commit(ctx)
-func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs []int, records iter.Seq2[arrow.RecordBatch, error]) ([]iceberg.DataFile, error) {
-	if t.meta.formatVersion < 2 {
+func WriteEqualityDeletes(ctx context.Context, t *Transaction, equalityFieldIDs []int, records iter.Seq2[arrow.RecordBatch, error]) ([]iceberg.DataFile, error) {
+	meta := t.CurrentMeta()
+	if meta.FormatVersion() < 2 {
 		return nil, fmt.Errorf("equality deletes require table format version >= 2, got v%d",
-			t.meta.formatVersion)
+			meta.FormatVersion())
 	}
 
-	deleteSchema, err := equalityDeleteSchema(t.meta.CurrentSchema(), equalityFieldIDs)
+	deleteSchema, err := equalityDeleteSchema(meta.CurrentSchema(), equalityFieldIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	fs, err := t.tbl.fsF(ctx)
+	fs, err := t.TableFS(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +115,7 @@ func (t *Transaction) WriteEqualityDeletes(ctx context.Context, equalityFieldIDs
 		counter:   internal.Counter(0),
 	}
 
-	dataFiles, err := equalityDeleteRecordsToDataFiles(ctx, t.tbl.Location(), t.meta, deleteSchema, equalityFieldIDs, args)
+	dataFiles, err := equalityDeleteRecordsToDataFiles(ctx, t.Table().Location(), meta, deleteSchema, equalityFieldIDs, args)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +156,7 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 		args.writeUUID = &u
 	}
 
-	targetFileSize := int64(meta.props.GetInt(WriteTargetFileSizeBytesKey,
+	targetFileSize := int64(meta.Props().GetInt(WriteTargetFileSizeBytesKey,
 		WriteTargetFileSizeBytesDefault))
 
 	cw := newConcurrentDataFileWriter(newEqualityDeleteWriterMaker(deleteSchema, equalityFieldIDs),
@@ -205,7 +206,7 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 				FileCount:   fileCount,
 				Schema:      deleteSchema,
 				Batches:     batch,
-				SortOrderID: meta.defaultSortOrderID,
+				SortOrderID: meta.DefaultSortOrderID(),
 			}
 			if !yield(t) {
 				return
@@ -213,7 +214,7 @@ func equalityDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 		}
 	}
 
-	return cw.writeFiles(ctx, rootLocation, args.fs, meta, meta.props, nil, tasks), nil
+	return cw.writeFiles(ctx, rootLocation, args.fs, meta, meta.Props(), nil, tasks), nil
 }
 
 // equalityDeleteWriteSchema returns a schema containing the union of equality

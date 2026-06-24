@@ -62,16 +62,6 @@ func NewSurvivorSurvey() *SurvivorSurvey {
 // the survey. partition is the data file's partition tuple from
 // iceberg.DataFile.Partition() (nil/empty for unpartitioned tables);
 // seq is the data file's sequence number from the manifest entry.
-//
-// Defensive: if seq < 0 (sentinel for "unset"), the file is recorded
-// with seq=0 (smallest real value), which keeps it permanently alive
-// against every eq-delete. Better to preserve uncertain state than to
-// drop deletes that may still apply.
-//
-// Pointer receiver: EmptyPartMinSeq is int64 (value type) and we need
-// updates to persist. Callers must hold the survey by value or pointer
-// consistently — typical pattern is `survey := NewSurvivorSurvey()`
-// followed by `survey.AddSurvivor(...)` which Go auto-addresses.
 func (s *SurvivorSurvey) AddSurvivor(partition map[int]any, seq int64) {
 	if seq < 0 {
 		seq = 0
@@ -88,11 +78,6 @@ func (s *SurvivorSurvey) AddSurvivor(partition map[int]any, seq int64) {
 	s.PartMinSeq[key] = seq
 }
 
-// applicableMinSeq returns the smallest surviving-D seq number that
-// the eq-delete with the given partition could apply to. Mirrors the
-// scanner's predicate: an unpartitioned surviving D applies to every
-// E (so EmptyPartMinSeq is always in the min); an unpartitioned E
-// applies to every surviving D (so we min across every PartMinSeq).
 func (s *SurvivorSurvey) applicableMinSeq(eqPartition map[int]any) int64 {
 	if len(eqPartition) == 0 {
 		if len(s.PartMinSeq) == 0 {
@@ -108,35 +93,8 @@ func (s *SurvivorSurvey) applicableMinSeq(eqPartition map[int]any) int64 {
 	return s.EmptyPartMinSeq
 }
 
-// DecideDeadEqualityDeletes is the pure spec-correctness predicate for
-// equality-delete cleanup during compaction. Given a survey of
-// surviving data file seqs (already excluding the rewrite set) and a
-// list of equality-delete manifest entries, it returns the eq-delete
-// files that no surviving data file could ever apply to.
-//
-// The rule is identical to scanner.matchEqualityDeletesToData (the
-// reader-side filter):
-//
-//	E applies to D iff E.seq > D.seq AND (
-//	    len(E.partition) == 0 ||
-//	    len(D.partition) == 0 ||
-//	    partitionsMatch(E.partition, D.partition)
-//	)
-//
-// E is dead iff no applicable surviving D has D.seq < E.seq —
-// equivalently, the applicable min-seq is >= E.seq.
-//
-// SpecID is intentionally NOT part of the predicate. The Iceberg-go
-// reader does not consult it; if the executor used a stricter
-// predicate it could drop eq-deletes the reader still applies, causing
-// silent data loss under partition-spec evolution.
-//
-// Defensive: candidates with sequence number < 0 (sentinel for unset)
-// are skipped — preserved rather than risk dropping an unidentifiable
-// file.
-//
-// Dedup by file path: the same eq-delete file may appear in multiple
-// manifest entries after manifest merging.
+// DecideDeadEqualityDeletes returns the eq-delete files from candidates
+// that no surviving data file could ever apply to.
 func DecideDeadEqualityDeletes(survey *SurvivorSurvey, candidates []iceberg.ManifestEntry) []iceberg.DataFile {
 	if survey == nil || len(candidates) == 0 {
 		return nil
@@ -162,10 +120,6 @@ func DecideDeadEqualityDeletes(survey *SurvivorSurvey, candidates []iceberg.Mani
 	return dead
 }
 
-// partitionBucketKey returns a deterministic string key for a
-// (specID, partition) tuple. Used by the planner to group tasks for
-// bin-packing — different specs must NOT mix because a compacted
-// output file inherits a single spec.
 func partitionBucketKey(specID int32, part map[int]any) string {
 	if len(part) == 0 {
 		return fmt.Sprintf("%d:_", specID)
@@ -174,15 +128,6 @@ func partitionBucketKey(specID int32, part map[int]any) string {
 	return string(appendPartitionTuple(fmt.Appendf(nil, "%d:", specID), part))
 }
 
-// partitionMatchKey returns a deterministic string key for a
-// partition tuple alone (no spec id). Used by the eq-delete cleanup
-// to bucket survivors and candidates by the same key the reader uses
-// for applicability matching.
-//
-// Empty / nil partition → empty string sentinel. Callers must
-// special-case empty partitions per the global-applicability rule;
-// this helper does NOT collapse empty partitions into a fake
-// per-spec bucket because that would break the reader-equivalence.
 func partitionMatchKey(part map[int]any) string {
 	if len(part) == 0 {
 		return ""
@@ -191,8 +136,6 @@ func partitionMatchKey(part map[int]any) string {
 	return string(appendPartitionTuple(nil, part))
 }
 
-// appendPartitionTuple emits the sorted "id=value;" tuple into dst.
-// Caller is responsible for any leading prefix (e.g. specID).
 func appendPartitionTuple(dst []byte, part map[int]any) []byte {
 	ids := make([]int, 0, len(part))
 	for id := range part {

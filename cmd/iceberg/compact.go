@@ -23,9 +23,11 @@ import (
 	"os"
 	"strconv"
 
+	iceberg "github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/table"
-	"github.com/DataDog/iceberg-go/table/compaction"
+	"github.com/DataDog/iceberg-go/table/engine"
+	"github.com/DataDog/iceberg-go/table/engine/compaction"
 	"github.com/pterm/pterm"
 )
 
@@ -114,9 +116,9 @@ func compactRun(ctx context.Context, output Output, tbl *table.Table, plan compa
 	output.Text(fmt.Sprintf("Compacting %d groups (%d files)...",
 		len(plan.Groups), candidateFiles))
 
-	groups := make([]table.CompactionTaskGroup, len(plan.Groups))
+	groups := make([]engine.CompactionTaskGroup, len(plan.Groups))
 	for i, g := range plan.Groups {
-		groups[i] = table.CompactionTaskGroup{
+		groups[i] = engine.CompactionTaskGroup{
 			PartitionKey:   g.PartitionKey,
 			Tasks:          g.Tasks,
 			TotalSizeBytes: g.TotalSizeBytes,
@@ -124,14 +126,12 @@ func compactRun(ctx context.Context, output Output, tbl *table.Table, plan compa
 	}
 
 	tx := tbl.NewTransaction()
-	rewriteOpts := table.RewriteDataFilesOptions{
-		PartialProgress: cfg.partialProgress,
-	}
 
 	// Cleanup of dead equality-delete files. The executor only
 	// orchestrates the commit; the policy + walk live in
-	// table/compaction. Skipped in partial-progress mode (per-group
+	// table/engine/compaction. Skipped in partial-progress mode (per-group
 	// cleanup is a follow-up) and when the caller opts out.
+	var deadEqDeletes []iceberg.DataFile
 	if !cfg.partialProgress && !cfg.preserveDeadEqualityDeletes {
 		snap := tbl.CurrentSnapshot()
 		if snap != nil {
@@ -146,16 +146,15 @@ func compactRun(ctx context.Context, output Output, tbl *table.Table, plan compa
 					rewrittenSet[task.File.FilePath()] = struct{}{}
 				}
 			}
-			deadEqDeletes, err := compaction.CollectDeadEqualityDeletes(ctx, fs, snap, rewrittenSet)
+			deadEqDeletes, err = compaction.CollectDeadEqualityDeletes(ctx, fs, snap, rewrittenSet)
 			if err != nil {
 				output.Error(fmt.Errorf("collect dead equality deletes: %w", err))
 				os.Exit(1)
 			}
-			rewriteOpts.ExtraDeleteFilesToRemove = deadEqDeletes
 		}
 	}
 
-	result, err := tx.RewriteDataFiles(ctx, groups, rewriteOpts)
+	result, err := engine.RewriteDataFiles(ctx, tx, groups, cfg.partialProgress, nil)
 	if err != nil {
 		if result != nil && result.RewrittenGroups > 0 {
 			output.Text(fmt.Sprintf("  (partial: %d groups committed before failure)", result.RewrittenGroups))
@@ -164,15 +163,20 @@ func compactRun(ctx context.Context, output Output, tbl *table.Table, plan compa
 		os.Exit(1)
 	}
 
+	if len(deadEqDeletes) > 0 {
+		if err := tx.ReplaceFiles(ctx, nil, nil, deadEqDeletes, nil); err != nil {
+			output.Error(fmt.Errorf("remove dead equality deletes: %w", err))
+			os.Exit(1)
+		}
+	}
+
 	if _, err := tx.Commit(ctx); err != nil {
 		output.Error(fmt.Errorf("commit failed: %w", err))
 		os.Exit(1)
 	}
 
-	totalRemovedDeletes := result.RemovedPositionDeleteFiles + result.RemovedEqualityDeleteFiles
-	output.Text(fmt.Sprintf("Done. Rewrote %d -> %d files. Removed %d delete files (%d position, %d equality).",
-		result.RemovedDataFiles, result.AddedDataFiles,
-		totalRemovedDeletes, result.RemovedPositionDeleteFiles, result.RemovedEqualityDeleteFiles))
+	output.Text(fmt.Sprintf("Done. Rewrote %d -> %d files. Removed %d delete files.",
+		result.RemovedDataFiles, result.AddedDataFiles, result.RemovedDeleteFiles))
 	output.Text(fmt.Sprintf("  Size: %s -> %s",
 		formatBytes(result.BytesBefore), formatBytes(result.BytesAfter)))
 }

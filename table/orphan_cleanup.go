@@ -268,16 +268,12 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		for _, manifest := range manifestFiles {
 			referenced[manifest.FilePath()] = true
 
-			// discardDeleted=true: skip DELETED-status entries when
-			// computing the reachable file set. A DELETED entry is
-			// not live in this snapshot and should not pin the file
-			// against orphan cleanup once the snapshot that
-			// originally held it live has been expired.
-			// This matches iceberg-java and pyiceberg behavior.
-			for entry, err := range manifest.Entries(fs, true) {
-				if err != nil {
-					return nil, fmt.Errorf("failed to read manifest entries: %w", err)
-				}
+			entries, err := manifest.FetchEntries(fs, false)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read manifest entries: %w", err)
+			}
+
+			for _, entry := range entries {
 				referenced[entry.DataFile().FilePath()] = true
 			}
 		}

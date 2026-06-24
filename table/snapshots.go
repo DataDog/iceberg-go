@@ -345,19 +345,20 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 		}
 
 		for _, m := range manifests {
-			for entry, err := range m.Entries(fio, false) {
-				if err != nil {
-					yield(nil, err)
+			dataFiles, err := m.FetchEntries(fio, false)
+			if err != nil {
+				yield(nil, err)
 
-					return
-				}
+				return
+			}
 
+			for _, f := range dataFiles {
 				if fileFilter != nil {
-					if _, ok := fileFilter[entry.DataFile().ContentType()]; !ok {
+					if _, ok := fileFilter[f.DataFile().ContentType()]; !ok {
 						continue
 					}
 				}
-				if !yield(entry.DataFile(), nil) {
+				if !yield(f.DataFile(), nil) {
 					return
 				}
 			}
@@ -388,13 +389,15 @@ func (s Snapshot) entries(fio iceio.IO, manifestContent iceberg.ManifestContent)
 				continue
 			}
 
-			for entry, err := range m.Entries(fio, false) {
-				if err != nil {
-					yield(nil, err)
+			entries, err := m.FetchEntries(fio, false)
+			if err != nil {
+				yield(nil, err)
 
-					return
-				}
-				if !yield(entry, nil) {
+				return
+			}
+
+			for _, e := range entries {
+				if !yield(e, nil) {
 					return
 				}
 			}

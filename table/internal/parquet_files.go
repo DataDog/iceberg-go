@@ -720,19 +720,11 @@ type ParquetFileSource struct {
 	file iceberg.DataFile
 }
 
-// RowGroupBloomPred holds the physical-encoded bytes for each literal in a
-// bloom-filterable predicate on one field. A row group can be skipped when
-// NONE of the bytes appear in the column's bloom filter.
-type RowGroupBloomPred struct {
-	FieldID   int
-	PhysBytes [][]byte // one entry for EqualTo; one per value for In
-}
-
 // ParquetRowGroupTester combines stats-based and bloom filter row group pruning.
 // Pass it as the tester argument to wrapPqArrowReader.GetRecords.
 type ParquetRowGroupTester struct {
 	StatsFn    func(*metadata.RowGroupMetaData, []int) (bool, error)
-	BloomPreds []RowGroupBloomPred // nil = no bloom filter pass
+	BloomPreds []internal.RowGroupBloomPred // nil = no bloom filter pass
 }
 
 type wrapPqArrowReader struct {
@@ -839,7 +831,7 @@ func checkRowGroupBloomFilters(
 	bfReader *metadata.BloomFilterReader,
 	rg int,
 	fieldIDToColIdx map[int]int,
-	preds []RowGroupBloomPred,
+	preds []internal.RowGroupBloomPred,
 ) (bool, error) {
 	rgBFReader, err := bfReader.RowGroup(rg)
 	if err != nil {

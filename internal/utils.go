@@ -140,6 +140,14 @@ func MapExec[T, S any](ctx context.Context, nWorkers int, slice iter.Seq[T], fn 
 	}
 }
 
+// RowGroupBloomPred holds the physical-encoded bytes for each literal in a
+// bloom-filterable predicate on one field. A row group can be skipped when
+// NONE of the bytes appear in the column's bloom filter.
+type RowGroupBloomPred struct {
+	FieldID   int
+	PhysBytes [][]byte // one entry for EqualTo; one per value for In
+}
+
 // Helper function to find the difference between two slices (a - b).
 func Difference(a, b []string) []string {
 	m := make(map[string]bool)

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -102,7 +102,7 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		return nil, err
 	}
 
-	locProvider, err := LoadLocationProvider(rootLocation, meta.props)
+	locProvider, err := LoadLocationProvider(rootLocation, meta.Props())
 	if err != nil {
 		stopCount()
 
@@ -121,7 +121,7 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 	}
 
 	fileFormat, err := iceberg.FileFormatFromString(
-		iceberg.Properties(meta.props).Get(WriteFormatDefaultKey, WriteFormatDefaultDefault))
+		iceberg.Properties(meta.Props()).Get(WriteFormatDefaultKey, WriteFormatDefaultDefault))
 	if err != nil {
 		stopCount()
 
@@ -154,19 +154,19 @@ func newWriterFactory(rootLocation string, args recordWritingArgs, meta *Metadat
 		locProvider:    locProvider,
 		fileSchema:     fileSchema,
 		arrowSchema:    arrowSchema,
-		writeProps:     format.GetWriteProperties(meta.props),
+		writeProps:     format.GetWriteProperties(meta.Props()),
 		currentSpec:    *currentSpec,
 		fileFormat:     fileFormat,
 		format:         format,
 		nextCount:      nextCount,
 		stopCount:      stopCount,
-		sortOrderID:    meta.defaultSortOrderID,
+		sortOrderID:    meta.DefaultSortOrderID(),
 	}
 	for _, apply := range opts {
 		apply(f)
 	}
 
-	f.statsCols, err = computeStatsPlan(f.fileSchema, meta.props)
+	f.statsCols, err = computeStatsPlan(f.fileSchema, meta.Props())
 	if err != nil {
 		stopCount()
 
@@ -309,7 +309,7 @@ func (r *RollingDataWriter) stream(outputDataFilesCh chan<- iceberg.DataFile) {
 	var currentWriter tblutils.FileWriter
 	defer func() {
 		if currentWriter != nil {
-			_ = currentWriter.Abort()
+			currentWriter.Close()
 		}
 	}()
 
@@ -391,11 +391,17 @@ func (r *RollingDataWriter) closeAndWait() error {
 	r.factory.writers.Delete(r.partitionKey)
 	r.wg.Wait()
 
-	if err := <-r.errorCh; err != nil {
-		return fmt.Errorf("error in rolling data writer: %w", err)
-	}
+	select {
+	case err := <-r.errorCh:
+		if err != nil {
+			return fmt.Errorf("error in rolling data writer: %w", err)
+		}
 
-	return nil
+		return nil
+	default:
+
+		return nil
+	}
 }
 
 func (w *writerFactory) closeAll() error {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package table
+package engine
 
 import (
 	"context"
@@ -1408,7 +1408,7 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 				}
 			}()
 
-			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.defaultSortOrderID, meta.props)
+			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.DefaultSortOrderID(), meta.Props())
 
 			return nil
 		})
@@ -1526,7 +1526,7 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 		args.writeUUID = &u
 	}
 
-	targetFileSize := int64(meta.props.GetInt(WriteTargetFileSizeBytesKey,
+	targetFileSize := int64(meta.Props().GetInt(WriteTargetFileSizeBytesKey,
 		WriteTargetFileSizeBytesDefault))
 
 	nameMapping := meta.CurrentSchema().NameMapping()
@@ -1660,7 +1660,7 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 		args.writeUUID = &u
 	}
 
-	targetFileSize := int64(meta.props.GetInt(WriteTargetFileSizeBytesKey,
+	targetFileSize := int64(meta.Props().GetInt(WriteTargetFileSizeBytesKey,
 		WriteTargetFileSizeBytesDefault))
 
 	cw := newConcurrentDataFileWriter(func(rootLocation string, fs iceio.WriteFileIO, meta *MetadataBuilder, props iceberg.Properties, opts ...dataFileWriterOption) (dataFileWriter, error) {
@@ -1682,7 +1682,7 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 					FileCount:   fileCount,
 					Schema:      iceberg.PositionalDeleteSchema,
 					Batches:     batch,
-					SortOrderID: meta.defaultSortOrderID,
+					SortOrderID: meta.DefaultSortOrderID(),
 				}
 				if !yield(t) {
 					return
@@ -1690,7 +1690,7 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 			}
 		}
 
-		return cw.writeFiles(ctx, rootLocation, args.fs, meta, meta.props, nil, tasks)
+		return cw.writeFiles(ctx, rootLocation, args.fs, meta, meta.Props(), nil, tasks)
 	}
 	factory, err := newWriterFactory(rootLocation, args, meta, iceberg.PositionalDeleteSchema, targetFileSize,
 		withContentType(iceberg.EntryContentPosDeletes),

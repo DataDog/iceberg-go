@@ -21,20 +21,20 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"iter"
 	"math"
 	"slices"
-	"strings"
 	"sync"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/io"
 	"golang.org/x/sync/errgroup"
 )
 
 const ScanNoLimit = -1
+
+// set is a generic set built on a map. It is shared by the scanner,
+// snapshot file iteration, and (in the engine package) the arrow readers.
+type set[T comparable] map[T]struct{}
 
 type keyDefaultMap[K comparable, V any] struct {
 	defaultFactory func(K) V
@@ -154,13 +154,13 @@ func GetPartitionRecord(dataFile iceberg.DataFile, partitionType *iceberg.Struct
 func openManifest(io io.IO, manifest iceberg.ManifestFile,
 	partitionFilter, metricsEval func(iceberg.DataFile) (bool, error),
 ) ([]iceberg.ManifestEntry, error) {
-	// Counts may be -1 (unset) on V1 manifests, so clamp before allocating.
-	out := make([]iceberg.ManifestEntry, 0, max(0, int(manifest.AddedDataFiles())+int(manifest.ExistingDataFiles())))
-	for entry, err := range manifest.Entries(io, true) {
-		if err != nil {
-			return nil, err
-		}
+	entries, err := manifest.FetchEntries(io, true)
+	if err != nil {
+		return nil, err
+	}
 
+	out := make([]iceberg.ManifestEntry, 0, len(entries))
+	for _, entry := range entries {
 		p, err := partitionFilter(entry.DataFile())
 		if err != nil {
 			return nil, err
@@ -242,8 +242,6 @@ func (scan *Scan) Snapshot() *Snapshot {
 
 func (scan *Scan) Projection() (*iceberg.Schema, error) {
 	curSchema := scan.metadata.CurrentSchema()
-	curVersion := scan.metadata.Version()
-	caseSensitive := scan.caseSensitive
 	if scan.snapshotID != nil {
 		snap := scan.metadata.SnapshotByID(*scan.snapshotID)
 		if snap == nil {
@@ -263,21 +261,6 @@ func (scan *Scan) Projection() (*iceberg.Schema, error) {
 
 	if slices.Contains(scan.selectedFields, "*") {
 		return curSchema, nil
-	}
-
-	selectedFieldsMeta := metaFieldsFromSelectedFields(scan.selectedFields, caseSensitive)
-	schemaMeta := metaFieldsFromSchema(curSchema)
-	synthesisMeta := synthesizeMeta(selectedFieldsMeta, schemaMeta)
-	if len(synthesisMeta) > 0 && curVersion >= minFormatVersionRowLineage {
-
-		// synthesis path
-		removedMetaSlice, missingMetaFields := removeMetadataFromSelectedFields(scan.selectedFields, synthesisMeta)
-		sch, err := curSchema.Select(scan.caseSensitive, removedMetaSlice...)
-		if err != nil {
-			return nil, err
-		}
-
-		return iceberg.NewSchemaWithIdentifiers(sch.ID, sch.IdentifierFieldIDs, append(sch.Fields(), missingMetaFields...)...), nil
 	}
 
 	return curSchema.Select(scan.caseSensitive, scan.selectedFields...)
@@ -331,6 +314,23 @@ func buildPartitionEvaluator(specID int, metadata Metadata, partitionFilters *ke
 	return func(d iceberg.DataFile) (bool, error) {
 		return fn(GetPartitionRecord(d, partType))
 	}, nil
+}
+
+// BuildManifestEvaluatorForSpec returns a manifest-pruning predicate for the
+// given partition spec id, projecting rowFilter onto the spec. Exported for
+// the engine package (which has no access to the unexported memoizer the
+// scanner uses internally).
+func BuildManifestEvaluatorForSpec(specID int, meta Metadata, rowFilter iceberg.BooleanExpression, caseSensitive bool) (func(iceberg.ManifestFile) (bool, error), error) {
+	partFilter, err := buildPartitionProjection(specID, meta, rowFilter, caseSensitive)
+	if err != nil {
+		return nil, err
+	}
+	spec := meta.PartitionSpecByID(specID)
+	if spec == nil {
+		return nil, fmt.Errorf("%w: id %d", ErrPartitionSpecNotFound, specID)
+	}
+
+	return newManifestEvaluator(*spec, meta.CurrentSchema(), partFilter, caseSensitive)
 }
 
 func (scan *Scan) checkSequenceNumber(minSeqNum int64, manifest iceberg.ManifestFile) bool {
@@ -617,155 +617,24 @@ type FileScanTask struct {
 	DataSequenceNumber *int64
 }
 
-// ToArrowRecords returns the arrow schema of the expected records and an interator
-// that can be used with a range expression to read the records as they are available.
-// If an error is encountered, during the planning and setup then this will return the
-// error directly. If the error occurs while iterating the records, it will be returned
-// by the iterator.
-//
-// The purpose for returning the schema up front is to handle the case where there are no
-// rows returned. The resulting Arrow Schema of the projection will still be known.
-func (scan *Scan) ToArrowRecords(ctx context.Context) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
-	tasks, err := scan.PlanFiles(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
+// ScanFS resolves the scan's filesystem. Exposed for the engine package's
+// arrow record readers.
+func (scan *Scan) ScanFS(ctx context.Context) (io.IO, error) { return scan.ioF(ctx) }
 
-	return scan.ReadTasks(ctx, tasks)
-}
+// ScanMetadata returns the metadata the scan is reading against.
+func (scan *Scan) ScanMetadata() Metadata { return scan.metadata }
 
-// ReadTasks reads Arrow records from a specific set of FileScanTasks, applying the
-// scan's projection, row filters, and positional delete handling. This is useful when
-// the caller has already planned or selected specific tasks to read.
-func (scan *Scan) ReadTasks(ctx context.Context, tasks []FileScanTask) (*arrow.Schema, iter.Seq2[arrow.RecordBatch, error], error) {
-	var (
-		boundFilter iceberg.BooleanExpression
-		err         error
-	)
+// ScanRowFilter returns the scan's row filter expression.
+func (scan *Scan) ScanRowFilter() iceberg.BooleanExpression { return scan.rowFilter }
 
-	if scan.rowFilter != nil {
-		boundFilter, err = iceberg.BindExpr(scan.metadata.CurrentSchema(), scan.rowFilter, scan.caseSensitive)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
+// ScanCaseSensitive reports whether field-name lookups are case-sensitive.
+func (scan *Scan) ScanCaseSensitive() bool { return scan.caseSensitive }
 
-	schema, err := scan.Projection()
-	if err != nil {
-		return nil, nil, err
-	}
+// ScanLimit returns the scan's row limit ([ScanNoLimit] when unset).
+func (scan *Scan) ScanLimit() int64 { return scan.limit }
 
-	fs, err := scan.ioF(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
+// ScanOptions returns the scan's options properties.
+func (scan *Scan) ScanOptions() iceberg.Properties { return scan.options }
 
-	return (&arrowScan{
-		metadata:        scan.metadata,
-		fs:              fs,
-		projectedSchema: schema,
-		boundRowFilter:  boundFilter,
-		caseSensitive:   scan.caseSensitive,
-		rowLimit:        scan.limit,
-		options:         scan.options,
-		concurrency:     scan.concurrency,
-	}).GetRecords(ctx, tasks)
-}
-
-// ToArrowTable calls ToArrowRecords and then gathers all of the records together
-// and returns an arrow.Table make from those records.
-func (scan *Scan) ToArrowTable(ctx context.Context) (arrow.Table, error) {
-	schema, itr, err := scan.ToArrowRecords(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	records := make([]arrow.RecordBatch, 0)
-	for rec, err := range itr {
-		if err != nil {
-			return nil, err
-		}
-
-		defer rec.Release()
-		records = append(records, rec)
-	}
-
-	return array.NewTableFromRecords(schema, records), nil
-}
-
-// Removes metaFields from selectedField if it exists. Returns a []string representing the filtered selectedFields
-// and an iceberg.NestedField[] representing the removed metadata. Note that metaFields is passed in
-// after being validated from metaFieldsFromSelectedFields.
-func removeMetadataFromSelectedFields(selectedFields []string, metaFields []string) ([]string, []iceberg.NestedField) {
-	filteredFields := []string{}
-	meta := []iceberg.NestedField{}
-
-	for _, field := range selectedFields {
-		if slices.Contains(metaFields, strings.ToLower(field)) {
-
-			switch strings.ToLower(field) {
-			case iceberg.LastUpdatedSequenceNumberColumnName:
-				meta = append(meta, iceberg.LastUpdatedSequenceNumber())
-			case iceberg.RowIDColumnName:
-				meta = append(meta, iceberg.RowID())
-			}
-
-			continue
-		}
-
-		filteredFields = append(filteredFields, field)
-	}
-
-	return filteredFields, meta
-}
-
-func metaFieldsFromSelectedFields(selectedFields []string, caseSensitive bool) []string {
-	meta := []string{}
-	if !caseSensitive {
-		for _, field := range selectedFields {
-			if strings.EqualFold(field, iceberg.RowIDColumnName) || strings.EqualFold(field, iceberg.LastUpdatedSequenceNumberColumnName) {
-				meta = append(meta, strings.ToLower(field))
-			}
-		}
-
-		return meta
-	}
-
-	for _, field := range selectedFields {
-		if field == iceberg.RowIDColumnName || field == iceberg.LastUpdatedSequenceNumberColumnName {
-			meta = append(meta, strings.ToLower(field))
-		}
-	}
-
-	return meta
-}
-
-// Takes in a *iceberg.Schema and returns a []string representing the row lineage metadata present
-// in the schema.
-func metaFieldsFromSchema(sch *iceberg.Schema) []string {
-	meta := []string{}
-	_, hasRowIDMeta := sch.FindFieldByName(iceberg.RowIDColumnName)
-	_, hasSeqMeta := sch.FindFieldByName(iceberg.LastUpdatedSequenceNumberColumnName)
-
-	if hasRowIDMeta {
-		meta = append(meta, iceberg.RowIDColumnName)
-	}
-	if hasSeqMeta {
-		meta = append(meta, iceberg.LastUpdatedSequenceNumberColumnName)
-	}
-
-	return meta
-}
-
-// Any metadata which is in selectedFieldsMeta and not in schemaMeta is a synthesis meta
-func synthesizeMeta(selectedFieldsMeta []string, schemaMeta []string) []string {
-	synthesis := []string{}
-
-	for _, f := range selectedFieldsMeta {
-		if !slices.Contains(schemaMeta, f) {
-			synthesis = append(synthesis, f)
-		}
-	}
-
-	return synthesis
-}
+// ScanConcurrency returns the scan's configured concurrency.
+func (scan *Scan) ScanConcurrency() int { return scan.concurrency }
