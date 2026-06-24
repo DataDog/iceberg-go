@@ -37,7 +37,6 @@ import (
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/internal"
 	icebergio "github.com/DataDog/iceberg-go/io"
-	tblutils "github.com/DataDog/iceberg-go/table/internal"
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sync/errgroup"
 )
@@ -251,7 +250,7 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 		}
 	}
 
-	type list = tblutils.Enumerated[[]iceberg.ManifestFile]
+	type list = internal.Enumerated[[]iceberg.ManifestFile]
 	g := errgroup.Group{}
 
 	n := len(t.metadata.Snapshots())
@@ -279,7 +278,7 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 		}
 	}()
 
-	results := tblutils.MakeSequencedChan(uint(n), ch,
+	results := internal.MakeSequencedChan(uint(n), ch,
 		func(left, right *list) bool {
 			switch {
 			case left.Index < 0:

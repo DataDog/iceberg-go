@@ -32,7 +32,6 @@ import (
 	"github.com/DataDog/iceberg-go/config"
 	"github.com/DataDog/iceberg-go/internal"
 	iceio "github.com/DataDog/iceberg-go/io"
-	tblutils "github.com/DataDog/iceberg-go/table/internal"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
@@ -321,7 +320,7 @@ func (of *overwriteFiles) deletedEntries(ctx context.Context) ([]iceberg.Manifes
 
 	nWorkers := config.EnvConfig.MaxWorkers
 	finalResult := make([]iceberg.ManifestEntry, 0, len(previousManifests))
-	for entries, err := range tblutils.MapExec(ctx, nWorkers, slices.Values(previousManifests), getEntries) {
+	for entries, err := range internal.MapExec(ctx, nWorkers, slices.Values(previousManifests), getEntries) {
 		if err != nil {
 			return nil, err
 		}

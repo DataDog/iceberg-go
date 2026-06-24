@@ -19,13 +19,126 @@ package internal
 
 import (
 	"cmp"
+	"container/heap"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
+	"runtime"
 	"slices"
 	"sync/atomic"
+
+	"golang.org/x/sync/errgroup"
 )
+
+// Enumerated is a quick way to represent a sequenced value that can
+// be processed in parallel and then needs to be reordered.
+type Enumerated[T any] struct {
+	Value T
+	Index int
+	Last  bool
+}
+
+type pqueue[T any] struct {
+	queue   []*T
+	compare func(a, b *T) bool
+}
+
+func (pq *pqueue[T]) Len() int            { return len(pq.queue) }
+func (pq *pqueue[T]) Less(i, j int) bool  { return pq.compare(pq.queue[i], pq.queue[j]) }
+func (pq *pqueue[T]) Swap(i, j int)       { pq.queue[i], pq.queue[j] = pq.queue[j], pq.queue[i] }
+func (pq *pqueue[T]) Push(x any)          { pq.queue = append(pq.queue, x.(*T)) }
+func (pq *pqueue[T]) Pop() any {
+	old := pq.queue
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	pq.queue = old[0 : n-1]
+	return item
+}
+
+// MakeSequencedChan creates a channel that outputs values in a given order
+// based on the comesAfter and isNext functions.
+func MakeSequencedChan[T any](bufferSize uint, source <-chan T, comesAfter, isNext func(a, b *T) bool, initial T) <-chan T {
+	pq := pqueue[T]{queue: make([]*T, 0), compare: comesAfter}
+	heap.Init(&pq)
+	previous, out := &initial, make(chan T, bufferSize)
+	go func() {
+		defer close(out)
+		for val := range source {
+			heap.Push(&pq, &val)
+			for pq.Len() > 0 && isNext(previous, pq.queue[0]) {
+				previous = heap.Pop(&pq).(*T)
+				out <- *previous
+			}
+		}
+	}()
+	return out
+}
+
+// MapExec runs fn on each element of slice concurrently across nWorkers goroutines.
+func MapExec[T, S any](ctx context.Context, nWorkers int, slice iter.Seq[T], fn func(T) (S, error)) iter.Seq2[S, error] {
+	if nWorkers <= 0 {
+		nWorkers = runtime.GOMAXPROCS(0)
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	ch := make(chan T, nWorkers)
+	out := make(chan S, nWorkers)
+
+	for range nWorkers {
+		g.Go(func() error {
+			for v := range ch {
+				result, err := fn(v)
+				if err != nil {
+					return err
+				}
+				select {
+				case out <- result:
+				case <-ctx.Done():
+					return context.Cause(ctx)
+				}
+			}
+			return nil
+		})
+	}
+
+	var err error
+	go func() {
+		defer func() {
+			close(ch)
+			err = g.Wait()
+			close(out)
+		}()
+		for v := range slice {
+			select {
+			case ch <- v:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return func(yield func(S, error) bool) {
+		defer func() {
+			// drain out if we exit early
+			for range out {
+			}
+		}()
+
+		for v := range out {
+			if !yield(v, nil) {
+				return
+			}
+		}
+
+		if err != nil {
+			var z S
+			yield(z, err)
+		}
+	}
+}
 
 // Helper function to find the difference between two slices (a - b).
 func Difference(a, b []string) []string {

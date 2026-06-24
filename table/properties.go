@@ -17,11 +17,7 @@
 
 package table
 
-import (
-	"math"
-
-	"github.com/DataDog/iceberg-go/table/internal"
-)
+import "math"
 
 const (
 	WriteDataPathKey                        = "write.data.path"
@@ -38,28 +34,28 @@ const (
 	DefaultWriteMetricsModeKey     = "write.metadata.metrics.default"
 	DefaultWriteMetricsModeDefault = "truncate(16)"
 
-	ParquetRowGroupSizeBytesKey              = internal.ParquetRowGroupSizeBytesKey
-	ParquetRowGroupSizeBytesDefault          = internal.ParquetRowGroupSizeBytesDefault
-	ParquetRowGroupLimitKey                  = internal.ParquetRowGroupLimitKey
-	ParquetRowGroupLimitDefault              = internal.ParquetRowGroupLimitDefault
-	ParquetPageSizeBytesKey                  = internal.ParquetPageSizeBytesKey
-	ParquetPageSizeBytesDefault              = internal.ParquetPageSizeBytesDefault
-	ParquetPageRowLimitKey                   = internal.ParquetPageRowLimitKey
-	ParquetPageRowLimitDefault               = internal.ParquetPageRowLimitDefault
-	ParquetDictSizeBytesKey                  = internal.ParquetDictSizeBytesKey
-	ParquetDictSizeBytesDefault              = internal.ParquetDictSizeBytesDefault
-	ParquetPageVersionKey                    = internal.ParquetPageVersionKey
-	ParquetPageVersionDefault                = internal.ParquetPageVersionDefault
-	ParquetCompressionKey                    = internal.ParquetCompressionKey
-	ParquetCompressionDefault                = internal.ParquetCompressionDefault
-	ParquetCompressionLevelKey               = internal.ParquetCompressionLevelKey
-	ParquetCompressionLevelDefault           = internal.ParquetCompressionLevelDefault
-	ParquetBloomFilterMaxBytesKey            = internal.ParquetBloomFilterMaxBytesKey
-	ParquetBloomFilterMaxBytesDefault        = internal.ParquetBloomFilterMaxBytesDefault
-	ParquetBloomFilterColumnEnabledKeyPrefix = internal.ParquetBloomFilterColumnEnabledKeyPrefix
+	ParquetRowGroupSizeBytesKey              = "write.parquet.row-group-size-bytes"
+	ParquetRowGroupSizeBytesDefault          = 128 * 1024 * 1024 // 128 MB
+	ParquetRowGroupLimitKey                  = "write.parquet.row-group-limit"
+	ParquetRowGroupLimitDefault              = 1048576
+	ParquetPageSizeBytesKey                  = "write.parquet.page-size-bytes"
+	ParquetPageSizeBytesDefault              = 1024 * 1024 // 1 MB
+	ParquetPageRowLimitKey                   = "write.parquet.page-row-limit"
+	ParquetPageRowLimitDefault               = 20000
+	ParquetDictSizeBytesKey                  = "write.parquet.dict-size-bytes"
+	ParquetDictSizeBytesDefault              = 2 * 1024 * 1024 // 2 MB
+	ParquetPageVersionKey                    = "write.parquet.page-version"
+	ParquetPageVersionDefault                = "2"
+	ParquetCompressionKey                    = "write.parquet.compression-codec"
+	ParquetCompressionDefault                = "zstd"
+	ParquetCompressionLevelKey               = "write.parquet.compression-level"
+	ParquetCompressionLevelDefault           = -1
+	ParquetBloomFilterMaxBytesKey            = "write.parquet.bloom-filter-max-bytes"
+	ParquetBloomFilterMaxBytesDefault        = 1024 * 1024
+	ParquetBloomFilterColumnEnabledKeyPrefix = "write.parquet.bloom-filter-enabled.column"
 
-	ParquetBatchSizeKey     = internal.ParquetBatchSizeKey
-	ParquetBatchSizeDefault = internal.ParquetBatchSizeDefault
+	ParquetBatchSizeKey     = "read.parquet.batch-size"
+	ParquetBatchSizeDefault = 1 << 17 // 131072 rows
 
 	ManifestMergeEnabledKey     = "commit.manifest-merge.enabled"
 	ManifestMergeEnabledDefault = false
