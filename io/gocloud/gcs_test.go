@@ -20,7 +20,7 @@ package gocloud
 import (
 	"testing"
 
-	"github.com/apache/iceberg-go/io"
+	"github.com/DataDog/iceberg-go/io"
 	"github.com/stretchr/testify/assert"
 )
 
