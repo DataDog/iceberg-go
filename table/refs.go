@@ -18,8 +18,8 @@
 package table
 
 import (
-	"encoding/json"
 	"errors"
+	"github.com/goccy/go-json"
 	"reflect"
 )
 

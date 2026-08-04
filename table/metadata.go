@@ -20,9 +20,9 @@ package table
 import (
 	"cmp"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/goccy/go-json"
 	"io"
 	"iter"
 	"maps"

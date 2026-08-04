@@ -20,8 +20,8 @@ package iceberg
 import (
 	"bytes"
 	"compress/flate"
-	"encoding/json"
 	"errors"
+	"github.com/goccy/go-json"
 	"io"
 	"io/fs"
 	"math"

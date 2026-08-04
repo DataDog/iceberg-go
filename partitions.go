@@ -18,9 +18,9 @@
 package iceberg
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/goccy/go-json"
 	"iter"
 	"net/url"
 	"slices"

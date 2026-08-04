@@ -24,9 +24,9 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/goccy/go-json"
 	"math/rand/v2"
 	"net/http"
 	"net/url"

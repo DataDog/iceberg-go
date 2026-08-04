@@ -20,8 +20,8 @@ package iceberg
 import (
 	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"math"
 	"sort"
 	"strings"

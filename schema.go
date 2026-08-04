@@ -18,8 +18,8 @@
 package iceberg
 
 import (
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"iter"
 	"maps"
 	"slices"

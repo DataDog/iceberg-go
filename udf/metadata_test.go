@@ -18,8 +18,8 @@
 package udf
 
 import (
-	"encoding/json"
 	"errors"
+	"github.com/goccy/go-json"
 	"os"
 	"strings"
 	"testing"
