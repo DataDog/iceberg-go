@@ -1622,7 +1622,12 @@ func (r *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*
 		return nil, err
 	}
 
-	ret, err := doGet[loadTableResponse](ctx, r.baseURI, path,
+	uri := r.baseURI.JoinPath(path...)
+	v := url.Values{}
+	v.Set("snapshots", "refs")
+	uri.RawQuery = v.Encode()
+
+	ret, err := doGet[loadTableResponse](ctx, uri, path,
 		r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchTable})
 	if err != nil {
 		return nil, err
