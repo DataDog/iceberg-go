@@ -98,6 +98,7 @@ const (
 	keyTlsSkipVerify   = "rest.tls.skip-verify"
 
 	keyViewEndpointsSupported = "view-endpoints-supported"
+	keySnapshotLoadingMode    = "snapshot-loading-mode"
 )
 
 var (
@@ -114,6 +115,19 @@ var (
 	ErrCommitFailed       = fmt.Errorf("%w: %w", ErrRESTError, table.ErrCommitFailed)
 	ErrCommitStateUnknown = fmt.Errorf("%w: commit failed due to unknown reason", ErrRESTError)
 	ErrOAuthError         = fmt.Errorf("%w: oauth error", ErrRESTError)
+)
+
+// SnapshotMode controls which snapshots are included in a loadTable response.
+type SnapshotMode string
+
+const (
+	// SnapshotModeAll requests all currently valid snapshots (server default).
+	SnapshotModeAll SnapshotMode = "all"
+	// SnapshotModeRefs requests only snapshots that are referenced by at least one named branch or tag.
+	// The server omits unreferenced historical snapshots, which reduces response size for tables
+	// with long snapshot histories. Note: time-travel to a snapshot not referenced by any branch
+	// or tag will fail, as that snapshot will not be present in the returned metadata.
+	SnapshotModeRefs SnapshotMode = "refs"
 )
 
 func init() {
@@ -330,6 +344,7 @@ type reqConfig struct {
 	errorTypeOverride map[string]error
 	allowNoContent    bool
 	requireBody       bool
+	queryParams       url.Values
 }
 
 type reqOption func(*reqConfig)
@@ -383,6 +398,16 @@ func requireBody() reqOption {
 	return func(c *reqConfig) { c.requireBody = true }
 }
 
+// Appends query parameters to the request.
+func withQueryParams(params url.Values) reqOption {
+	return func(c *reqConfig) {
+		if c.queryParams == nil {
+			c.queryParams = make(url.Values, len(params))
+		}
+		maps.Copy(c.queryParams, params)
+	}
+}
+
 func newReqConfig(opts []reqOption) reqConfig {
 	var cfg reqConfig
 	for _, opt := range opts {
@@ -421,7 +446,17 @@ func do[T any](ctx context.Context, method string, baseURI *url.URL, path []stri
 		rsp *http.Response
 	)
 
-	uri := baseURI.JoinPath(path...).String()
+	u := baseURI.JoinPath(path...)
+	if len(cfg.queryParams) > 0 {
+		q := u.Query()
+		for k, vs := range cfg.queryParams {
+			for _, v := range vs {
+				q.Add(k, v)
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+	uri := u.String()
 	ctx = withSuppressedHeadersCtx(ctx, cfg.suppressHeaders)
 	if req, err = http.NewRequestWithContext(ctx, method, uri, nil); err != nil {
 		return ret, err
@@ -780,6 +815,7 @@ type Catalog struct {
 	endpoints endpointSet
 
 	namespaceSeparator string
+	snapshotMode       SnapshotMode
 
 	// reporter builds and caches the catalog's metrics reporter once, so it is
 	// constructed per-catalog rather than per table load. Released by Close.
@@ -1054,6 +1090,7 @@ func (r *Catalog) fetchConfig(ctx context.Context, opts *options) (*options, err
 	maps.Copy(cfg, rsp.Overrides)
 
 	r.namespaceSeparator = cfg.Get(keyNamespaceSeparator, defaultNamespaceSeparator)
+	r.snapshotMode = SnapshotMode(cfg.Get(keySnapshotLoadingMode, ""))
 
 	// Negotiate capabilities from the endpoints the server advertises, falling
 	// back to a backward-compatible default set when none are provided.
@@ -1607,7 +1644,16 @@ func (r *Catalog) RegisterTable(ctx context.Context, identifier table.Identifier
 	return r.tableFromResponse(ctx, identifier, ret.Metadata, ret.MetadataLoc, config, credsVended)
 }
 
+// LoadTable loads a table from the catalog. It implements [catalog.Catalog].
+// When snapshot-loading-mode is set to "refs" in the catalog properties, only
+// snapshots referenced by a named branch or tag are included in the response.
+// Callers that need to time-travel to an unreferenced snapshot should use
+// snapshot-loading-mode "all" or omit the property entirely.
 func (r *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*table.Table, error) {
+	return r.loadTableWithMode(ctx, identifier, r.snapshotMode)
+}
+
+func (r *Catalog) loadTableWithMode(ctx context.Context, identifier table.Identifier, mode SnapshotMode) (*table.Table, error) {
 	if err := r.endpoints.check(endpointLoadTable); err != nil {
 		return nil, err
 	}
@@ -1622,8 +1668,13 @@ func (r *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*
 		return nil, err
 	}
 
+	var opts []reqOption
+	if mode != "" {
+		opts = append(opts, withQueryParams(url.Values{"snapshots": {string(mode)}}))
+	}
+
 	ret, err := doGet[loadTableResponse](ctx, r.baseURI, path,
-		r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchTable})
+		r.cl, map[int]error{http.StatusNotFound: catalog.ErrNoSuchTable}, opts...)
 	if err != nil {
 		return nil, err
 	}
