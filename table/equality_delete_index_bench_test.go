@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/apache/iceberg-go"
+	"github.com/DataDog/iceberg-go"
 )
 
 var equalityDeleteBenchmarkSink int

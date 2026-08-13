@@ -28,7 +28,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/apache/iceberg-go/catalog"
+	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

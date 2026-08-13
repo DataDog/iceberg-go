@@ -33,9 +33,9 @@ import (
 	"testing"
 	"time"
 
-	iceberg "github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/metrics"
-	"github.com/apache/iceberg-go/table"
+	iceberg "github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/metrics"
+	"github.com/DataDog/iceberg-go/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

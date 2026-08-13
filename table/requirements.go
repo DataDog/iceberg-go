@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/apache/iceberg-go/internal"
+	"github.com/DataDog/iceberg-go/internal"
 	"github.com/google/uuid"
 )
 

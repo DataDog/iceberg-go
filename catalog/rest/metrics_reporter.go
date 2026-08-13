@@ -27,8 +27,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	iceberg "github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/metrics"
+	iceberg "github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/metrics"
 )
 
 const (

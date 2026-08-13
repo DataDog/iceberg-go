@@ -47,7 +47,7 @@ package otel
 import (
 	"context"
 
-	"github.com/apache/iceberg-go/metrics"
+	"github.com/DataDog/iceberg-go/metrics"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"

@@ -24,7 +24,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/apache/iceberg-go/metrics"
+	"github.com/DataDog/iceberg-go/metrics"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/sqlitedialect"

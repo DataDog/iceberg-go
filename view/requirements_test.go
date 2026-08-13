@@ -22,8 +22,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/apache/iceberg-go/table"
-	"github.com/apache/iceberg-go/view"
+	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/view"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
