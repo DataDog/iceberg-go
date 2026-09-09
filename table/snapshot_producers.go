@@ -431,6 +431,7 @@ func (m *manifestMergeManager) createManifest(specID int, bin []iceberg.Manifest
 	}
 
 	if wr == nil {
+		log.Print("Manifest merge yielded no entries; skipping empty manifest creation")
 		return nil, nil
 	}
 
