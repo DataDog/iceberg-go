@@ -14,7 +14,7 @@
 
 module gocloud.dev/docstore/mongodocstore
 
-go 1.24
+go 1.26.6
 
 require (
 	github.com/google/go-cmp v0.7.0

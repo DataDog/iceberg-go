@@ -14,7 +14,7 @@
 
 module gocloud.dev/pubsub/kafkapubsub
 
-go 1.24
+go 1.26.6
 
 require (
 	github.com/IBM/sarama v1.45.2
