@@ -18,9 +18,9 @@ package puffin
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"io"
 	"maps"
 	"math"
@@ -99,9 +99,7 @@ func (w *Writer) AddProperties(props map[string]string) error {
 	if w.failed != nil {
 		return fmt.Errorf("puffin: cannot set properties: writer previously failed: %w", w.failed)
 	}
-	for k, v := range props {
-		w.props[k] = v
-	}
+	maps.Copy(w.props, props)
 
 	return nil
 }

@@ -216,6 +216,105 @@ func TestBooleanExprVisitor(t *testing.T) {
 	}, result)
 }
 
+type evaluatorVisitor struct {
+	values  map[string]bool
+	visited []string
+}
+
+func (e *evaluatorVisitor) VisitTrue() bool {
+	e.visited = append(e.visited, "true")
+
+	return true
+}
+
+func (e *evaluatorVisitor) VisitFalse() bool {
+	e.visited = append(e.visited, "false")
+
+	return false
+}
+
+func (e *evaluatorVisitor) VisitNot(child bool) bool { return !child }
+
+func (e *evaluatorVisitor) VisitAnd(left, right bool) bool {
+	e.visited = append(e.visited, "and")
+
+	return left && right
+}
+
+func (e *evaluatorVisitor) VisitOr(left, right bool) bool {
+	e.visited = append(e.visited, "or")
+
+	return left || right
+}
+
+func (e *evaluatorVisitor) VisitUnbound(pred iceberg.UnboundPredicate) bool {
+	ref := pred.Term().(iceberg.Reference)
+	e.visited = append(e.visited, string(ref))
+
+	return e.values[string(ref)]
+}
+
+func (*evaluatorVisitor) VisitBound(iceberg.BoundPredicate) bool {
+	panic("unexpected bound predicate")
+}
+
+func TestVisitExprEvaluatorShortCircuits(t *testing.T) {
+	tests := []struct {
+		name    string
+		expr    iceberg.BooleanExpression
+		values  map[string]bool
+		result  bool
+		visited []string
+	}{
+		{
+			name: "and when left is false",
+			expr: iceberg.NewAnd(
+				iceberg.EqualTo(iceberg.Reference("left"), int32(1)),
+				iceberg.EqualTo(iceberg.Reference("right"), int32(1))),
+			values:  map[string]bool{"left": false, "right": true},
+			result:  false,
+			visited: []string{"left", "false"},
+		},
+		{
+			name: "or when left is true",
+			expr: iceberg.NewOr(
+				iceberg.EqualTo(iceberg.Reference("left"), int32(1)),
+				iceberg.EqualTo(iceberg.Reference("right"), int32(1))),
+			values:  map[string]bool{"left": true, "right": false},
+			result:  true,
+			visited: []string{"left", "true"},
+		},
+		{
+			name: "and when left is true",
+			expr: iceberg.NewAnd(
+				iceberg.EqualTo(iceberg.Reference("left"), int32(1)),
+				iceberg.EqualTo(iceberg.Reference("right"), int32(1))),
+			values:  map[string]bool{"left": true, "right": false},
+			result:  false,
+			visited: []string{"left", "right", "and"},
+		},
+		{
+			name: "or when left is false",
+			expr: iceberg.NewOr(
+				iceberg.EqualTo(iceberg.Reference("left"), int32(1)),
+				iceberg.EqualTo(iceberg.Reference("right"), int32(1))),
+			values:  map[string]bool{"left": false, "right": true},
+			result:  true,
+			visited: []string{"left", "right", "or"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			visitor := &evaluatorVisitor{values: tt.values}
+			result, err := iceberg.VisitExprEvaluator(tt.expr, visitor)
+			require.NoError(t, err)
+			assert.Equal(t, tt.result, result)
+			assert.Equal(t, tt.visited, visitor.visited)
+		})
+	}
+}
+
 func TestBindVisitorAlready(t *testing.T) {
 	bound, err := iceberg.EqualTo(iceberg.Reference("foo"), "hello").
 		Bind(tableSchemaSimple, false)
@@ -994,6 +1093,54 @@ func TestEvaluatorCmpTypes(t *testing.T) {
 			assert.Equal(t, tt.exp, res)
 		})
 	}
+}
+
+func TestEvaluatorTransformTerms(t *testing.T) {
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+	)
+	transform := iceberg.BucketTransform{NumBuckets: 100}
+	term := iceberg.NewUnboundTransform(transform, iceberg.Reference("id"))
+	bucketed := transform.Apply(iceberg.Optional[iceberg.Literal]{
+		Valid: true,
+		Val:   iceberg.Int32Literal(7),
+	})
+	bucket := bucketed.Val.(iceberg.TypedLiteral[int32]).Value()
+
+	tests := []struct {
+		name string
+		expr iceberg.BooleanExpression
+		want bool
+	}{
+		{name: "is null", expr: iceberg.IsNull(term), want: false},
+		{name: "not null", expr: iceberg.NotNull(term), want: true},
+		{name: "equal", expr: iceberg.EqualTo(term, bucket), want: true},
+		{name: "in", expr: iceberg.IsIn(term, bucket, bucket+1), want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eval, err := iceberg.ExpressionEvaluator(schema, tt.expr, true)
+			require.NoError(t, err)
+
+			got, err := eval(rowOf(int32(7)))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestEvaluatorDayTransform(t *testing.T) {
+	schema := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "ts", Type: iceberg.PrimitiveTypes.Timestamp},
+	)
+	term := iceberg.NewUnboundTransform(iceberg.DayTransform{}, iceberg.Reference("ts"))
+	eval, err := iceberg.ExpressionEvaluator(schema, iceberg.EqualTo(term, iceberg.Date(0)), true)
+	require.NoError(t, err)
+
+	matched, err := eval(rowOf(iceberg.Timestamp(0)))
+	require.NoError(t, err)
+	assert.True(t, matched)
 }
 
 func TestRewriteNot(t *testing.T) {

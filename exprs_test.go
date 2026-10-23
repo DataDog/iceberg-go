@@ -23,8 +23,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/DataDog/iceberg-go"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/parquet/variant"
+	"github.com/DataDog/iceberg-go"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -132,6 +133,30 @@ func TestUnaryExpr(t *testing.T) {
 
 			assert.True(t, n1.Equals(iceberg.AlwaysFalse{}))
 			assert.True(t, n2.Equals(iceberg.AlwaysTrue{}))
+		})
+
+		t.Run("transform terms do not use source nullability", func(t *testing.T) {
+			voidID := iceberg.NewUnboundTransform(iceberg.VoidTransform{}, iceberg.Reference("a"))
+
+			isNull, err := iceberg.IsNull(voidID).Bind(sc3, true)
+			require.NoError(t, err)
+			assert.True(t, isNull.Equals(iceberg.AlwaysTrue{}))
+
+			voidID = iceberg.NewUnboundTransform(iceberg.VoidTransform{}, iceberg.Reference("a"))
+			notNull, err := iceberg.NotNull(voidID).Bind(sc3, true)
+			require.NoError(t, err)
+			assert.True(t, notNull.Equals(iceberg.AlwaysFalse{}))
+		})
+
+		t.Run("nested transforms are rejected", func(t *testing.T) {
+			nested := iceberg.NewUnboundTransform(
+				iceberg.BucketTransform{NumBuckets: 16},
+				iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 4}, iceberg.Reference("a")),
+			)
+
+			_, err := nested.Bind(sc, true)
+			assert.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			assert.Contains(t, err.Error(), "direct reference")
 		})
 	})
 
@@ -244,7 +269,7 @@ func TestRefTypes(t *testing.T) {
 	}
 
 	t.Run("bind term", func(t *testing.T) {
-		for i := 0; i < sc.NumFields(); i++ {
+		for i := range sc.NumFields() {
 			fld := sc.Field(i)
 			t.Run(fld.Type.String(), func(t *testing.T) {
 				ref, err := iceberg.Reference(fld.Name).Bind(sc, true)
@@ -257,7 +282,7 @@ func TestRefTypes(t *testing.T) {
 	})
 
 	t.Run("bind unary", func(t *testing.T) {
-		for i := 0; i < sc.NumFields(); i++ {
+		for i := range sc.NumFields() {
 			fld := sc.Field(i)
 			t.Run(fld.Type.String(), func(t *testing.T) {
 				b, err := iceberg.IsNull(iceberg.Reference(fld.Name)).Bind(sc, true)
@@ -997,6 +1022,96 @@ func TestBindAboveBelowIntMax(t *testing.T) {
 			assert.Equal(t, tt.exp, b)
 		})
 	}
+
+	t.Run("set predicates", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			pred     iceberg.BooleanExpression
+			expected iceberg.BooleanExpression
+		}{
+			{"int in mixed range", iceberg.IsIn(ref, int64(34), above, below), iceberg.EqualTo(ref, int32(34))},
+			{"int not in mixed range", iceberg.NotIn(ref, int64(34), above, below), iceberg.NotEqualTo(ref, int32(34))},
+			{"int in mixed range set", iceberg.IsIn(ref, int64(34), int64(35), above, below), iceberg.IsIn(ref, int32(34), int32(35))},
+			{"int in outside range", iceberg.IsIn(ref, above, below), iceberg.AlwaysFalse{}},
+			{"int not in outside range", iceberg.NotIn(ref, above, below), iceberg.AlwaysTrue{}},
+			{"float in mixed range", iceberg.IsIn(ref2, float64(34), above2, below2), iceberg.EqualTo(ref2, float32(34))},
+			{"float not in mixed range", iceberg.NotIn(ref2, float64(34), above2, below2), iceberg.NotEqualTo(ref2, float32(34))},
+			{"float in outside range", iceberg.IsIn(ref2, above2, below2), iceberg.AlwaysFalse{}},
+			{"float not in outside range", iceberg.NotIn(ref2, above2, below2), iceberg.AlwaysTrue{}},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				bound, err := iceberg.BindExpr(sc, tt.pred, true)
+				require.NoError(t, err)
+				wantBound, err := iceberg.BindExpr(sc, tt.expected, true)
+				require.NoError(t, err)
+				assert.True(t, wantBound.Equals(bound), "expected %s, got %s", wantBound, bound)
+			})
+		}
+	})
+}
+
+func TestBindOutOfRangeDate(t *testing.T) {
+	sc := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "d", Type: iceberg.PrimitiveTypes.Date},
+	)
+
+	ref := iceberg.Reference("d")
+	above, below := int64(math.MaxInt32)+1, int64(math.MinInt32)-1
+
+	tests := []struct {
+		name     string
+		pred     iceberg.BooleanExpression
+		expected iceberg.BooleanExpression
+	}{
+		{"eq above max", iceberg.EqualTo(ref, above), iceberg.AlwaysFalse{}},
+		{"eq below min", iceberg.EqualTo(ref, below), iceberg.AlwaysFalse{}},
+		{"neq above max", iceberg.NotEqualTo(ref, above), iceberg.AlwaysTrue{}},
+		{"in mixed range", iceberg.IsIn(ref, int64(34), above, below), iceberg.EqualTo(ref, iceberg.Date(34))},
+		{"in outside range", iceberg.IsIn(ref, above, below), iceberg.AlwaysFalse{}},
+		{"not in outside range", iceberg.NotIn(ref, above, below), iceberg.AlwaysTrue{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bound, err := iceberg.BindExpr(sc, tt.pred, true)
+			require.NoError(t, err)
+			wantBound, err := iceberg.BindExpr(sc, tt.expected, true)
+			require.NoError(t, err)
+			assert.True(t, wantBound.Equals(bound), "expected %s, got %s", wantBound, bound)
+		})
+	}
+}
+
+func TestBindDecimalToIntRespectsScale(t *testing.T) {
+	sc := iceberg.NewSchema(1,
+		iceberg.NestedField{ID: 1, Name: "qty", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 2, Name: "total", Type: iceberg.PrimitiveTypes.Int64},
+	)
+
+	fractional := iceberg.Decimal{Val: decimal128.FromI64(1234), Scale: 2} // 12.34
+	whole := iceberg.Decimal{Val: decimal128.FromI64(1200), Scale: 2}      // 12.00
+
+	for _, name := range []string{"qty", "total"} {
+		t.Run(name, func(t *testing.T) {
+			ref := iceberg.Reference(name)
+
+			// Binding 12.34 must not produce qty == 1234, and rounding would
+			// turn qty < 12.34 into qty < 12, so both are rejected.
+			_, err := iceberg.BindExpr(sc, iceberg.EqualTo(ref, fractional), true)
+			require.ErrorIs(t, err, iceberg.ErrBadCast)
+
+			_, err = iceberg.BindExpr(sc, iceberg.LessThan(ref, fractional), true)
+			require.ErrorIs(t, err, iceberg.ErrBadCast)
+
+			bound, err := iceberg.BindExpr(sc, iceberg.EqualTo(ref, whole), true)
+			require.NoError(t, err)
+			want, err := iceberg.BindExpr(sc, iceberg.EqualTo(ref, int64(12)), true)
+			require.NoError(t, err)
+			assert.True(t, want.Equals(bound), "expected %s, got %s", want, bound)
+		})
+	}
 }
 
 func TestVariantBoundLiteralRejectionMessage(t *testing.T) {
@@ -1014,4 +1129,71 @@ func TestVariantBoundLiteralRejectionMessage(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
 	assert.ErrorContains(t, err, "ordered predicates are not supported on variant fields")
+}
+
+func TestVariantSetPredicate(t *testing.T) {
+	one := variant.Value(variantLiteralOf(t, int64(1)))
+	two := variant.Value(variantLiteralOf(t, int64(2)))
+	ref := iceberg.Reference("payload")
+
+	t.Run("in", func(t *testing.T) {
+		pred := iceberg.IsIn(ref, one, two, variant.Value(variantLiteralOf(t, int64(1))))
+		require.Implements(t, (*iceberg.UnboundPredicate)(nil), pred)
+		assert.Equal(t, iceberg.OpIn, pred.Op())
+		// The duplicate is a separate buffer, so this only holds if the set dedups by content.
+		assert.True(t, pred.Equals(iceberg.IsIn(ref, one, two)))
+	})
+
+	t.Run("not in", func(t *testing.T) {
+		pred := iceberg.NotIn(ref, one, two)
+		require.Implements(t, (*iceberg.UnboundPredicate)(nil), pred)
+		assert.Equal(t, iceberg.OpNotIn, pred.Op())
+		assert.True(t, pred.Negate().Equals(iceberg.IsIn(ref, one, two)))
+	})
+
+	t.Run("bind to variant column keeps distinct members", func(t *testing.T) {
+		sc := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}, Required: false},
+		)
+
+		// Set predicates on variant columns are not supported yet, so binding
+		// falls through to the set-predicate ErrType. That error is only
+		// reachable if the bind-time set still holds both members: had they
+		// collapsed to one, binding would take the single-literal path and
+		// fail with ErrInvalidArgument instead.
+		_, err := iceberg.BindExpr(sc, iceberg.IsIn(ref, one, two), true)
+		require.ErrorIs(t, err, iceberg.ErrType)
+	})
+
+	t.Run("bind to primitive column", func(t *testing.T) {
+		sc := iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.PrimitiveTypes.Int64, Required: false},
+		)
+
+		bound, err := iceberg.BindExpr(sc, iceberg.IsIn(ref, one, two), true)
+		require.NoError(t, err)
+		require.Implements(t, (*iceberg.BoundSetPredicate)(nil), bound)
+		lits := bound.(iceberg.BoundSetPredicate).Literals()
+		assert.Equal(t, 2, lits.Len())
+		assert.True(t, lits.Contains(iceberg.Int64Literal(1)))
+		assert.True(t, lits.Contains(iceberg.Int64Literal(2)))
+	})
+}
+
+func TestUnknownTransformCannotBindAsPredicate(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: false},
+	)
+	transform, err := iceberg.ParseTransform("future_transform")
+	require.NoError(t, err)
+
+	tests := []iceberg.UnboundPredicate{
+		iceberg.IsNull(iceberg.NewUnboundTransform(transform, iceberg.Reference("id"))),
+		iceberg.EqualTo(iceberg.NewUnboundTransform(transform, iceberg.Reference("id")), int32(1)),
+		iceberg.IsIn(iceberg.NewUnboundTransform(transform, iceberg.Reference("id")), int32(1), int32(2)).(iceberg.UnboundPredicate),
+	}
+	for _, pred := range tests {
+		_, err := pred.Bind(schema, true)
+		require.ErrorIs(t, err, iceberg.ErrNotImplemented, pred)
+	}
 }

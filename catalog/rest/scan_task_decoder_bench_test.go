@@ -1,0 +1,180 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package rest
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+)
+
+var (
+	decodeScanTasksBenchmarkSink   int
+	decodeJSONIntegerBenchmarkSink int64
+	decodeJSONFloatBenchmarkSink   float64
+)
+
+func BenchmarkDecodeScanTasksDeletionVectors(b *testing.B) {
+	metadata := newScanTaskDecoderMetadata()
+
+	for _, tc := range []struct {
+		name          string
+		taskCount     int
+		explicitOwner bool
+	}{
+		{name: "explicit-owner/tasks=100", taskCount: 100, explicitOwner: true},
+		{name: "derived-owner/tasks=100", taskCount: 100},
+		{name: "explicit-owner/tasks=1000", taskCount: 1000, explicitOwner: true},
+		{name: "derived-owner/tasks=1000", taskCount: 1000},
+		{name: "explicit-owner/tasks=10000", taskCount: 10000, explicitOwner: true},
+		{name: "derived-owner/tasks=10000", taskCount: 10000},
+	} {
+		wire := deletionVectorScanTasksWire(tc.taskCount, tc.explicitOwner)
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				tasks, err := DecodeScanTasks(wire, metadata, metadata.schema, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decodeScanTasksBenchmarkSink = len(tasks)
+			}
+		})
+	}
+}
+
+func deletionVectorScanTasksWire(taskCount int, explicitOwner bool) ScanTasks {
+	base := validScanTasksWire()
+	dataFile := *base.FileScanTasks[0].DataFile
+	deleteFile := base.DeleteFiles[0]
+	deleteFile.FileFormat = "puffin"
+	deleteFile.ContentOffset = new(int64(10))
+	deleteFile.ContentSizeInBytes = new(int64(20))
+
+	wire := ScanTasks{
+		FileScanTasks: make([]RESTFileScanTask, taskCount),
+		DeleteFiles:   make([]RESTDeleteFile, taskCount),
+	}
+	for i := range taskCount {
+		data := dataFile
+		data.FilePath = fmt.Sprintf("s3://bucket/table/data-%d.parquet", i)
+		delete := deleteFile
+		delete.FilePath = fmt.Sprintf("s3://bucket/table/delete-%d.puffin", i)
+		if explicitOwner {
+			delete.ReferencedDataFile = new(data.FilePath)
+		}
+
+		wire.FileScanTasks[i] = RESTFileScanTask{
+			DataFile:             &data,
+			DeleteFileReferences: []int{i},
+		}
+		wire.DeleteFiles[i] = delete
+	}
+
+	return wire
+}
+
+func BenchmarkDecodeScanTasks(b *testing.B) {
+	metadata := newScanTaskDecoderMetadata()
+	base := validScanTasksWire().FileScanTasks[0].DataFile
+
+	for _, taskCount := range []int{1, 64, 1024} {
+		b.Run(fmt.Sprintf("%d_tasks", taskCount), func(b *testing.B) {
+			wire := ScanTasks{FileScanTasks: make([]RESTFileScanTask, taskCount)}
+			for i := range wire.FileScanTasks {
+				dataFile := *base
+				wire.FileScanTasks[i] = RESTFileScanTask{
+					DataFile: &dataFile,
+				}
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := DecodeScanTasks(wire, metadata, metadata.schema, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeJSONInteger(b *testing.B) {
+	raw := json.RawMessage("12345")
+	for _, bitSize := range []int{32, 64} {
+		b.Run(fmt.Sprintf("int%d", bitSize), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := decodeJSONInteger(raw, bitSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decodeJSONIntegerBenchmarkSink = value
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeJSONFloat(b *testing.B) {
+	raw := json.RawMessage("12345.25")
+	for _, bitSize := range []int{32, 64} {
+		b.Run(fmt.Sprintf("float%d", bitSize), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := decodeJSONFloat(raw, bitSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				decodeJSONFloatBenchmarkSink = value
+			}
+		})
+	}
+}
+
+func BenchmarkDecodeJSONNumberForms(b *testing.B) {
+	for _, tc := range []struct {
+		name, raw string
+		floating  bool
+	}{
+		{name: "int64_exact", raw: "9007199254740993"},
+		{name: "quoted_int64", raw: `"9007199254740993"`},
+		{name: "exponent", raw: "-1.25e2", floating: true},
+		{name: "quoted_exponent", raw: `"-1.25e2"`, floating: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			raw := json.RawMessage(tc.raw)
+			b.ReportAllocs()
+			for b.Loop() {
+				if tc.floating {
+					value, err := decodeJSONFloat(raw, 64)
+					if err != nil {
+						b.Fatal(err)
+					}
+					decodeJSONFloatBenchmarkSink = value
+				} else {
+					value, err := decodeJSONInteger(raw, 64)
+					if err != nil {
+						b.Fatal(err)
+					}
+					decodeJSONIntegerBenchmarkSink = value
+				}
+			}
+		})
+	}
+}

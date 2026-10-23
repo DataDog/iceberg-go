@@ -18,12 +18,11 @@
 package udf
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/goccy/go-json"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -550,12 +549,12 @@ func TestMetadataValidation(t *testing.T) {
 		{
 			"malformed parameter",
 			func(t *testing.T, m map[string]any) { definition(t, m, 0)["parameters"] = []any{42} },
-			nil, "invalid character",
+			nil, "cannot unmarshal number",
 		},
 		{
 			"malformed representation",
 			func(t *testing.T, m map[string]any) { version(t, m, 0, 0)["representations"] = []any{42} },
-			nil, "invalid character",
+			nil, "cannot unmarshal number",
 		},
 		{
 			"sql representation with non-string dialect",
@@ -564,12 +563,12 @@ func TestMetadataValidation(t *testing.T) {
 					map[string]any{"type": "sql", "dialect": 5, "sql": "x + 1"},
 				}
 			},
-			nil, "invalid character",
+			nil, "cannot unmarshal number",
 		},
 		{
 			"malformed version",
 			func(t *testing.T, m map[string]any) { definition(t, m, 0)["versions"] = []any{42} },
-			nil, "invalid character",
+			nil, "cannot unmarshal number",
 		},
 		{
 			"parameter with invalid type",

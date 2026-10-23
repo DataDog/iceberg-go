@@ -22,6 +22,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/parquet/variant"
 	"github.com/DataDog/iceberg-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,6 +32,33 @@ import (
 const (
 	IntMinValue, IntMaxValue int32 = 30, 79
 )
+
+type noPartitionAccessManifestFile struct {
+	iceberg.ManifestFile
+}
+
+func (noPartitionAccessManifestFile) Partitions() []iceberg.FieldSummary {
+	panic("partition summaries should not be read")
+}
+
+func TestManifestEvaluatorAlwaysTrue(t *testing.T) {
+	schema := iceberg.NewSchema(1, iceberg.NestedField{
+		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true,
+	})
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{1},
+		FieldID:   1000,
+		Name:      "id_part",
+		Transform: iceberg.IdentityTransform{},
+	})
+
+	eval, err := newManifestEvaluator(spec, schema, iceberg.AlwaysTrue{}, true)
+	require.NoError(t, err)
+
+	matches, err := eval(noPartitionAccessManifestFile{})
+	require.NoError(t, err)
+	assert.True(t, matches)
+}
 
 func TestManifestEvaluator(t *testing.T) {
 	var (
@@ -1631,6 +1659,38 @@ func (suite *InclusiveMetricsTestSuite) TestZeroRecordFileStats() {
 	}
 }
 
+func (suite *InclusiveMetricsTestSuite) TestAlwaysTrue() {
+	emptyFile := &mockDataFile{
+		path:   "empty.parquet",
+		format: iceberg.ParquetFile,
+		count:  0,
+	}
+
+	tests := []struct {
+		name              string
+		file              iceberg.DataFile
+		includeEmptyFiles bool
+		want              bool
+	}{
+		{name: "nonempty file", file: suite.dataFiles[0], want: true},
+		{name: "empty file", file: emptyFile, want: false},
+		{name: "empty file when included", file: emptyFile, includeEmptyFiles: true, want: true},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.name, func() {
+			eval, err := newInclusiveMetricsEvaluator(
+				suite.schemaDataFile, iceberg.AlwaysTrue{}, true, tt.includeEmptyFiles,
+			)
+			suite.Require().NoError(err)
+
+			matches, err := eval(tt.file)
+			suite.Require().NoError(err)
+			suite.Equal(tt.want, matches)
+		})
+	}
+}
+
 func (suite *InclusiveMetricsTestSuite) TestNot() {
 	tests := []struct {
 		expr     iceberg.BooleanExpression
@@ -1929,6 +1989,7 @@ func (suite *InclusiveMetricsTestSuite) TestInMetrics() {
 		{iceberg.IsIn(ref, IntMinValue-1, IntMinValue), true, "should read: id equal to lower bound"},
 		{iceberg.IsIn(ref, IntMaxValue-4, IntMaxValue-3), true, "should read: id between upper and lower bounds"},
 		{iceberg.IsIn(ref, IntMaxValue, IntMaxValue+1), true, "should read: id equal to upper bound"},
+		{iceberg.IsIn(ref, int64(IntMaxValue), int64(math.MaxInt32)+1), true, "should read: ignore value outside int32 range"},
 		{iceberg.IsIn(ref, IntMaxValue+1, IntMaxValue+2), false, "should skip: id above upper bound"},
 		{iceberg.IsIn(ref, IntMaxValue+6, IntMaxValue+7), false, "should skip: id above upper bound"},
 		{iceberg.IsIn(iceberg.Reference("all_nulls"), "abc", "def"), false, "should skip: in on all nulls column"},
@@ -3021,6 +3082,7 @@ func (suite *StrictMetricsTestSuite) TestNotInMetrics() {
 		{iceberg.NotIn(ref, IntMinValue-1, IntMinValue), false, "should skip: some values may be == 30"},
 		{iceberg.NotIn(ref, IntMaxValue-4, IntMaxValue-3), false, "should skip: some value may be == 75 or == 76"},
 		{iceberg.NotIn(ref, IntMaxValue, IntMaxValue+1), false, "should skip: some value may be == 79"},
+		{iceberg.NotIn(ref, int64(IntMaxValue), int64(IntMaxValue-1), int64(math.MaxInt32)+1), false, "should skip: in-range values remain after ignoring value outside int32 range"},
 		{iceberg.NotIn(ref, IntMaxValue+1, IntMaxValue+2), true, "should read: no values == 80 or == 81"},
 		{iceberg.NotIn(iceberg.Reference("always_5"), int32(5), int32(6)), false, "should skip: all values == 5"},
 		{iceberg.NotIn(iceberg.Reference("all_nulls"), "abc", "def"), true, "should read: notIn on all nulls column"},
@@ -3043,6 +3105,59 @@ func TestEvaluators(t *testing.T) {
 	suite.Run(t, &ProjectionTestSuite{})
 	suite.Run(t, &InclusiveMetricsTestSuite{})
 	suite.Run(t, &StrictMetricsTestSuite{})
+}
+
+func TestMetricsEvaluatorsKeepTransformedTerms(t *testing.T) {
+	categoryMin, err := iceberg.StringLiteral("books").MarshalBinary()
+	require.NoError(t, err)
+	categoryMax := append([]byte(nil), categoryMin...)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	file := &mockDataFile{
+		count:       1,
+		valueCounts: map[int]int64{1: 1},
+		nullCounts:  map[int]int64{1: 0},
+		lowerBounds: map[int][]byte{1: categoryMin},
+		upperBounds: map[int][]byte{1: categoryMax},
+	}
+	term := iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 3}, iceberg.Reference("category"))
+
+	inclusive, err := newInclusiveMetricsEvaluator(schema, iceberg.EqualTo(term, "boo"), true, true)
+	require.NoError(t, err)
+	keep, err := inclusive(file)
+	require.NoError(t, err)
+	assert.True(t, keep)
+
+	strict, err := newStrictMetricsEvaluator(schema, iceberg.NotEqualTo(term, "boo"), true, true)
+	require.NoError(t, err)
+	mustMatch, err := strict(file)
+	require.NoError(t, err)
+	assert.False(t, mustMatch)
+}
+
+func TestManifestEvaluatorKeepsTransformedTerms(t *testing.T) {
+	lower, err := iceberg.StringLiteral("books").MarshalBinary()
+	require.NoError(t, err)
+	upper := append([]byte(nil), lower...)
+
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "category", Type: iceberg.PrimitiveTypes.String, Required: true},
+	)
+	term := iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 3}, iceberg.Reference("category"))
+	bound, err := iceberg.BindExpr(schema, iceberg.EqualTo(term, "boo"), true)
+	require.NoError(t, err)
+
+	visitor := &manifestEvalVisitor{
+		partitionFields: []iceberg.FieldSummary{{
+			LowerBound: &lower,
+			UpperBound: &upper,
+		}},
+	}
+	keep, err := iceberg.VisitExprEvaluator(bound, visitor)
+	require.NoError(t, err)
+	assert.True(t, keep)
 }
 
 func TestGetCmpLiteralRejectsGeo(t *testing.T) {
@@ -3111,9 +3226,7 @@ func TestBloomPredicateCollector(t *testing.T) {
 	)
 
 	bind := func(expr iceberg.BooleanExpression) iceberg.BooleanExpression {
-		rewritten, err := iceberg.RewriteNotExpr(expr)
-		require.NoError(t, err)
-		bound, err := iceberg.BindExpr(sc, rewritten, true)
+		bound, err := iceberg.BindExpr(sc, expr, true)
 		require.NoError(t, err)
 
 		return bound
@@ -3157,6 +3270,34 @@ func TestBloomPredicateCollector(t *testing.T) {
 		assert.Empty(t, preds)
 	})
 
+	t.Run("NOT(NotEqual) is normalized to Equal", func(t *testing.T) {
+		expr := bind(iceberg.NewNot(
+			iceberg.NotEqualTo(iceberg.Reference("id"), int64(42))))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		require.Len(t, preds, 1)
+		assert.Equal(t, 1, preds[0].FieldID)
+		assert.Len(t, preds[0].PhysBytes, 1)
+	})
+
+	t.Run("NOT(NotIn) is normalized to In", func(t *testing.T) {
+		expr := bind(iceberg.NewNot(
+			iceberg.NotIn(iceberg.Reference("id"), int64(1), int64(2))))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		require.Len(t, preds, 1)
+		assert.Equal(t, 1, preds[0].FieldID)
+		assert.Len(t, preds[0].PhysBytes, 2)
+	})
+
+	t.Run("NOT(Equal) remains unsupported", func(t *testing.T) {
+		expr := bind(iceberg.NewNot(
+			iceberg.EqualTo(iceberg.Reference("id"), int64(42))))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+
 	t.Run("AlwaysTrue returns nil", func(t *testing.T) {
 		preds, err := newBloomFilterPredicates(iceberg.AlwaysTrue{})
 		require.NoError(t, err)
@@ -3169,4 +3310,155 @@ func TestBloomPredicateCollector(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, preds)
 	})
+
+	t.Run("transform predicate returns nil", func(t *testing.T) {
+		term := iceberg.NewUnboundTransform(iceberg.TruncateTransform{Width: 3}, iceberg.Reference("name"))
+		expr := bind(iceberg.EqualTo(term, "ali"))
+		preds, err := newBloomFilterPredicates(expr)
+		require.NoError(t, err)
+		assert.Empty(t, preds)
+	})
+}
+
+// TestVariantExtractPruningGuards confirms extract terms are never pruned by null/nan-count guards.
+func TestVariantExtractPruningGuards(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	extI := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+	extF := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Float64)
+	extS := iceberg.Extract("payload", "$.b", iceberg.PrimitiveTypes.String)
+
+	for _, tt := range []struct {
+		name string
+		expr iceberg.BooleanExpression
+		file *mockDataFile
+	}{
+		{"is_null", iceberg.IsNull(extI), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{2: 0}}},
+		{"is_nan", iceberg.IsNaN(extF), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nanCounts: map[int]int64{2: 0}}},
+		{"not_nan", iceberg.NotNaN(extF), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nanCounts: map[int]int64{2: 10}}},
+		{"not_starts_with", iceberg.NotStartsWith(extS, "r"), &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{99: 0}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			eval, err := newInclusiveMetricsEvaluator(sc, tt.expr, true, true)
+			require.NoError(t, err)
+			res, err := eval(tt.file)
+			require.NoError(t, err)
+			assert.Equal(t, rowsMightMatch, res, "variant extract guard must never prune")
+		})
+	}
+}
+
+// TestStrictMetricsExtractNeverMatches confirms the strict evaluator treats extract terms
+// conservatively (rowsMightNotMatch) instead of decoding the variant bytes and erroring.
+func TestStrictMetricsExtractNeverMatches(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	var b variant.Builder
+	start := b.Offset()
+	entries := []variant.FieldEntry{b.NextField(start, "$['a']")}
+	require.NoError(t, b.AppendInt(5))
+	require.NoError(t, b.FinishObject(start, entries))
+	v, err := b.Build()
+	require.NoError(t, err)
+	bound := append(append([]byte{}, v.Metadata().Bytes()...), v.Bytes()...)
+
+	// A variant column carrying bounds: boundFor must decode it without erroring.
+	file := &mockDataFile{
+		count:       10,
+		valueCounts: map[int]int64{2: 10},
+		nullCounts:  map[int]int64{2: 0},
+		lowerBounds: map[int][]byte{2: bound},
+		upperBounds: map[int][]byte{2: bound},
+	}
+
+	expr := iceberg.EqualTo(iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64), int64(5))
+	eval, err := newStrictMetricsEvaluator(sc, expr, true, true)
+	require.NoError(t, err)
+
+	res, err := eval(file)
+	require.NoError(t, err)
+	assert.Equal(t, rowsMightNotMatch, res)
+}
+
+// TestInclusiveMetricsExtractPrunes proves the actual pushdown skip: a file whose shredded
+// $.a bounds exclude the queried value is pruned (rowsCannotMatch), not merely residual-filtered.
+func TestInclusiveMetricsExtractPrunes(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	// A shredded variant bound is a variant object keyed by the normalized sub-path.
+	mkBound := func(val int64) []byte {
+		var b variant.Builder
+		start := b.Offset()
+		entries := []variant.FieldEntry{b.NextField(start, "$['a']")}
+		require.NoError(t, b.AppendInt(val))
+		require.NoError(t, b.FinishObject(start, entries))
+		v, err := b.Build()
+		require.NoError(t, err)
+
+		return append(append([]byte{}, v.Metadata().Bytes()...), v.Bytes()...)
+	}
+	// File carries $.a in [10, 100].
+	file := &mockDataFile{
+		count:       10,
+		valueCounts: map[int]int64{2: 10},
+		nullCounts:  map[int]int64{2: 0},
+		lowerBounds: map[int][]byte{2: mkBound(10)},
+		upperBounds: map[int][]byte{2: mkBound(100)},
+	}
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+
+	for _, tt := range []struct {
+		name string
+		expr iceberg.BooleanExpression
+		want bool
+	}{
+		{"eq below lower prunes", iceberg.EqualTo(ext, int64(5)), rowsCannotMatch},
+		{"eq above upper prunes", iceberg.EqualTo(ext, int64(500)), rowsCannotMatch},
+		{"eq within bounds keeps", iceberg.EqualTo(ext, int64(50)), rowsMightMatch},
+		{"less below lower prunes", iceberg.LessThan(ext, int64(5)), rowsCannotMatch},
+		{"greater above upper prunes", iceberg.GreaterThan(ext, int64(500)), rowsCannotMatch},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			eval, err := newInclusiveMetricsEvaluator(sc, tt.expr, true, true)
+			require.NoError(t, err)
+			res, err := eval(file)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, res)
+		})
+	}
+}
+
+// TestInclusiveMetricsExtractNotNull pins the VisitNotNull asymmetry: NotNull(extract) may
+// prune only when the whole variant column is null, and must keep an otherwise-populated one.
+func TestInclusiveMetricsExtractNotNull(t *testing.T) {
+	sc := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	ext := iceberg.NotNull(iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64))
+
+	// All-null variant column: no row has any sub-path, so NotNull cannot match -> prune.
+	allNull := &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{2: 10}}
+	eval, err := newInclusiveMetricsEvaluator(sc, ext, true, true)
+	require.NoError(t, err)
+	res, err := eval(allNull)
+	require.NoError(t, err)
+	assert.Equal(t, rowsCannotMatch, res, "all-null variant column prunes NotNull(extract)")
+
+	// Populated column: the sub-path may be present, so the file must be kept even though
+	// the column has zero nulls (the column being non-null says nothing about $.a).
+	populated := &mockDataFile{count: 10, valueCounts: map[int]int64{2: 10}, nullCounts: map[int]int64{2: 0}}
+	eval, err = newInclusiveMetricsEvaluator(sc, ext, true, true)
+	require.NoError(t, err)
+	res, err = eval(populated)
+	require.NoError(t, err)
+	assert.Equal(t, rowsMightMatch, res, "populated variant column must not prune NotNull(extract)")
 }

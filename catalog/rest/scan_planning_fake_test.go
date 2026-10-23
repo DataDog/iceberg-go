@@ -89,7 +89,7 @@ func TestPlanFakeCapabilityDiscovery(t *testing.T) {
 				planfake.FetchScanTasksEndpoint,
 			},
 			wantPlan:         true,
-			wantFullPlanning: false,
+			wantFullPlanning: true,
 		},
 		{
 			name: "missing task fetch",
@@ -121,6 +121,7 @@ func TestPlanFakeCapabilityDiscovery(t *testing.T) {
 
 			assert.Equal(t, test.wantPlan, catalog.SupportsPlanTableScan())
 			assert.Equal(t, test.wantFullPlanning, catalog.SupportsFullRemoteScanPlanning())
+			assert.Equal(t, test.wantPlan, catalog.SupportsRemoteScanPlanning())
 
 			requests := srv.Requests()
 			require.Len(t, requests, 1)
@@ -492,11 +493,12 @@ func TestPlanFakeWaitCancellationBoundsStalledCleanup(t *testing.T) {
 	waitContext, cancelWait := context.WithCancel(t.Context())
 	defer cancelWait()
 	waitDone := make(chan error, 1)
+	// The grace bounds the whole DELETE, including reaching the fake, not just the stall.
 	go func() {
 		_, waitErr := catalog.WaitForPlan(waitContext, standardPlanFakeIdentifier(), *initial.PlanID, rest.WaitForPlanOptions{
 			MinDelay:          time.Hour,
 			MaxDelay:          time.Hour,
-			CancelGracePeriod: 100 * time.Millisecond,
+			CancelGracePeriod: time.Second,
 		})
 		waitDone <- waitErr
 	}()
@@ -709,62 +711,6 @@ func waitForPlanFakeResult(t *testing.T, ctx context.Context, result <-chan erro
 
 		return nil
 	}
-}
-
-type rawPlanningFixture struct {
-	Status             string                        `json:"status"`
-	PlanID             string                        `json:"plan-id"`
-	PlanTasks          []string                      `json:"plan-tasks"`
-	FileScanTasks      []rawFileScanTaskFixture      `json:"file-scan-tasks"`
-	DeleteFiles        []rawDeleteFileFixture        `json:"delete-files"`
-	StorageCredentials []rawStorageCredentialFixture `json:"storage-credentials"`
-}
-
-type rawFileScanTaskFixture struct {
-	DataFile             rawDataFileFixture `json:"data-file"`
-	DeleteFileReferences []int              `json:"delete-file-references"`
-	ResidualFilter       json.RawMessage    `json:"residual-filter"`
-}
-
-type rawDataFileFixture struct {
-	SpecID      int                `json:"spec-id"`
-	Partition   []json.RawMessage  `json:"partition"`
-	Content     string             `json:"content"`
-	FilePath    string             `json:"file-path"`
-	LowerBounds rawValueMapFixture `json:"lower-bounds"`
-	UpperBounds rawValueMapFixture `json:"upper-bounds"`
-	ColumnSizes rawCountMapFixture `json:"column-sizes"`
-}
-
-type rawDeleteFileFixture struct {
-	SpecID    int               `json:"spec-id"`
-	Partition []json.RawMessage `json:"partition"`
-	Content   string            `json:"content"`
-	FilePath  string            `json:"file-path"`
-}
-
-type rawValueMapFixture struct {
-	Keys   []int    `json:"keys"`
-	Values []string `json:"values"`
-}
-
-type rawCountMapFixture struct {
-	Keys   []int   `json:"keys"`
-	Values []int64 `json:"values"`
-}
-
-type rawStorageCredentialFixture struct {
-	Prefix string            `json:"prefix"`
-	Config map[string]string `json:"config"`
-}
-
-func parseRawPlanningFixture(t *testing.T, body string) rawPlanningFixture {
-	t.Helper()
-
-	var fixture rawPlanningFixture
-	require.NoError(t, json.Unmarshal([]byte(body), &fixture))
-
-	return fixture
 }
 
 func fetchRawPlanTaskFixture(t *testing.T, serverURL, planTask string) rawPlanningFixture {

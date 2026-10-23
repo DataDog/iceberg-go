@@ -531,11 +531,9 @@ func TestMetricsDispatcherCloseIsIdempotent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			d.close()
-		}()
+		})
 	}
 
 	done := make(chan struct{})
@@ -575,8 +573,8 @@ func TestRESTMetricsReporterBuildsPathThroughProduction(t *testing.T) {
 
 	select {
 	case req := <-received:
-		// The namespace levels are percent-encoded and joined by the encoded
-		// separator (%1F); the table segment is escaped by the URL builder.
+		// Namespace levels and the table name use path encoding; namespace
+		// levels are joined by the encoded separator (%1F).
 		assert.Equal(t, "/v1/my-prefix/namespaces/a%20b%1Fd%20e/tables/t%20x/metrics", req.escapedPath)
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for the async metrics POST")

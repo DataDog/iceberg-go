@@ -20,8 +20,9 @@ package table
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"github.com/goccy/go-json"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/DataDog/iceberg-go"
@@ -38,6 +39,7 @@ func testFSF(io iceio.IO) FSysF {
 // trackingCallsIO wraps trackingIO to count Open and Remove calls per path.
 type trackingCallsIO struct {
 	*trackingIO
+	mu          sync.Mutex
 	openCount   map[string]int
 	removeCount map[string]int
 }
@@ -51,13 +53,17 @@ func newTrackingCallsIO() *trackingCallsIO {
 }
 
 func (c *trackingCallsIO) Open(name string) (iceio.File, error) {
+	c.mu.Lock()
 	c.openCount[name]++
+	c.mu.Unlock()
 
 	return c.trackingIO.Open(name)
 }
 
 func (c *trackingCallsIO) Remove(name string) error {
+	c.mu.Lock()
 	c.removeCount[name]++
+	c.mu.Unlock()
 
 	return c.trackingIO.Remove(name)
 }
@@ -66,7 +72,7 @@ func (c *trackingCallsIO) Remove(name string) error {
 // entry pointing at dataPath into tio.files at manifestPath, and returns a
 // ManifestFile descriptor with seqNum pre-assigned so the same descriptor
 // can be referenced from multiple manifest lists.
-func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, manifestPath, dataPath string) iceberg.ManifestFile {
+func writeManifest(t testing.TB, tio *trackingIO, snapshotID, seqNum int64, manifestPath, dataPath string) iceberg.ManifestFile {
 	t.Helper()
 
 	dataSchema := iceberg.NewSchema(0,
@@ -98,7 +104,7 @@ func writeManifest(t *testing.T, tio *trackingIO, snapshotID, seqNum int64, mani
 
 // writeManifestList writes a v2 manifest list referencing the
 // given manifests into tio.files at listPath.
-func writeManifestList(t *testing.T, tio *trackingIO, snapshotID int64, listPath string, manifests []iceberg.ManifestFile) {
+func writeManifestList(t testing.TB, tio *trackingIO, snapshotID int64, listPath string, manifests []iceberg.ManifestFile) {
 	t.Helper()
 
 	var buf bytes.Buffer
@@ -143,6 +149,51 @@ func TestRemoveSnapshotsPostCommitSkipped(t *testing.T) {
 	// without accessing the table arguments (which are nil here)
 	err := update.PostCommit(context.Background(), nil, nil)
 	assert.NoError(t, err)
+}
+
+func TestRemoveSnapshotsPostCommitSkippedWhenGCDisabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		gcValue string
+	}{
+		{name: "false", gcValue: "false"},
+		{name: "one", gcValue: "1"},
+		{name: "garbage", gcValue: "garbage"},
+		{name: "false with trailing space", gcValue: "false "},
+		{name: "true with trailing space", gcValue: "true "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preMeta := buildMetaJSON(metaJSONOpts{
+				snapshots:  `{"snapshot-id":1,"timestamp-ms":1000}`,
+				statistics: `{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}`,
+			})
+			postMeta := buildMetaJSON(metaJSONOpts{})
+
+			pre, err := ParseMetadataString(preMeta)
+			require.NoError(t, err)
+			post, err := ParseMetadataString(postMeta)
+			require.NoError(t, err)
+
+			postBuilder, err := MetadataBuilderFromBase(post, "")
+			require.NoError(t, err)
+			require.NoError(t, postBuilder.SetProperties(iceberg.Properties{GCEnabledKey: tt.gcValue}))
+			post, err = postBuilder.Build()
+			require.NoError(t, err)
+
+			tio := newTrackingCallsIO()
+			tio.files["s3://bucket/stats/snap1.puffin"] = []byte("puffin")
+			fsF := testFSF(tio)
+			preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
+			postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
+
+			update := NewRemoveSnapshotsUpdate([]int64{1}, true)
+			require.NoError(t, update.PostCommit(context.Background(), preTable, postTable))
+			require.Contains(t, tio.files, "s3://bucket/stats/snap1.puffin")
+			require.Zero(t, tio.removeCount["s3://bucket/stats/snap1.puffin"])
+		})
+	}
 }
 
 func TestRemoveSnapshotsPostCommitDeletesStatisticsFiles(t *testing.T) {
@@ -348,7 +399,7 @@ func TestUnmarshalUpdates(t *testing.T) {
 		22,
 		[]SortField{
 			{SourceIDs: []int{19}, Transform: iceberg.IdentityTransform{}, NullOrder: NullsFirst, Direction: SortASC},
-			{SourceIDs: []int{25}, Transform: iceberg.BucketTransform{NumBuckets: 4}, NullOrder: NullsFirst, Direction: SortDESC},
+			{SourceIDs: []int{25}, Transform: iceberg.BucketTransform{NumBuckets: 4}, NullOrder: NullsLast, Direction: SortDESC},
 			{SourceIDs: []int{22}, Transform: iceberg.VoidTransform{}, NullOrder: NullsFirst, Direction: SortASC},
 		},
 	)
@@ -513,26 +564,26 @@ func TestUnmarshalUpdates(t *testing.T) {
 				}
 			} else {
 				assert.NoError(t, err)
-				assert.Equal(t, len(tc.expected), len(actual))
-				for idx, u := range actual {
-					switch u.Action() {
-					case "add-schema":
-						expectedAddSchema := u.(*addSchemaUpdate)
+				require.Len(t, actual, len(tc.expected))
+				for idx, expected := range tc.expected {
+					switch expected.Action() {
+					case UpdateAddSchema:
+						expectedAddSchema := expected.(*addSchemaUpdate)
 						actualAddSchema := actual[idx].(*addSchemaUpdate)
 						assert.True(t, expectedAddSchema.Schema.Equals(actualAddSchema.Schema))
-						assert.Equal(t, actualAddSchema.initial, expectedAddSchema.initial)
-					case "add-partition-spec":
-						expectedAddPartitionSpec := u.(*addPartitionSpecUpdate)
+						assert.Equal(t, expectedAddSchema.initial, actualAddSchema.initial)
+					case UpdateAddSpec:
+						expectedAddPartitionSpec := expected.(*addPartitionSpecUpdate)
 						actualAddPartitionSpec := actual[idx].(*addPartitionSpecUpdate)
-						assert.True(t, expectedAddPartitionSpec.Spec.Equals(*actualAddPartitionSpec.Spec))
-						assert.Equal(t, actualAddPartitionSpec.initial, expectedAddPartitionSpec.initial)
-					case "add-sort-order":
-						expectedAddSortOrder := u.(*addSortOrderUpdate)
+						assert.True(t, expectedAddPartitionSpec.Spec.Equals(actualAddPartitionSpec.Spec.PartitionSpec))
+						assert.Equal(t, expectedAddPartitionSpec.initial, actualAddPartitionSpec.initial)
+					case UpdateAddSortOrder:
+						expectedAddSortOrder := expected.(*addSortOrderUpdate)
 						actualAddSortOrder := actual[idx].(*addSortOrderUpdate)
-						assert.True(t, expectedAddSortOrder.SortOrder.Equals(*actualAddSortOrder.SortOrder))
-						assert.Equal(t, actualAddSortOrder.initial, expectedAddSortOrder.initial)
+						assert.True(t, expectedAddSortOrder.SortOrder.Equals(actualAddSortOrder.SortOrder.SortOrder))
+						assert.Equal(t, expectedAddSortOrder.initial, actualAddSortOrder.initial)
 					default:
-						assert.Equal(t, u, actual[idx])
+						assert.Equal(t, expected, actual[idx])
 					}
 				}
 			}
@@ -679,7 +730,7 @@ func TestUnmarshalUpdatesRejectsMissingRequiredFields(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.action, func(t *testing.T) {
 			var updates Updates
-			data := []byte(fmt.Sprintf(`[{"action":%q}]`, tt.action))
+			data := fmt.Appendf(nil, `[{"action":%q}]`, tt.action)
 			if tt.action == UpdateSetSnapshotRef {
 				data = snapshotRefPayload(tt.field, false)
 			}
@@ -746,7 +797,7 @@ func TestUnmarshalUpdatesRejectsNullRequiredPayload(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.action+"/"+tt.field, func(t *testing.T) {
 			var updates Updates
-			data := []byte(fmt.Sprintf(`[{"action":%q,%q:null}]`, tt.action, tt.field))
+			data := fmt.Appendf(nil, `[{"action":%q,%q:null}]`, tt.action, tt.field)
 			if tt.action == UpdateSetSnapshotRef {
 				data = snapshotRefPayload(tt.field, true)
 			}
@@ -764,6 +815,88 @@ func TestUnmarshalUpdatesRejectsMissingOrNullAction(t *testing.T) {
 			err := json.Unmarshal([]byte("["+data+"]"), &updates)
 			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
 			require.ErrorContains(t, err, "action")
+		})
+	}
+}
+
+func TestUnmarshalUpdatesUsesJSONActionFieldSemantics(t *testing.T) {
+	tests := []struct {
+		name           string
+		data           string
+		expectedAction string
+		assert         func(*testing.T, Update)
+	}{
+		{
+			name:           "accepts mixed-case action key",
+			data:           `[{"Action":"set-location","location":"s3://bucket/table"}]`,
+			expectedAction: UpdateSetLocation,
+			assert: func(t *testing.T, update Update) {
+				t.Helper()
+				location, ok := update.(*setLocationUpdate)
+				require.True(t, ok)
+				assert.Equal(t, "s3://bucket/table", location.Location)
+			},
+		},
+		{
+			name:           "uses the last duplicate case-variant action key",
+			data:           `[{"action":"set-location","ACTION":"assign-uuid","location":"s3://bucket/table","uuid":"550e8400-e29b-41d4-a716-446655440000"}]`,
+			expectedAction: UpdateAssignUUID,
+			assert: func(t *testing.T, update Update) {
+				t.Helper()
+				assignUUID, ok := update.(*assignUUIDUpdate)
+				require.True(t, ok)
+				assert.Equal(t, uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"), assignUUID.UUID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var updates Updates
+			require.NoError(t, json.Unmarshal([]byte(tt.data), &updates))
+			require.Len(t, updates, 1)
+			assert.Equal(t, tt.expectedAction, updates[0].Action())
+			tt.assert(t, updates[0])
+		})
+	}
+
+	t.Run("rejects unknown action from duplicate case-variant key", func(t *testing.T) {
+		var updates Updates
+		err := json.Unmarshal([]byte(`[{"action":"set-location","ACTION":"unknown","location":"s3://bucket/table"}]`), &updates)
+		require.ErrorContains(t, err, "unknown update action: unknown")
+	})
+}
+
+func TestUnmarshalUpdatesPreservesDuplicateActionTypeError(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "valid final action",
+			data: `[{"action":123,"action":"set-properties","updated":{"k":"v"}}]`,
+		},
+		{
+			name: "valid final action with missing required field",
+			data: `[{"action":123,"action":"set-location"}]`,
+		},
+		{
+			name: "unknown final action",
+			data: `[{"action":123,"action":"unknown"}]`,
+		},
+		{
+			name: "null final action",
+			data: `[{"action":123,"action":null}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var updates Updates
+			var typeErr *json.UnmarshalTypeError
+			err := json.Unmarshal([]byte(tt.data), &updates)
+
+			require.ErrorAs(t, err, &typeErr)
 		})
 	}
 }
@@ -1216,4 +1349,119 @@ func TestRemoveEncryptionKeyUpdate_Apply_NoOp(t *testing.T) {
 	// Removing a key that doesn't exist should not error.
 	b := buildFromBase(t)
 	require.NoError(t, NewRemoveEncryptionKeyUpdate("nonexistent").Apply(b))
+}
+
+func TestAddPartitionSpecUpdate_UnmarshalVoidTombstone(t *testing.T) {
+	// A dropped partition field whose source column is gone is a void
+	// transform over source ID 0; BindToSchema carries it across, so the
+	// decoder must let it through.
+	data := []byte(`[{"action":"add-spec","spec":{"spec-id":1,"fields":[{"source-id":0,"field-id":1000,"transform":"void","name":"x_bucket"}]}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	b := buildFromBaseV3(t)
+	require.NoError(t, updates[0].Apply(b))
+
+	meta, err := b.Build()
+	require.NoError(t, err)
+
+	spec := meta.PartitionSpecByID(1)
+	require.NotNil(t, spec)
+	require.Equal(t, 1, spec.NumFields())
+	assert.Equal(t, "x_bucket", spec.Field(0).Name)
+	assert.IsType(t, iceberg.VoidTransform{}, spec.Field(0).Transform)
+}
+
+func TestAddPartitionSpecUpdate_UnmarshalUnresolvableSourceID(t *testing.T) {
+	// A non-void source ID that the current schema cannot resolve is still
+	// rejected, but by binding rather than by decoding.
+	data := []byte(`[{"action":"add-spec","spec":{"spec-id":1,"fields":[{"source-id":0,"field-id":1000,"transform":"identity","name":"x"}]}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	err := updates[0].Apply(buildFromBaseV3(t))
+	// Pinned to BindToSchema's wording on purpose: the assertion below only
+	// shows the decoder let the field through, not who rejected it.
+	require.ErrorContains(t, err, "cannot find source column with id: 0 in schema")
+	assert.NotContains(t, err.Error(), "must be positive")
+}
+
+func TestAddSortOrderUpdate_UnmarshalDefersBindingToApply(t *testing.T) {
+	// Decoding accepts the order either way; Apply reports both the positivity
+	// check and the schema lookup, which needs a schema only Apply knows. Source
+	// ID 0 fails the first and never reaches the second, so 999 covers the
+	// lookup: positive, and absent from baseMetaV3JSON.
+	for _, tt := range []struct {
+		name     string
+		sourceID int
+		message  string
+	}{
+		{name: "not positive", sourceID: 0, message: "source ID must be positive: 0"},
+		{name: "unresolvable", sourceID: 999, message: "sort field with source id 999 not found in schema"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := fmt.Appendf(nil,
+				`[{"action":"add-sort-order","sort-order":{"order-id":1,"fields":[{"source-id":%d,"transform":"identity","direction":"asc","null-order":"nulls-first"}]}}]`,
+				tt.sourceID,
+			)
+
+			var updates Updates
+			require.NoError(t, json.Unmarshal(data, &updates))
+			require.Len(t, updates, 1)
+
+			err := updates[0].Apply(buildFromBaseV3(t))
+			require.ErrorContains(t, err, "not compatible with current schema")
+			assert.ErrorContains(t, err, tt.message)
+		})
+	}
+}
+
+func TestAddSortOrderUpdate_UnmarshalRoundTrip(t *testing.T) {
+	// The decode no longer validates source IDs, so cover the resolvable case
+	// end to end: field 1 is x in baseMetaV3JSON.
+	data := []byte(`[{"action":"add-sort-order","sort-order":{"order-id":1,"fields":[{"source-id":1,"transform":"identity","direction":"desc","null-order":"nulls-last"}]}}]`)
+
+	var updates Updates
+	require.NoError(t, json.Unmarshal(data, &updates))
+	require.Len(t, updates, 1)
+
+	b := buildFromBaseV3(t)
+	require.NoError(t, updates[0].Apply(b))
+
+	meta, err := b.Build()
+	require.NoError(t, err)
+
+	var order SortOrder
+	var found bool
+	for _, o := range meta.SortOrders() {
+		if o.OrderID() == 1 {
+			order, found = o, true
+
+			break
+		}
+	}
+	require.True(t, found)
+	require.Equal(t, 1, order.Len())
+
+	field := order.Field(0)
+	assert.Equal(t, []int{1}, field.SourceIDs)
+	assert.Equal(t, SortDESC, field.Direction)
+	assert.Equal(t, NullsLast, field.NullOrder)
+	assert.IsType(t, iceberg.IdentityTransform{}, field.Transform)
+}
+
+func TestAddSpecAndSortOrderUpdates_ApplyRejectNilPayload(t *testing.T) {
+	t.Run("add-spec", func(t *testing.T) {
+		err := NewAddPartitionSpecUpdate(nil, true).Apply(buildFromBaseV3(t))
+		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	})
+
+	t.Run("add-sort-order", func(t *testing.T) {
+		err := NewAddSortOrderUpdate(nil).Apply(buildFromBaseV3(t))
+		require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	})
 }

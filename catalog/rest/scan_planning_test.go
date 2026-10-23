@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -120,13 +121,12 @@ func TestScanPlanningCapabilities(t *testing.T) {
 	t.Run("plan only", func(t *testing.T) {
 		t.Parallel()
 
-		// A plan-only server can plan inline, but a `submitted` reply could not
-		// be polled, so it is not full-remote capable. SupportsRemoteScanPlanning
-		// is false here too (gated off while PlanFiles is a stub).
+		// A plan-only server can plan inline even though it cannot handle response
+		// shapes that require polling or task expansion.
 		cat := &Catalog{endpoints: newEndpointSet([]endpoint{endpointPlanTableScan})}
 		assert.True(t, cat.SupportsPlanTableScan())
 		assert.False(t, cat.SupportsFullRemoteScanPlanning())
-		assert.False(t, cat.SupportsRemoteScanPlanning())
+		assert.True(t, cat.SupportsRemoteScanPlanning())
 	})
 
 	t.Run("full remote planning", func(t *testing.T) {
@@ -140,11 +140,19 @@ func TestScanPlanningCapabilities(t *testing.T) {
 		})}
 		assert.True(t, cat.SupportsPlanTableScan())
 		assert.True(t, cat.SupportsFullRemoteScanPlanning())
-		// SupportsRemoteScanPlanning stays false while PlanFiles is a stub, even
-		// when all four endpoints are advertised, so auto mode falls back to
-		// local instead of routing into ErrNotImplemented. Flips on with the
-		// PlanFiles phase.
-		assert.False(t, cat.SupportsRemoteScanPlanning())
+		assert.True(t, cat.SupportsRemoteScanPlanning())
+	})
+
+	t.Run("execution endpoints without optional cancel", func(t *testing.T) {
+		t.Parallel()
+
+		cat := &Catalog{endpoints: newEndpointSet([]endpoint{
+			endpointPlanTableScan,
+			endpointFetchPlanResult,
+			endpointFetchScanTasks,
+		})}
+		assert.True(t, cat.SupportsFullRemoteScanPlanning())
+		assert.True(t, cat.SupportsRemoteScanPlanning())
 	})
 
 	t.Run("default fallback does not advertise scan planning", func(t *testing.T) {
@@ -201,18 +209,47 @@ func TestPlanTableScanResponseAcceptsCompletedWithPlanID(t *testing.T) {
 	assert.Equal(t, "position-deletes", resp.DeleteFiles[0].Content)
 }
 
+func TestPlanTableScanResponseRejectsInvalidStatusEnvelope(t *testing.T) {
+	t.Parallel()
+
+	for i, payload := range []string{
+		`{"status":"submitted","plan-id":"abc","file-scan-tasks":[]}`,
+		`{"status":"submitted","plan-id":"abc","file-scan-tasks":null}`,
+		`{"status":"submitted","plan-id":"abc","delete-files":[]}`,
+		`{"status":"submitted","plan-id":"abc","delete-files":null}`,
+		`{"status":"failed","plan-tasks":[]}`,
+		`{"status":"failed","plan-tasks":null}`,
+		`{"status":"completed","plan-id":"abc","delete-files":[{}]}`,
+		`{"status":"completed","plan-id":"abc","plan-tasks":null}`,
+		`{"status":"completed","plan-id":"abc","file-scan-tasks":null}`,
+		`{"status":"completed","plan-id":"abc","delete-files":null}`,
+		`{"status":"failed","plan-id":"abc"}`,
+	} {
+		t.Run(fmt.Sprintf("payload-%d", i), func(t *testing.T) {
+			t.Parallel()
+
+			var resp PlanTableScanResponse
+			require.ErrorIs(t, json.Unmarshal([]byte(payload), &resp), ErrRESTError, payload)
+		})
+	}
+}
+
 func TestPlanTableScanResponseAcceptsFailedWithoutUsableError(t *testing.T) {
 	t.Parallel()
 
-	for _, payload := range []string{
+	for i, payload := range []string{
 		`{"status":"failed"}`,
 		`{"status":"failed","error":null}`,
 		`{"status":"failed","error":"oops"}`,
 	} {
-		var resp PlanTableScanResponse
-		require.NoError(t, json.Unmarshal([]byte(payload), &resp))
-		assert.Equal(t, PlanStatusFailed, resp.Status)
-		assert.Nil(t, resp.Error)
+		t.Run(fmt.Sprintf("payload-%d", i), func(t *testing.T) {
+			t.Parallel()
+
+			var resp PlanTableScanResponse
+			require.NoError(t, json.Unmarshal([]byte(payload), &resp))
+			assert.Equal(t, PlanStatusFailed, resp.Status)
+			assert.Nil(t, resp.Error)
+		})
 	}
 }
 
@@ -224,6 +261,22 @@ func TestPlanTableScanResponseAcceptsFailedWithError(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp.Error)
 	assert.Equal(t, "boom", resp.Error.Message)
+}
+
+func TestPlanTableScanResponseRejectsErrorOnNonFailedStatus(t *testing.T) {
+	t.Parallel()
+
+	for i, payload := range []string{
+		`{"status":"completed","plan-id":"abc","error":"oops"}`,
+		`{"status":"submitted","plan-id":"abc","error":[]}`,
+	} {
+		t.Run(fmt.Sprintf("payload-%d", i), func(t *testing.T) {
+			t.Parallel()
+
+			var resp PlanTableScanResponse
+			require.ErrorIs(t, json.Unmarshal([]byte(payload), &resp), ErrRESTError, payload)
+		})
+	}
 }
 
 func TestPlanTableScanResponseRejectsUnknownStatus(t *testing.T) {
@@ -240,15 +293,19 @@ func TestFetchPlanningResultResponseValidation(t *testing.T) {
 	t.Run("failed without usable error is accepted", func(t *testing.T) {
 		t.Parallel()
 
-		for _, payload := range []string{
+		for i, payload := range []string{
 			`{"status":"failed"}`,
 			`{"status":"failed","error":null}`,
 			`{"status":"failed","error":"oops"}`,
 		} {
-			var resp FetchPlanningResultResponse
-			require.NoError(t, json.Unmarshal([]byte(payload), &resp))
-			assert.Equal(t, PlanStatusFailed, resp.Status)
-			assert.Nil(t, resp.Error)
+			t.Run(fmt.Sprintf("payload-%d", i), func(t *testing.T) {
+				t.Parallel()
+
+				var resp FetchPlanningResultResponse
+				require.NoError(t, json.Unmarshal([]byte(payload), &resp))
+				assert.Equal(t, PlanStatusFailed, resp.Status)
+				assert.Nil(t, resp.Error)
+			})
 		}
 	})
 
@@ -259,6 +316,47 @@ func TestFetchPlanningResultResponseValidation(t *testing.T) {
 		err := json.Unmarshal([]byte(`{"status":"bogus"}`), &resp)
 		require.ErrorIs(t, err, ErrRESTError)
 	})
+
+	t.Run("rejects task fields before completion", func(t *testing.T) {
+		t.Parallel()
+
+		for i, payload := range []string{
+			`{"status":"submitted","plan-tasks":[]}`,
+			`{"status":"submitted","plan-tasks":null}`,
+			`{"status":"submitted","delete-files":[]}`,
+			`{"status":"submitted","delete-files":null}`,
+			`{"status":"cancelled","file-scan-tasks":[]}`,
+			`{"status":"cancelled","file-scan-tasks":null}`,
+			`{"status":"completed","delete-files":[{}]}`,
+			`{"status":"completed","plan-tasks":null}`,
+			`{"status":"completed","file-scan-tasks":null}`,
+			`{"status":"completed","delete-files":null}`,
+		} {
+			t.Run(fmt.Sprintf("payload-%d", i), func(t *testing.T) {
+				t.Parallel()
+
+				var resp FetchPlanningResultResponse
+				require.ErrorIs(t, json.Unmarshal([]byte(payload), &resp), ErrRESTError, payload)
+			})
+		}
+	})
+
+	t.Run("rejects error on non-failed status", func(t *testing.T) {
+		t.Parallel()
+
+		for i, payload := range []string{
+			`{"status":"completed","error":"oops"}`,
+			`{"status":"submitted","error":[]}`,
+			`{"status":"cancelled","error":{}}`,
+		} {
+			t.Run(fmt.Sprintf("payload-%d", i), func(t *testing.T) {
+				t.Parallel()
+
+				var resp FetchPlanningResultResponse
+				require.ErrorIs(t, json.Unmarshal([]byte(payload), &resp), ErrRESTError, payload)
+			})
+		}
+	})
 }
 
 func TestPlanTableScanGeneratesIdempotencyKeyAndUsesDefaultAccessDelegation(t *testing.T) {
@@ -267,15 +365,21 @@ func TestPlanTableScanGeneratesIdempotencyKeyAndUsesDefaultAccessDelegation(t *t
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			got := req.Header.Get(headerIdempotencyKey)
-			require.NotEmpty(t, got)
+			if !assert.NotEmpty(t, got) {
+				return
+			}
 			parsed, err := uuid.Parse(got)
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 			// The spec pins the generated key to UUIDv7.
 			assert.Equal(t, 7, int(parsed.Version()))
 			assert.Equal(t, []string{defaultAccessDelegation}, req.Header.Values(headerIcebergAccessDelegation))
 
 			_, err = w.Write([]byte(`{"status":"completed","plan-id":"plan-1"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -326,7 +430,9 @@ func TestPlanTableScanAcceptsUppercaseCanonicalIdempotencyKey(t *testing.T) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			assert.Equal(t, key, req.Header.Get(headerIdempotencyKey))
 			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -350,13 +456,13 @@ func TestPlanTableScanRequest(t *testing.T) {
 			name:       "completed",
 			response:   `{"status":"completed","plan-id":"plan-1","plan-tasks":["task-1"]}`,
 			wantStatus: PlanStatusCompleted,
-			wantPlanID: stringPtr("plan-1"),
+			wantPlanID: new("plan-1"),
 		},
 		{
 			name:       "submitted",
 			response:   `{"status":"submitted","plan-id":"plan-2"}`,
 			wantStatus: PlanStatusSubmitted,
-			wantPlanID: stringPtr("plan-2"),
+			wantPlanID: new("plan-2"),
 		},
 		{
 			name:       "failed",
@@ -375,12 +481,16 @@ func TestPlanTableScanRequest(t *testing.T) {
 			snapshotID := int64(22)
 			cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 				mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
-					require.Equal(t, http.MethodPost, req.Method)
+					if !assert.Equal(t, http.MethodPost, req.Method) {
+						return
+					}
 					assert.Equal(t, idempotencyKey, req.Header.Get(headerIdempotencyKey))
 					assert.Equal(t, []string{accessDelegation}, req.Header.Values(headerIcebergAccessDelegation))
 
 					body, err := io.ReadAll(req.Body)
-					require.NoError(t, err)
+					if !assert.NoError(t, err) {
+						return
+					}
 					assert.JSONEq(t, `{
 						"snapshot-id": 22,
 						"select": ["id", "data"],
@@ -388,7 +498,9 @@ func TestPlanTableScanRequest(t *testing.T) {
 					}`, string(body))
 
 					_, err = w.Write([]byte(tc.response))
-					require.NoError(t, err)
+					if !assert.NoError(t, err) {
+						return
+					}
 				})
 			})
 
@@ -431,7 +543,9 @@ func TestPlanTableScanRejectsEmptyBody(t *testing.T) {
 	// success; assert it is rejected instead.
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodPost, req.Method)
+			if !assert.Equal(t, http.MethodPost, req.Method) {
+				return
+			}
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusOK)
 		})
@@ -452,9 +566,35 @@ func TestFetchScanTasksRejectsEmptyBody(t *testing.T) {
 	key := "0190b6c5-1c3d-7000-8000-000000000004"
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodPost, req.Method)
+			if !assert.Equal(t, http.MethodPost, req.Method) {
+				return
+			}
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusOK)
+		})
+	})
+
+	resp, err := cat.FetchScanTasks(context.Background(), table.Identifier{"db", "tbl"}, FetchScanTasksRequest{
+		IdempotencyKey: &key,
+		PlanTask:       "task-1",
+	})
+	require.ErrorIs(t, err, ErrRESTError)
+	assert.Equal(t, FetchScanTasksResponse{}, resp)
+}
+
+func TestFetchScanTasksRejectsNullBody(t *testing.T) {
+	t.Parallel()
+
+	key := "0190b6c5-1c3d-7000-8000-000000000005"
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			if !assert.Equal(t, http.MethodPost, req.Method) {
+				return
+			}
+			_, err := w.Write([]byte("null"))
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -472,11 +612,15 @@ func TestFetchPlanningResultRequest(t *testing.T) {
 	accessDelegation := "remote-signing"
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchPlanResult}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodGet, req.Method)
+			if !assert.Equal(t, http.MethodGet, req.Method) {
+				return
+			}
 			assert.Equal(t, []string{accessDelegation}, req.Header.Values(headerIcebergAccessDelegation))
 
 			_, err := w.Write([]byte(`{"status":"completed","plan-tasks":["task-1"]}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -493,11 +637,15 @@ func TestFetchPlanningResultUsesDefaultAccessDelegation(t *testing.T) {
 
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchPlanResult}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodGet, req.Method)
+			if !assert.Equal(t, http.MethodGet, req.Method) {
+				return
+			}
 			assert.Equal(t, []string{defaultAccessDelegation}, req.Header.Values(headerIcebergAccessDelegation))
 
 			_, err := w.Write([]byte(`{"status":"submitted"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -532,7 +680,9 @@ func TestFetchPlanningResultMapsNotFound(t *testing.T) {
 
 			cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchPlanResult}, func(mux *http.ServeMux) {
 				mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
-					require.Equal(t, http.MethodGet, req.Method)
+					if !assert.Equal(t, http.MethodGet, req.Method) {
+						return
+					}
 					writeRESTNotFound(t, w, tc.errType)
 				})
 			})
@@ -572,7 +722,9 @@ func TestFetchScanTasksMapsNotFound(t *testing.T) {
 			idempotencyKey := "0190b6c5-1c3d-7000-8000-000000000003"
 			cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
 				mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
-					require.Equal(t, http.MethodPost, req.Method)
+					if !assert.Equal(t, http.MethodPost, req.Method) {
+						return
+					}
 					writeRESTNotFound(t, w, tc.errType)
 				})
 			})
@@ -613,7 +765,9 @@ func TestPlanTableScanMapsNotFound(t *testing.T) {
 
 			cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 				mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
-					require.Equal(t, http.MethodPost, req.Method)
+					if !assert.Equal(t, http.MethodPost, req.Method) {
+						return
+					}
 					writeRESTNotFound(t, w, tc.errType)
 				})
 			})
@@ -647,7 +801,9 @@ func TestFetchPlanningResultStatusArms(t *testing.T) {
 		cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchPlanResult}, func(mux *http.ServeMux) {
 			mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
 				_, err := w.Write([]byte(`{"status":"cancelled"}`))
-				require.NoError(t, err)
+				if !assert.NoError(t, err) {
+					return
+				}
 			})
 		})
 
@@ -661,7 +817,9 @@ func TestFetchPlanningResultStatusArms(t *testing.T) {
 		cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchPlanResult}, func(mux *http.ServeMux) {
 			mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
 				_, err := w.Write([]byte(`{"status":"failed","error":{"message":"boom","type":"ServerError","code":500}}`))
-				require.NoError(t, err)
+				if !assert.NoError(t, err) {
+					return
+				}
 			})
 		})
 
@@ -683,7 +841,9 @@ func TestFetchPlanningResultStatusArms(t *testing.T) {
 			cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchPlanResult}, func(mux *http.ServeMux) {
 				mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
 					_, err := w.Write([]byte(payload))
-					require.NoError(t, err)
+					if !assert.NoError(t, err) {
+						return
+					}
 				})
 			})
 
@@ -701,7 +861,9 @@ func TestCancelPlanningRequest(t *testing.T) {
 
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointCancelPlanning}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-123", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodDelete, req.Method)
+			if !assert.Equal(t, http.MethodDelete, req.Method) {
+				return
+			}
 			assert.Empty(t, req.Header.Values(headerIdempotencyKey))
 			assert.Empty(t, req.Header.Values(headerIcebergAccessDelegation))
 			w.WriteHeader(http.StatusNoContent)
@@ -717,12 +879,16 @@ func TestFetchScanTasksRequest(t *testing.T) {
 	idempotencyKey := "0190b6c5-1c3d-7000-8000-000000000002"
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodPost, req.Method)
+			if !assert.Equal(t, http.MethodPost, req.Method) {
+				return
+			}
 			assert.Equal(t, idempotencyKey, req.Header.Get(headerIdempotencyKey))
 			assert.Empty(t, req.Header.Values(headerIcebergAccessDelegation))
 
 			body, err := io.ReadAll(req.Body)
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 			assert.JSONEq(t, `{"plan-task":"task-1"}`, string(body))
 
 			_, err = w.Write([]byte(`{
@@ -730,7 +896,9 @@ func TestFetchScanTasksRequest(t *testing.T) {
 				"file-scan-tasks": [{}],
 				"delete-files": [{}]
 			}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -789,13 +957,17 @@ func newScanPlanningTestCatalog(t *testing.T, endpoints []endpoint, register fun
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, req *http.Request) {
-		require.Equal(t, http.MethodGet, req.Method)
+		if !assert.Equal(t, http.MethodGet, req.Method) {
+			return
+		}
 		err := json.NewEncoder(w).Encode(map[string]any{
 			"defaults":  map[string]any{},
 			"overrides": map[string]any{},
 			"endpoints": endpointStrings(endpoints),
 		})
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
 	})
 	if register != nil {
 		register(mux)
@@ -836,10 +1008,8 @@ func writeRESTNotFound(t *testing.T, w http.ResponseWriter, errType string) {
 	}
 
 	_, err := fmt.Fprintf(w, `{"error":{"message":%q,"type":%q,"code":404}}`, errType, errType)
-	require.NoError(t, err)
+	assert.NoError(t, err)
 }
-
-func stringPtr(s string) *string { return &s }
 
 // TestPlanTableScanRequestFromEncodesFilter checks the row filter serializes to
 // ExpressionParser JSON on the wire request, and that trivial filters are
@@ -923,6 +1093,10 @@ func TestPlanTableScanRequestFromPassesFields(t *testing.T) {
 	assert.Equal(t, &caseSensitive, wire.CaseSensitive)
 	assert.Equal(t, []string{"a"}, wire.StatsFields)
 	assert.Nil(t, wire.Filter)
+
+	wire, err = planTableScanRequestFrom(table.ScanPlanningRequest{SelectedFields: []string{"*"}})
+	require.NoError(t, err)
+	assert.Nil(t, wire.Select, "the local wildcard sentinel is not a REST FieldName")
 }
 
 // scanFilterSchema is the schema filter-binding tests resolve references against.
@@ -937,13 +1111,23 @@ func scanFilterSchema() *iceberg.Schema {
 // encoding needs.
 type scanTestMetadata struct{ schema *iceberg.Schema }
 
-func (m scanTestMetadata) CurrentSchema() *iceberg.Schema               { return m.schema }
-func (m scanTestMetadata) Schemas() []*iceberg.Schema                   { return []*iceberg.Schema{m.schema} }
+func (m scanTestMetadata) CurrentSchema() *iceberg.Schema { return m.schema }
+func (m scanTestMetadata) Schemas() []*iceberg.Schema     { return []*iceberg.Schema{m.schema} }
+
 func (m scanTestMetadata) PartitionSpec() iceberg.PartitionSpec         { return iceberg.PartitionSpec{} }
 func (m scanTestMetadata) PartitionSpecByID(int) *iceberg.PartitionSpec { return nil }
 func (m scanTestMetadata) CurrentSnapshot() *table.Snapshot             { return nil }
 func (m scanTestMetadata) SnapshotByID(int64) *table.Snapshot           { return nil }
 func (m scanTestMetadata) Properties() iceberg.Properties               { return nil }
+
+type scanPlanningSchemaMetadata struct {
+	*scanTaskDecoderMetadata
+	current *iceberg.Schema
+	schemas []*iceberg.Schema
+}
+
+func (m scanPlanningSchemaMetadata) CurrentSchema() *iceberg.Schema { return m.current }
+func (m scanPlanningSchemaMetadata) Schemas() []*iceberg.Schema     { return m.schemas }
 
 // planFilesReq is a minimal planner request naming the test table.
 func planFilesReq() table.ScanPlanningRequest {
@@ -962,7 +1146,9 @@ func TestPlanFilesCompletedEmpty(t *testing.T) {
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -970,6 +1156,69 @@ func TestPlanFilesCompletedEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, result.Tasks)
 	assert.Nil(t, result.IO)
+}
+
+func TestScanPlanningRemoteSupportsSynchronousPlanOnlyServer(t *testing.T) {
+	t.Parallel()
+
+	metadata := newScanTaskDecoderMetadata()
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			planID := "plan-1"
+			if !assert.NoError(t, json.NewEncoder(w).Encode(PlanTableScanResponse{
+				Status:    PlanStatusCompleted,
+				PlanID:    &planID,
+				ScanTasks: validScanTasksWire(),
+			})) {
+				return
+			}
+		})
+	})
+
+	assert.True(t, cat.SupportsRemoteScanPlanning())
+	assert.False(t, cat.SupportsFullRemoteScanPlanning())
+
+	req := planFilesReq()
+	req.Metadata = metadata
+	req.Schema = metadata.schema
+	result, err := cat.PlanFiles(context.Background(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Tasks, 1)
+	assert.Equal(t, "s3://bucket/table/data.parquet", result.Tasks[0].File.FilePath())
+}
+
+func TestPlanFilesRequiresAdvertisedResponseContinuation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{
+			name:     "submitted plan requires result fetch",
+			response: `{"status":"submitted","plan-id":"plan-1"}`,
+		},
+		{
+			name:     "plan task requires task fetch",
+			response: `{"status":"completed","plan-id":"plan-1","plan-tasks":["task-1"]}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
+				mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+					_, err := w.Write([]byte(test.response))
+					if !assert.NoError(t, err) {
+						return
+					}
+				})
+			})
+
+			_, err := cat.PlanFiles(context.Background(), planFilesReq())
+			require.ErrorIs(t, err, ErrEndpointNotSupported)
+		})
+	}
 }
 
 // TestPlanFilesEncodesFilter checks the row filter reaches the plan request body
@@ -980,14 +1229,20 @@ func TestPlanFilesEncodesFilter(t *testing.T) {
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			body, err := io.ReadAll(req.Body)
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 
 			var got PlanTableScanRequest
-			require.NoError(t, json.Unmarshal(body, &got))
+			if !assert.NoError(t, json.Unmarshal(body, &got)) {
+				return
+			}
 			assert.JSONEq(t, `{"type":"eq","term":"i","value":25}`, string(got.Filter))
 
 			_, err = w.Write([]byte(`{"status":"completed","plan-id":"plan-1"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -997,21 +1252,22 @@ func TestPlanFilesEncodesFilter(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestPlanFilesTasksNotYetDecodable documents the one stubbed boundary: a plan
-// that returns actual file-scan-tasks surfaces ErrNotImplemented until the
-// scan-task decoder phase fills in RESTFileScanTask.
-func TestPlanFilesTasksNotYetDecodable(t *testing.T) {
+// TestPlanFilesRejectsMalformedScanTasks makes sure remote planning validates
+// the task payload instead of returning partially decoded tasks.
+func TestPlanFilesRejectsMalformedScanTasks(t *testing.T) {
 	t.Parallel()
 
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","file-scan-tasks":[{}]}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
 	_, err := cat.PlanFiles(context.Background(), planFilesReq())
-	require.ErrorIs(t, err, iceberg.ErrNotImplemented)
+	require.ErrorIs(t, err, ErrRESTError)
 }
 
 // TestPlanFilesPollsSubmittedPlan covers the async arm: a submitted plan is
@@ -1022,12 +1278,18 @@ func TestPlanFilesPollsSubmittedPlan(t *testing.T) {
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan, endpointFetchPlanResult}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"submitted","plan-id":"plan-9"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-9", func(w http.ResponseWriter, req *http.Request) {
-			require.Equal(t, http.MethodGet, req.Method)
+			if !assert.Equal(t, http.MethodGet, req.Method) {
+				return
+			}
 			_, err := w.Write([]byte(`{"status":"completed"}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -1042,23 +1304,34 @@ func TestPlanFilesPollsSubmittedPlan(t *testing.T) {
 func TestPlanFilesExpandsPlanTasks(t *testing.T) {
 	t.Parallel()
 
+	var mu sync.Mutex
 	var fetched []string
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan, endpointFetchScanTasks}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","plan-tasks":["h1"]}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
 			var body FetchScanTasksRequest
-			require.NoError(t, json.NewDecoder(req.Body).Decode(&body))
+			if !assert.NoError(t, json.NewDecoder(req.Body).Decode(&body)) {
+				return
+			}
+			mu.Lock()
 			fetched = append(fetched, body.PlanTask)
+			mu.Unlock()
 			switch body.PlanTask {
 			case "h1":
 				_, err := w.Write([]byte(`{"plan-tasks":["h2"]}`))
-				require.NoError(t, err)
+				if !assert.NoError(t, err) {
+					return
+				}
 			default:
 				_, err := w.Write([]byte(`{"file-scan-tasks":[]}`))
-				require.NoError(t, err)
+				if !assert.NoError(t, err) {
+					return
+				}
 			}
 		})
 	})
@@ -1066,7 +1339,210 @@ func TestPlanFilesExpandsPlanTasks(t *testing.T) {
 	result, err := cat.PlanFiles(context.Background(), planFilesReq())
 	require.NoError(t, err)
 	assert.Empty(t, result.Tasks)
+	mu.Lock()
+	defer mu.Unlock()
 	assert.Equal(t, []string{"h1", "h2"}, fetched)
+}
+
+func TestCollectScanTasksFetchesFrontierConcurrentlyInOrder(t *testing.T) {
+	t.Parallel()
+
+	h1Started := make(chan struct{})
+	h2Started := make(chan struct{})
+	releaseH1 := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseH1) }) }
+
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+
+			switch body.PlanTask {
+			case "h1":
+				close(h1Started)
+				<-releaseH1
+				_, _ = w.Write([]byte(`{"file-scan-tasks":[{"data-file":{"file-path":"h1"}}]}`))
+			case "h2":
+				close(h2Started)
+				_, _ = w.Write([]byte(`{"file-scan-tasks":[{"data-file":{"file-path":"h2"}}]}`))
+			default:
+				http.Error(w, "unexpected plan task", http.StatusBadRequest)
+			}
+		})
+	})
+	t.Cleanup(release)
+
+	type outcome struct {
+		envelopes []ScanTasks
+		err       error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		envelopes, err := cat.collectScanTasksWithConcurrency(t.Context(), table.Identifier{"db", "tbl"}, ScanTasks{
+			PlanTasks: []string{"h1", "h2"},
+		}, 2)
+		done <- outcome{envelopes: envelopes, err: err}
+	}()
+
+	for name, started := range map[string]<-chan struct{}{
+		"h1": h1Started,
+		"h2": h2Started,
+	} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %s to start", name)
+		}
+	}
+
+	release()
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Len(t, result.envelopes, 3)
+		require.Len(t, result.envelopes[1].FileScanTasks, 1)
+		require.Len(t, result.envelopes[2].FileScanTasks, 1)
+		require.NotNil(t, result.envelopes[1].FileScanTasks[0].DataFile)
+		require.NotNil(t, result.envelopes[2].FileScanTasks[0].DataFile)
+		assert.Equal(t, "h1", result.envelopes[1].FileScanTasks[0].DataFile.FilePath)
+		assert.Equal(t, "h2", result.envelopes[2].FileScanTasks[0].DataFile.FilePath)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for frontier fetches")
+	}
+}
+
+type orderedScanTaskErrorTransport struct {
+	planTaskReturned chan struct{}
+}
+
+func (t *orderedScanTaskErrorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body FetchScanTasksRequest
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+
+	var errType string
+	switch body.PlanTask {
+	case "table":
+		select {
+		case <-t.planTaskReturned:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+		errType = errTypeNoSuchTable
+	case "plan-task":
+		close(t.planTaskReturned)
+		errType = errTypeNoSuchPlanTask
+	default:
+		return nil, fmt.Errorf("unexpected plan task %q", body.PlanTask)
+	}
+
+	data := fmt.Sprintf(`{"error":{"message":%q,"type":%q,"code":404}}`, errType, errType)
+
+	return &http.Response{
+		StatusCode:    http.StatusNotFound,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(data)),
+		ContentLength: int64(len(data)),
+		Request:       req,
+	}, nil
+}
+
+func TestCollectScanTasksReturnsFirstErrorInHandleOrder(t *testing.T) {
+	t.Parallel()
+
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, nil)
+	cat.cl = &http.Client{Transport: &orderedScanTaskErrorTransport{
+		planTaskReturned: make(chan struct{}),
+	}}
+
+	envelopes, err := cat.collectScanTasksWithConcurrency(t.Context(), table.Identifier{"db", "tbl"}, ScanTasks{
+		PlanTasks: []string{"table", "plan-task"},
+	}, 2)
+	require.ErrorIs(t, err, catalog.ErrNoSuchTable)
+	assert.Contains(t, err.Error(), `handle "table"`)
+	assert.NotErrorIs(t, err, ErrNoSuchPlanTask)
+	assert.Nil(t, envelopes)
+}
+
+func TestCollectScanTasksBoundsFrontierConcurrency(t *testing.T) {
+	t.Parallel()
+
+	const maxConcurrency = 8
+	const handleCount = maxConcurrency + 1
+	started := make(chan string, handleCount)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+
+			started <- body.PlanTask
+			<-release
+			_, _ = w.Write([]byte(`{"file-scan-tasks":[]}`))
+		})
+	})
+	t.Cleanup(finish)
+
+	handles := make([]string, handleCount)
+	for i := range handles {
+		handles[i] = fmt.Sprintf("h%d", i)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := cat.collectScanTasksWithConcurrency(t.Context(), table.Identifier{"db", "tbl"}, ScanTasks{
+			PlanTasks: handles,
+		}, maxConcurrency)
+		done <- err
+	}()
+
+	for range maxConcurrency {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for bounded frontier workers")
+		}
+	}
+
+	select {
+	case handle := <-started:
+		t.Fatalf("frontier exceeded concurrency limit with %s", handle)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	finishOne := func() {
+		select {
+		case release <- struct{}{}:
+		case <-time.After(time.Second):
+			t.Fatal("timed out releasing a frontier worker")
+		}
+	}
+	finishOne()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out starting the queued frontier handle")
+	}
+	finish()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bounded frontier fetches")
+	}
 }
 
 // TestPlanFilesFanoutCycleTerminates guards the seen-set: a server that re-issues
@@ -1078,12 +1554,16 @@ func TestPlanFilesFanoutCycleTerminates(t *testing.T) {
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan, endpointFetchScanTasks}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","plan-tasks":["h1"]}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
 			calls.Add(1)
 			_, err := w.Write([]byte(`{"plan-tasks":["h1"]}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
@@ -1093,8 +1573,296 @@ func TestPlanFilesFanoutCycleTerminates(t *testing.T) {
 	assert.Equal(t, int32(1), calls.Load())
 }
 
+func TestPlanFilesCancelsAfterFanoutFailure(t *testing.T) {
+	t.Parallel()
+
+	var cancels atomic.Int32
+	cat := newScanPlanningTestCatalog(t, []endpoint{
+		endpointPlanTableScan,
+		endpointFetchScanTasks,
+		endpointCancelPlanning,
+	}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","plan-tasks":["h1","h2"]}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if !assert.NoError(t, json.NewDecoder(req.Body).Decode(&body)) {
+				return
+			}
+			if body.PlanTask == "h1" {
+				_, err := w.Write([]byte(`{"plan-tasks":[]}`))
+				if !assert.NoError(t, err) {
+					return
+				}
+
+				return
+			}
+
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-1", func(w http.ResponseWriter, req *http.Request) {
+			if !assert.Equal(t, http.MethodDelete, req.Method) {
+				return
+			}
+			cancels.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		})
+	})
+
+	_, err := cat.PlanFiles(context.Background(), planFilesReq())
+	require.ErrorIs(t, err, ErrServiceUnavailable)
+	assert.Equal(t, int32(1), cancels.Load())
+}
+
+func TestPlanFilesCancelsAfterSuccessfulMaterialization(t *testing.T) {
+	t.Parallel()
+
+	var cancels atomic.Int32
+	cat := newScanPlanningTestCatalog(t, []endpoint{
+		endpointPlanTableScan,
+		endpointFetchScanTasks,
+		endpointCancelPlanning,
+	}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","plan-tasks":["h1"]}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if !assert.NoError(t, json.NewDecoder(req.Body).Decode(&body)) {
+				return
+			}
+			if !assert.Equal(t, "h1", body.PlanTask) {
+				return
+			}
+			_, err := w.Write([]byte(`{"file-scan-tasks":[]}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-1", func(w http.ResponseWriter, req *http.Request) {
+			if !assert.Equal(t, http.MethodDelete, req.Method) {
+				return
+			}
+			cancels.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		})
+	})
+
+	result, err := cat.PlanFiles(context.Background(), planFilesReq())
+	require.NoError(t, err)
+	assert.Empty(t, result.Tasks)
+	assert.Equal(t, int32(1), cancels.Load())
+}
+
+func TestPlanFilesDefersCancelWithVendedCredentials(t *testing.T) {
+	t.Parallel()
+
+	var cancels atomic.Int32
+	cat := newScanPlanningTestCatalog(t, []endpoint{
+		endpointPlanTableScan,
+		endpointCancelPlanning,
+	}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","storage-credentials":[{"prefix":"s3://bucket/","config":{"s3.access-key-id":"vended"}}]}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-1", func(w http.ResponseWriter, req *http.Request) {
+			if !assert.Equal(t, http.MethodDelete, req.Method) {
+				return
+			}
+			cancels.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		})
+	})
+
+	result, err := cat.PlanFiles(context.Background(), planFilesReq())
+	require.NoError(t, err)
+	require.NotNil(t, result.IO)
+	assert.Equal(t, int32(0), cancels.Load())
+
+	require.NoError(t, result.IO.Close())
+	assert.Equal(t, int32(1), cancels.Load())
+	require.NoError(t, result.IO.Close())
+	assert.Equal(t, int32(1), cancels.Load())
+}
+
+func TestPlanFilesCancelsAfterTaskDecodeFailure(t *testing.T) {
+	t.Parallel()
+
+	var cancels atomic.Int32
+	cat := newScanPlanningTestCatalog(t, []endpoint{
+		endpointPlanTableScan,
+		endpointFetchScanTasks,
+		endpointCancelPlanning,
+	}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","plan-tasks":["h1"]}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if !assert.NoError(t, json.NewDecoder(req.Body).Decode(&body)) {
+				return
+			}
+			if !assert.Equal(t, "h1", body.PlanTask) {
+				return
+			}
+			_, err := w.Write([]byte(`{"file-scan-tasks":[{}]}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-1", func(w http.ResponseWriter, req *http.Request) {
+			if !assert.Equal(t, http.MethodDelete, req.Method) {
+				return
+			}
+			cancels.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		})
+	})
+
+	_, err := cat.PlanFiles(context.Background(), planFilesReq())
+	require.ErrorIs(t, err, ErrRESTError)
+	assert.Equal(t, int32(1), cancels.Load())
+}
+
+func TestPlanFilesCancelsAfterTerminalPollError(t *testing.T) {
+	t.Parallel()
+
+	var cancels atomic.Int32
+	cat := newScanPlanningTestCatalog(t, []endpoint{
+		endpointPlanTableScan,
+		endpointFetchPlanResult,
+		endpointCancelPlanning,
+	}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			_, err := w.Write([]byte(`{"status":"submitted","plan-id":"plan-1"}`))
+			if !assert.NoError(t, err) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan/plan-1", func(w http.ResponseWriter, req *http.Request) {
+			switch req.Method {
+			case http.MethodGet:
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			case http.MethodDelete:
+				cancels.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			}
+		})
+	})
+
+	_, err := cat.PlanFiles(context.Background(), planFilesReq())
+	require.Error(t, err)
+	assert.Equal(t, int32(1), cancels.Load())
+}
+
+func TestRemoteScanTasksUsesResolvedSchemaForResiduals(t *testing.T) {
+	t.Parallel()
+
+	decoderMetadata := newScanTaskDecoderMetadata()
+	oldSchema := decoderMetadata.schema
+	currentFields := append([]iceberg.NestedField(nil), oldSchema.Fields()...)
+	currentFields[1].Name = "new_category"
+	currentSchema := iceberg.NewSchema(11, currentFields...)
+	metadata := scanPlanningSchemaMetadata{
+		scanTaskDecoderMetadata: decoderMetadata,
+		current:                 currentSchema,
+		schemas:                 []*iceberg.Schema{currentSchema, oldSchema},
+	}
+	req := table.ScanPlanningRequest{
+		Metadata: metadata,
+		Schema:   oldSchema,
+		RowFilter: iceberg.GreaterThan(
+			iceberg.Reference("category"),
+			"old",
+		),
+	}
+	wireReq, err := planTableScanRequestFrom(req)
+	require.NoError(t, err)
+
+	wire := validScanTasksWire()
+	wire.FileScanTasks[0].ResidualFilter = wireReq.Filter
+	tasks, err := remoteScanTasks([]ScanTasks{wire}, req)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.True(t, tasks[0].Residual.Equals(req.RowFilter))
+}
+
+// TestPlanFilesDecodesFanoutTaskEnvelopes exercises the Phase 5 boundary from
+// REST wire tasks to table.FileScanTask. In particular, each fetchScanTasks
+// response has its own delete-file reference namespace; decoding after
+// flattening the responses would attach the second task to the first delete.
+func TestPlanFilesDecodesFanoutTaskEnvelopes(t *testing.T) {
+	t.Parallel()
+
+	first := validScanTasksWire()
+	first.FileScanTasks[0].DataFile.FilePath = "s3://bucket/table/first-data.parquet"
+	first.DeleteFiles[0].FilePath = "s3://bucket/table/first-delete.parquet"
+	first.PlanTasks = []string{"h1"}
+
+	second := validScanTasksWire()
+	second.FileScanTasks[0].DataFile.FilePath = "s3://bucket/table/second-data.parquet"
+	second.DeleteFiles[0].FilePath = "s3://bucket/table/second-delete.parquet"
+
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan, endpointFetchScanTasks}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
+			response := struct {
+				Status PlanStatus `json:"status"`
+				PlanID string     `json:"plan-id"`
+				ScanTasks
+			}{
+				Status:    PlanStatusCompleted,
+				PlanID:    "plan-1",
+				ScanTasks: first,
+			}
+			if !assert.NoError(t, json.NewEncoder(w).Encode(response)) {
+				return
+			}
+		})
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var got FetchScanTasksRequest
+			if !assert.NoError(t, json.NewDecoder(req.Body).Decode(&got)) {
+				return
+			}
+			if !assert.Equal(t, "h1", got.PlanTask) {
+				return
+			}
+			if !assert.NoError(t, json.NewEncoder(w).Encode(FetchScanTasksResponse{ScanTasks: second})) {
+				return
+			}
+		})
+	})
+
+	req := planFilesReq()
+	req.Metadata = newScanTaskDecoderMetadata()
+	req.RowFilter = iceberg.GreaterThan(iceberg.Reference("id"), int64(10))
+
+	result, err := cat.PlanFiles(context.Background(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Tasks, 2)
+	assert.Equal(t, "s3://bucket/table/first-data.parquet", result.Tasks[0].File.FilePath())
+	assert.Equal(t, "s3://bucket/table/first-delete.parquet", result.Tasks[0].DeleteFiles[0].FilePath())
+	assert.Equal(t, "s3://bucket/table/second-data.parquet", result.Tasks[1].File.FilePath())
+	assert.Equal(t, "s3://bucket/table/second-delete.parquet", result.Tasks[1].DeleteFiles[0].FilePath())
+	assert.Same(t, req.RowFilter, result.Tasks[0].Residual)
+}
+
 // TestPlanFilesSurfacesVendedCredentials checks a plan that vends storage
-// credentials yields a plan-scoped IO that keeps the catalog's IO props (the
+// credentials yields a plan-scoped IO that keeps the table's IO props (the
 // custom endpoint here) rather than running on the vended creds alone, with the
 // vended values winning where they overlap.
 func TestPlanFilesSurfacesVendedCredentials(t *testing.T) {
@@ -1103,27 +1871,39 @@ func TestPlanFilesSurfacesVendedCredentials(t *testing.T) {
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"completed","plan-id":"plan-1","storage-credentials":[{"prefix":"s3://bucket/","config":{"s3.access-key-id":"vended"}}]}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
-	cat.props["s3.endpoint"] = "https://minio.local"
-	cat.props["s3.access-key-id"] = "static"
+	cat.props["s3.endpoint"] = "https://catalog.local"
+	cat.props["s3.access-key-id"] = "catalog-static"
 
 	req := planFilesReq()
 	req.MetadataLocation = "s3://bucket/db/tbl/metadata/v1.json"
+	req.FileIOProperties = iceberg.Properties{
+		"s3.endpoint":      "https://table.local",
+		"s3.access-key-id": "table-static",
+	}
 
 	result, err := cat.PlanFiles(context.Background(), req)
 	require.NoError(t, err)
 	require.NotNil(t, result.IO)
 
-	planIO, ok := result.IO.(*planScopedIO)
+	wrapped, ok := result.IO.(*planIOWithCleanup)
 	require.True(t, ok)
-	assert.Equal(t, "https://minio.local", planIO.refresher.props["s3.endpoint"])
-	assert.Equal(t, "vended", planIO.refresher.props["s3.access-key-id"])
+	planIO, ok := wrapped.io.(*planScopedIO)
+	require.True(t, ok)
+	assert.Equal(t, "https://table.local", planIO.refresher.props["s3.endpoint"])
+	assert.Equal(t, "table-static", planIO.refresher.props["s3.access-key-id"])
+	require.Len(t, planIO.refresher.credentials, 1)
+	assert.Equal(t, "vended", planIO.refresher.credentials[0].Config["s3.access-key-id"])
+	require.NoError(t, result.IO.Close())
 }
 
 // TestPlanScopedIOExpiredCredentials checks a plan whose creds state an expiry
-// fails loudly once past it, since plan creds can't be renewed.
+// fails loudly for a matching location once past it, since plan creds can't be
+// renewed.
 func TestPlanScopedIOExpiredCredentials(t *testing.T) {
 	t.Parallel()
 
@@ -1144,20 +1924,26 @@ func TestPlanScopedIOExpiredCredentials(t *testing.T) {
 	require.True(t, ok)
 	p.refresher.nowFunc = func() time.Time { return now }
 
-	// The first load caches an IO and picks up the stated expiry.
+	// The first load caches the prefix resolver rather than treating the plan's
+	// location-specific credentials as one global credential set.
 	fs, err := p.Load(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, fs)
-	assert.Equal(t, now.Add(time.Hour).UnixMilli(), p.refresher.expiresAt.UnixMilli())
+	assert.True(t, p.refresher.expiresAt.IsZero())
+	prefixIO, ok := fs.(*prefixScopedIO)
+	require.True(t, ok)
+	_, err = prefixIO.filesystemFor("file:///bucket/data.parquet")
+	require.NoError(t, err)
 
-	// Past the expiry, with no endpoint to renew from, the load fails.
+	// Past the expiry, access under the credential's prefix fails even though
+	// its filesystem was already cached.
 	p.refresher.nowFunc = func() time.Time { return now.Add(2 * time.Hour) }
-	_, err = p.Load(context.Background())
+	_, err = prefixIO.filesystemFor("file:///bucket/data.parquet")
 	require.ErrorIs(t, err, ErrVendedCredentialsExpired)
 }
 
 // TestPlanScopedIOAlreadyExpiredCredentials checks creds that are already past
-// their expiry on the very first load fail loudly instead of yielding an IO.
+// their expiry fail loudly when a matching location is first opened.
 func TestPlanScopedIOAlreadyExpiredCredentials(t *testing.T) {
 	t.Parallel()
 
@@ -1174,7 +1960,43 @@ func TestPlanScopedIOAlreadyExpiredCredentials(t *testing.T) {
 	require.True(t, ok)
 	p.refresher.nowFunc = func() time.Time { return now }
 
-	_, err := p.Load(context.Background())
+	fs, err := p.Load(context.Background())
+	require.NoError(t, err)
+	_, err = fs.Open("file:///bucket/data.parquet")
+	require.ErrorIs(t, err, ErrVendedCredentialsExpired)
+}
+
+func TestPlanScopedIOIgnoresExpiredCredentialForUnrelatedPrefix(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	creds := []StorageCredential{
+		{
+			Prefix: "file:///archive/",
+			Config: iceberg.Properties{
+				keyS3TokenExpiresAtMs: strconv.FormatInt(now.Add(-time.Hour).UnixMilli(), 10),
+			},
+		},
+		{
+			Prefix: "file:///current/",
+			Config: iceberg.Properties{
+				keyS3TokenExpiresAtMs: strconv.FormatInt(now.Add(time.Hour).UnixMilli(), 10),
+			},
+		},
+	}
+
+	p, ok := planIOFromCredentials(creds, "file:///metadata/v1.json", nil).(*planScopedIO)
+	require.True(t, ok)
+	p.refresher.nowFunc = func() time.Time { return now }
+
+	fs, err := p.Load(context.Background())
+	require.NoError(t, err)
+	prefixIO, ok := fs.(*prefixScopedIO)
+	require.True(t, ok)
+	_, err = prefixIO.filesystemFor("file:///current/data.parquet")
+	require.NoError(t, err)
+
+	_, err = prefixIO.filesystemFor("file:///archive/data.parquet")
 	require.ErrorIs(t, err, ErrVendedCredentialsExpired)
 }
 
@@ -1204,10 +2026,103 @@ func TestPlanFilesPropagatesFailure(t *testing.T) {
 	cat := newScanPlanningTestCatalog(t, []endpoint{endpointPlanTableScan}, func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/namespaces/db/tables/tbl/plan", func(w http.ResponseWriter, req *http.Request) {
 			_, err := w.Write([]byte(`{"status":"failed","error":{"message":"boom","type":"ServerError","code":500}}`))
-			require.NoError(t, err)
+			if !assert.NoError(t, err) {
+				return
+			}
 		})
 	})
 
 	_, err := cat.PlanFiles(context.Background(), planFilesReq())
 	require.ErrorIs(t, err, ErrPlanFailed)
+}
+
+func TestCollectScanTasksDeduplicatesAcrossFrontiers(t *testing.T) {
+	t.Parallel()
+
+	children := map[string][]string{
+		"a": {"c", "d", "a"},
+		"b": {"d", "e"},
+		"c": {"b"},
+	}
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+			mu.Lock()
+			calls[body.PlanTask]++
+			mu.Unlock()
+			response := ScanTasks{
+				PlanTasks: children[body.PlanTask],
+				FileScanTasks: []RESTFileScanTask{{DataFile: &RESTDataFile{
+					RESTContentFile: RESTContentFile{FilePath: body.PlanTask},
+				}}},
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		})
+	})
+
+	envelopes, err := cat.collectScanTasksWithConcurrency(t.Context(), table.Identifier{"db", "tbl"}, ScanTasks{
+		PlanTasks: []string{"a", "a", "b"},
+	}, 2)
+	require.NoError(t, err)
+	require.Len(t, envelopes, 6)
+	for i, name := range []string{"a", "b", "c", "d", "e"} {
+		require.Len(t, envelopes[i+1].FileScanTasks, 1)
+		assert.Equal(t, name, envelopes[i+1].FileScanTasks[0].DataFile.FilePath)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, map[string]int{"a": 1, "b": 1, "c": 1, "d": 1, "e": 1}, calls)
+}
+
+func TestCollectScanTasksCancelsSiblingRequestsOnFailure(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cat := newScanPlanningTestCatalog(t, []endpoint{endpointFetchScanTasks}, func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/namespaces/db/tables/tbl/tasks", func(w http.ResponseWriter, req *http.Request) {
+			var body FetchScanTasksRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+			switch body.PlanTask {
+			case "slow":
+				close(started)
+				<-req.Context().Done()
+				close(cancelled)
+			case "failed":
+				select {
+				case <-started:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":{"message":"invalid handle","type":"BadRequestException","code":400}}`))
+				case <-req.Context().Done():
+				}
+			default:
+				http.Error(w, "unexpected handle", http.StatusBadRequest)
+			}
+		})
+	})
+
+	envelopes, err := cat.collectScanTasksWithConcurrency(ctx, table.Identifier{"db", "tbl"}, ScanTasks{
+		PlanTasks: []string{"failed", "slow"},
+	}, 2)
+	require.ErrorIs(t, err, ErrBadRequest)
+	assert.Nil(t, envelopes)
+	select {
+	case <-cancelled:
+	case <-ctx.Done():
+		t.Fatal("sibling request was not cancelled after a fetch failure")
+	}
 }

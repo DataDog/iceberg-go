@@ -19,21 +19,77 @@ package table_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
 	"github.com/DataDog/iceberg-go/table/compaction"
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type partialProgressCatalog struct {
+	metadata  table.Metadata
+	failOn    int
+	unknownOn int
+	calls     int
+}
+
+func (c *partialProgressCatalog) LoadTable(context.Context, table.Identifier) (*table.Table, error) {
+	return nil, nil
+}
+
+func (c *partialProgressCatalog) CommitTable(_ context.Context, _ table.Identifier, _ []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	c.calls++
+	if c.failOn > 0 && c.calls == c.failOn {
+		return nil, "", fmt.Errorf("%w: injected partial progress commit failure", table.ErrCommitFailed)
+	}
+
+	meta, err := table.UpdateTableMetadata(c.metadata, updates, "")
+	if err != nil {
+		return nil, "", err
+	}
+	c.metadata = meta
+	if c.unknownOn > 0 && c.calls == c.unknownOn {
+		return meta, "", errors.New("injected unknown commit state")
+	}
+
+	return meta, "", nil
+}
+
+func newPartialProgressTestTable(t *testing.T) (*table.Table, *partialProgressCatalog) {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	meta, err := table.NewMetadata(schema, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, location,
+		iceberg.Properties{table.PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+
+	cat := &partialProgressCatalog{metadata: meta}
+	tbl := table.New(
+		table.Identifier{"db", "partial_progress_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		cat,
+	)
+
+	return tbl, cat
+}
 
 func newRewriteTestTable(t *testing.T) *table.Table {
 	t.Helper()
@@ -103,6 +159,13 @@ func runRewriteWithCleanup(t *testing.T, tbl *table.Table, groups []table.Compac
 
 	result, err := tx.RewriteDataFiles(t.Context(), groups, rewriteOpts)
 	require.NoError(t, err)
+	if partialProgress {
+		require.NotNil(t, result.Table)
+		_, err := tx.Commit(t.Context())
+		require.Error(t, err, "partial progress is terminal and must not make the parent Commit idempotent")
+
+		return result, result.Table
+	}
 
 	out, err := tx.Commit(t.Context())
 	require.NoError(t, err)
@@ -241,6 +304,12 @@ func TestRewriteDataFiles_EmptyPlan(t *testing.T) {
 	assert.Equal(t, 0, result.AddedDataFiles)
 	assert.Equal(t, 0, result.RemovedDataFiles)
 	assert.Equal(t, int64(0), result.BytesBefore)
+
+	partialTx := tbl.NewTransaction()
+	partialResult, err := partialTx.RewriteDataFiles(t.Context(), nil,
+		table.RewriteDataFilesOptions{PartialProgress: true})
+	require.NoError(t, err)
+	assert.Equal(t, tbl.Location(), partialResult.Table.Location())
 }
 
 // TestExecuteCompactionGroup_TargetFileSizeForwarded verifies that
@@ -291,6 +360,71 @@ func TestExecuteCompactionGroup_TargetFileSizeForwarded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, withDefault.NewDataFiles, 1,
 		"without the option, the same group consolidates into a single file")
+}
+
+// TestExecuteCompactionGroup_ParquetRowGroupLimitForwarded verifies
+// that WithCompactionParquetRowGroupLimit reaches the underlying
+// WriteRecords call: with the limit set, no output row group may
+// exceed it, while the no-option baseline packs all rows into one.
+// It doubles as the end-to-end pin for the option-forwarding block in
+// ExecuteCompactionGroup (the row-group limit is the cheapest
+// observable of the three forwarded tuning options).
+func TestExecuteCompactionGroup_ParquetRowGroupLimitForwarded(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	var rows strings.Builder
+	rows.WriteString("[")
+	for i := range 100 {
+		if i > 0 {
+			rows.WriteString(",")
+		}
+		fmt.Fprintf(&rows, `{"id": %d, "data": "row-%d"}`, i+1, i+1)
+	}
+	rows.WriteString("]")
+
+	dataPath := tbl.Location() + "/data/rg-limit.parquet"
+	writeParquetFile(t, dataPath, arrowSc, rows.String())
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+
+	group := table.CompactionTaskGroup{
+		PartitionKey:   "single",
+		Tasks:          []table.FileScanTask{tasks[0]},
+		TotalSizeBytes: tasks[0].File.FileSizeBytes(),
+	}
+
+	withLimit, err := table.ExecuteCompactionGroup(t.Context(), tbl, group,
+		table.WithCompactionParquetRowGroupLimit(10))
+	require.NoError(t, err)
+	require.Len(t, withLimit.NewDataFiles, 1)
+
+	limited, err := file.OpenParquetFile(strings.TrimPrefix(withLimit.NewDataFiles[0].FilePath(), "file://"), false)
+	require.NoError(t, err)
+	defer limited.Close()
+	assert.GreaterOrEqual(t, limited.NumRowGroups(), 10,
+		"100 rows with a 10-row limit need at least 10 row groups")
+	for rg := range limited.NumRowGroups() {
+		assert.LessOrEqual(t, limited.RowGroup(rg).NumRows(), int64(10))
+	}
+
+	baseline, err := table.ExecuteCompactionGroup(t.Context(), tbl, group)
+	require.NoError(t, err)
+	require.Len(t, baseline.NewDataFiles, 1)
+
+	unlimited, err := file.OpenParquetFile(strings.TrimPrefix(baseline.NewDataFiles[0].FilePath(), "file://"), false)
+	require.NoError(t, err)
+	defer unlimited.Close()
+	assert.Equal(t, 1, unlimited.NumRowGroups(),
+		"without the option, 100 rows fit in one row group")
 }
 
 // TestExecuteCompactionGroup_ScanConcurrencyForwarded is a smoke test
@@ -392,6 +526,14 @@ func TestRewriteDataFiles_EmptyGroupSkipped(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, 0, result.RewrittenGroups)
+
+	tx = tbl.NewTransaction()
+	_, err = tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+		MaxCommits:      -1,
+	})
+	require.ErrorIs(t, err, table.ErrInvalidOperation)
+	assert.Contains(t, err.Error(), "MaxCommits")
 }
 
 func TestRewriteDataFiles_PartialProgress(t *testing.T) {
@@ -418,11 +560,416 @@ func TestRewriteDataFiles_PartialProgress(t *testing.T) {
 	plan, err := defaultTestCompactionCfg.PlanCompaction(tasks)
 	require.NoError(t, err)
 
-	result, tbl := runRewriteWithCleanup(t, tbl, toTaskGroups(plan.Groups), true)
+	plannedGroups := toTaskGroups(plan.Groups)
+	require.NotEmpty(t, plannedGroups)
+	// Split the planned group so the test can distinguish one durable snapshot
+	// per group from one snapshot containing all staged rewrites.
+	first := plannedGroups[0]
+	require.GreaterOrEqual(t, len(first.Tasks), 2)
+	mid := len(first.Tasks) / 2
+	groups := []table.CompactionTaskGroup{
+		{PartitionKey: first.PartitionKey + "/a", Tasks: first.Tasks[:mid], TotalSizeBytes: first.TotalSizeBytes / 2},
+		{PartitionKey: first.PartitionKey + "/b", Tasks: first.Tasks[mid:], TotalSizeBytes: first.TotalSizeBytes - first.TotalSizeBytes/2},
+	}
+	groups = append(groups, plannedGroups[1:]...)
+	beforeSnapshots := len(tbl.Metadata().Snapshots())
+
+	result, tbl := runRewriteWithCleanup(t, tbl, groups, true)
 
 	assertRowCount(t, tbl, 6)
 	assert.Greater(t, result.RewrittenGroups, 0)
+	assert.Len(t, result.CompletedGroups, result.RewrittenGroups)
+	assert.Same(t, tbl, result.Table)
 	assert.Equal(t, 6, result.RemovedDataFiles)
+	assert.Equal(t, beforeSnapshots+result.RewrittenGroups, len(tbl.Metadata().Snapshots()))
+}
+
+func TestRewriteDataFiles_PartialProgressMaxCommitsProcessesAllGroups(t *testing.T) {
+	tbl := newRewriteTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 3 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/max-commit-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "row"}]`, i+1))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 3)
+	groups := make([]table.CompactionTaskGroup, 0, len(tasks))
+	for i, task := range tasks {
+		groups = append(groups, table.CompactionTaskGroup{
+			PartitionKey:   fmt.Sprintf("group-%d", i),
+			Tasks:          []table.FileScanTask{task},
+			TotalSizeBytes: task.File.FileSizeBytes(),
+		})
+	}
+
+	beforeSnapshots := len(tbl.Metadata().Snapshots())
+	tx := tbl.NewTransaction()
+	result, err := tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+		MaxCommits:      2,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, result.RewrittenGroups,
+		"MaxCommits limits durable snapshots, not the number of groups processed")
+	assert.Len(t, result.CompletedGroups, 3)
+	assert.Equal(t, beforeSnapshots+2, len(result.Table.Metadata().Snapshots()))
+	assertRowCount(t, result.Table, 3)
+}
+
+func TestRewriteDataFiles_PartialProgressRejectsCommittedParentReuse(t *testing.T) {
+	tbl, cat := newPartialProgressTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	dataPath := tbl.Location() + "/data/reuse.parquet"
+	writeParquetFile(t, dataPath, arrowSc, `[{"id": 1, "data": "row"}]`)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	groups := []table.CompactionTaskGroup{{
+		PartitionKey:   "reuse",
+		Tasks:          []table.FileScanTask{tasks[0]},
+		TotalSizeBytes: tasks[0].File.FileSizeBytes(),
+	}}
+
+	tx = tbl.NewTransaction()
+	_, err = tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+	})
+	require.NoError(t, err)
+	calls := cat.calls
+
+	result, err := tx.RewriteDataFiles(t.Context(), nil, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+	})
+	require.ErrorContains(t, err, "transaction has already been committed")
+	assert.Nil(t, result)
+	assert.Equal(t, calls, cat.calls, "an empty reused parent must be rejected before another catalog commit")
+
+	result, err = tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+	})
+	require.ErrorContains(t, err, "transaction has already been committed")
+	assert.Nil(t, result)
+	assert.Equal(t, calls, cat.calls, "a reused parent must be rejected before another catalog commit")
+}
+
+func TestRewriteDataFiles_PartialProgressStopsOnUnknownCommitState(t *testing.T) {
+	tbl, cat := newPartialProgressTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 2 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/unknown-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc,
+			fmt.Sprintf(`[{"id": %d, "data": "row"}, {"id": %d, "data": "row"}]`, i*2+1, i*2+2))
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	groups := []table.CompactionTaskGroup{
+		{PartitionKey: "unknown-0", Tasks: []table.FileScanTask{tasks[0]}, TotalSizeBytes: tasks[0].File.FileSizeBytes()},
+		{PartitionKey: "unknown-1", Tasks: []table.FileScanTask{tasks[1]}, TotalSizeBytes: tasks[1].File.FileSizeBytes()},
+	}
+
+	cat.unknownOn = cat.calls + 1
+	tx := tbl.NewTransaction()
+	result, err := tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+		MaxCommits:      2,
+	})
+	require.ErrorContains(t, err, "unknown commit state")
+	require.NotNil(t, result)
+	assert.Zero(t, result.RewrittenGroups)
+	assert.Equal(t, 1, len(cat.metadata.Snapshots())-len(tbl.Metadata().Snapshots()))
+	assert.Equal(t, cat.unknownOn, cat.calls, "later groups must not be planned after an unknown commit")
+	_, commitErr := tx.Commit(t.Context())
+	assert.Error(t, commitErr, "the parent transaction must remain terminal after an unknown commit")
+}
+
+func TestRewriteDataFiles_PartialProgressRetainsSharedPositionDeleteAfterFailure(t *testing.T) {
+	tbl, cat := newPartialProgressTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 2 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/shared-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc, fmt.Sprintf(
+			`[{"id": %d, "data": "a"}, {"id": %d, "data": "b"}]`, i*2+1, i*2+2))
+
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	// This partition-scoped position delete targets both data files. The first
+	// partial batch must not remove it while the second data file is still live.
+	posDelPath := tbl.Location() + "/data/shared-position-delete.parquet"
+	writeParquetFile(t, posDelPath, table.PositionalDeleteArrowSchema, fmt.Sprintf(
+		`[{"file_path": "%s", "pos": 0}, {"file_path": "%s", "pos": 0}]`,
+		tbl.Location()+"/data/shared-0.parquet", tbl.Location()+"/data/shared-1.parquet"))
+	posDelBuilder, err := iceberg.NewDataFileBuilder(
+		*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+		posDelPath, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+	require.NoError(t, err)
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.NewRowDelta(nil).AddDeletes(posDelBuilder.Build()).Commit(t.Context()))
+	tbl, err = tx.Commit(t.Context())
+	require.NoError(t, err)
+	assertRowCount(t, tbl, 2)
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	groups := make([]table.CompactionTaskGroup, 0, len(tasks))
+	for i, task := range tasks {
+		groups = append(groups, table.CompactionTaskGroup{
+			PartitionKey:   fmt.Sprintf("shared-group-%d", i),
+			Tasks:          []table.FileScanTask{task},
+			TotalSizeBytes: task.File.FileSizeBytes(),
+		})
+	}
+
+	// The first batch commits; the second batch fails. One tolerated failure
+	// must still return a successful result and leave its old data plus delete
+	// file in the table.
+	beforeFiles := parquetFiles(t, tbl.Location())
+	cat.failOn = cat.calls + 2
+	tx = tbl.NewTransaction()
+	result, err := tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress:  true,
+		MaxCommits:       2,
+		MaxFailedCommits: 1,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.RewrittenGroups)
+	require.Len(t, result.CompletedGroups, 1)
+	require.Len(t, result.FailedGroups, 1)
+	assert.Equal(t, 1, len(result.Table.Metadata().Snapshots())-len(tbl.Metadata().Snapshots()))
+
+	// The row deleted from the failed group's data file must remain hidden.
+	// If the shared position delete were removed by the first batch, this would
+	// be three rows instead of two.
+	assertRowCount(t, result.Table, 2)
+	newTasks, err := result.Table.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	var remainingPositionDeletes int
+	for _, task := range newTasks {
+		remainingPositionDeletes += len(task.DeleteFiles)
+	}
+	assert.Greater(t, remainingPositionDeletes, 0,
+		"a shared position delete must remain while a referenced data file survives")
+
+	expectedFiles := append([]string{}, beforeFiles...)
+	for _, completed := range result.CompletedGroups {
+		for _, file := range completed.NewDataFiles {
+			expectedFiles = append(expectedFiles, file.FilePath())
+		}
+	}
+	assert.ElementsMatch(t, expectedFiles, parquetFiles(t, tbl.Location()),
+		"generated files from tolerated failed batches must be removed")
+}
+
+func TestRewriteDataFiles_PartialProgressCleansOutputsBeforeCommit(t *testing.T) {
+	tbl, _ := newPartialProgressTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+
+	for i := range 2 {
+		dataPath := tbl.Location() + fmt.Sprintf("/data/precommit-%d.parquet", i)
+		writeParquetFile(t, dataPath, arrowSc, fmt.Sprintf(
+			`[{"id": %d, "data": "row"}]`, i+1))
+
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.AddFiles(t.Context(), []string{dataPath}, nil, false))
+		tbl, err = tx.Commit(t.Context())
+		require.NoError(t, err)
+	}
+
+	tasks, err := tbl.Scan().PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	groups := []table.CompactionTaskGroup{
+		{PartitionKey: "precommit-0", Tasks: []table.FileScanTask{tasks[0]}, TotalSizeBytes: tasks[0].File.FileSizeBytes()},
+		{PartitionKey: "precommit-1", Tasks: []table.FileScanTask{tasks[1]}, TotalSizeBytes: tasks[1].File.FileSizeBytes()},
+	}
+
+	// The first group writes an output before the second group fails while
+	// reading its source. Both groups are in one batch, so the output from the
+	// first group must be removed before the rewrite returns the read error.
+	missingPath := tasks[1].File.FilePath()
+	require.NoError(t, os.Remove(missingPath))
+	expectedFiles := parquetFiles(t, tbl.Location())
+
+	tx := tbl.NewTransaction()
+	result, err := tx.RewriteDataFiles(t.Context(), groups, table.RewriteDataFilesOptions{
+		PartialProgress: true,
+		MaxCommits:      1,
+	})
+	require.Error(t, err)
+	require.NotNil(t, result)
+	assert.Empty(t, result.CompletedGroups)
+	assert.ElementsMatch(t, expectedFiles, parquetFiles(t, tbl.Location()),
+		"outputs from groups written before a pre-commit failure must be removed")
+}
+
+func parquetFiles(t *testing.T, location string) []string {
+	t.Helper()
+
+	paths, err := filepath.Glob(filepath.Join(location, "data", "*.parquet"))
+	require.NoError(t, err)
+
+	return paths
+}
+
+func newPartialProgressPartitionedTable(t *testing.T) *table.Table {
+	t.Helper()
+
+	location := filepath.ToSlash(t.TempDir())
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "data", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2}, FieldID: 1000, Transform: iceberg.IdentityTransform{}, Name: "data",
+	})
+	meta, err := table.NewMetadata(schema, &spec, table.UnsortedSortOrder, location,
+		iceberg.Properties{table.PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+
+	cat := &partialProgressCatalog{metadata: meta}
+
+	return table.New(
+		table.Identifier{"db", "partial_progress_branch_test"},
+		meta, location+"/metadata/v1.metadata.json",
+		func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil },
+		cat,
+	)
+}
+
+func addPartitionedRowsOnRef(t *testing.T, tbl *table.Table, ref, name, partition string, ids ...int64) *table.Table {
+	t.Helper()
+
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Schema(), nil, false, false)
+	require.NoError(t, err)
+	rows := make([]string, len(ids))
+	for i, id := range ids {
+		rows[i] = fmt.Sprintf(`{"id": %d, "data": "%s"}`, id, partition)
+	}
+	dataPath := tbl.Location() + "/data/" + name + ".parquet"
+	writeParquetFile(t, dataPath, arrowSc, "["+strings.Join(rows, ",")+"]")
+	info, err := os.Stat(dataPath)
+	require.NoError(t, err)
+
+	txn, err := tbl.NewTransactionOnBranchWithError(ref)
+	require.NoError(t, err)
+	builder, err := iceberg.NewDataFileBuilder(
+		tbl.Spec(), iceberg.EntryContentData, dataPath, iceberg.ParquetFile,
+		map[int]any{1000: partition}, nil, nil, int64(len(ids)), info.Size())
+	require.NoError(t, err)
+	require.NoError(t, txn.AddDataFiles(t.Context(), []iceberg.DataFile{builder.Build()}, nil))
+	committed, err := txn.Commit(t.Context())
+	require.NoError(t, err)
+
+	return committed
+}
+
+func TestRewriteDataFiles_PartialProgressUsesTargetBranchSnapshot(t *testing.T) {
+	const branch = "feature"
+	tbl := newPartialProgressPartitionedTable(t)
+	tbl = addPartitionedRowsOnRef(t, tbl, table.MainBranch, "main-0", "main", 1, 2)
+	tbl = addPartitionedRowsOnRef(t, tbl, branch, "branch-0", "branch", 3, 4)
+	tbl = addPartitionedRowsOnRef(t, tbl, table.MainBranch, "main-1", "main", 5, 6)
+	tbl = addPartitionedRowsOnRef(t, tbl, branch, "branch-1", "branch", 7, 8)
+
+	mainPaths, _ := liveFilesOnRef(t, tbl, table.MainBranch)
+	branchPaths, _ := liveFilesOnRef(t, tbl, branch)
+	mainPathSet := make(map[string]struct{}, len(mainPaths))
+	for _, path := range mainPaths {
+		mainPathSet[path] = struct{}{}
+	}
+	branchOnly := make([]string, 0, 2)
+	for _, path := range branchPaths {
+		if _, ok := mainPathSet[path]; !ok {
+			branchOnly = append(branchOnly, path)
+		}
+	}
+	require.Len(t, branchOnly, 2)
+
+	posDelPath := tbl.Location() + "/data/branch-position-delete.parquet"
+	writeParquetFile(t, posDelPath, table.PositionalDeleteArrowSchema, fmt.Sprintf(
+		`[{"file_path": %q, "pos": 0}, {"file_path": %q, "pos": 0}]`,
+		branchOnly[0], branchOnly[1]))
+	info, err := os.Stat(posDelPath)
+	require.NoError(t, err)
+	delBuilder, err := iceberg.NewDataFileBuilder(
+		tbl.Spec(), iceberg.EntryContentPosDeletes, posDelPath, iceberg.ParquetFile,
+		map[int]any{1000: "branch"}, nil, nil, 2, info.Size())
+	require.NoError(t, err)
+	txn, err := tbl.NewTransactionOnBranchWithError(branch)
+	require.NoError(t, err)
+	require.NoError(t, txn.NewRowDelta(nil).AddDeletes(delBuilder.Build()).Commit(t.Context()))
+	tbl, err = txn.Commit(t.Context())
+	require.NoError(t, err)
+
+	scan := tbl.Scan()
+	scan, err = scan.UseRef(branch)
+	require.NoError(t, err)
+	tasks, err := scan.PlanFiles(t.Context())
+	require.NoError(t, err)
+	var rewriteTask table.FileScanTask
+	for _, task := range tasks {
+		if task.File.FilePath() == branchOnly[0] {
+			rewriteTask = task
+
+			break
+		}
+	}
+	require.NotNil(t, rewriteTask.File)
+
+	txn, err = tbl.NewTransactionOnBranchWithError(branch)
+	require.NoError(t, err)
+	result, err := txn.RewriteDataFiles(t.Context(), []table.CompactionTaskGroup{{
+		PartitionKey:   "branch",
+		Tasks:          []table.FileScanTask{rewriteTask},
+		TotalSizeBytes: rewriteTask.File.FileSizeBytes(),
+	}}, table.RewriteDataFilesOptions{PartialProgress: true})
+	require.NoError(t, err)
+	require.NotNil(t, result.Table)
+
+	assert.Equal(t, []int64{1, 2, 4, 8}, idsOnRef(t, result.Table, branch),
+		"a branch-only survivor must keep its partition-scoped delete after another branch file is rewritten")
+	branchScan := result.Table.Scan()
+	branchScan, err = branchScan.UseRef(branch)
+	require.NoError(t, err)
+	remainingTasks, err := branchScan.PlanFiles(t.Context())
+	require.NoError(t, err)
+	var remainingDeletes int
+	for _, task := range remainingTasks {
+		remainingDeletes += len(task.DeleteFiles)
+	}
+	assert.Greater(t, remainingDeletes, 0, "the branch position delete must remain live")
 }
 
 func TestRewriteDataFiles_ContextCancellation(t *testing.T) {
@@ -517,7 +1064,7 @@ func TestRewriteDataFiles_DeadEqualityDeletesDropped(t *testing.T) {
 	for rec, err := range itr {
 		require.NoError(t, err)
 		col := rec.Column(0).(*array.Int64)
-		for i := 0; i < col.Len(); i++ {
+		for i := range col.Len() {
 			ids = append(ids, col.Value(i))
 		}
 		rec.Release()
@@ -543,7 +1090,7 @@ func TestRewriteDataFiles_DeadEqualityDeletesDropped(t *testing.T) {
 //
 //	commit 1: small-0.parquet      (data, will survive — low seq)
 //	commit 2: small-1.parquet      (data, will survive — low seq)
-//	commit 3: eq-delete (id=99)    (eq-delete; seq > both small files)
+//	commit 3: eq-delete (id=1)     (eq-delete; seq > both small files)
 //	commit 4: preserve.parquet     (data, will be rewritten — high seq)
 //
 // The post-rewrite check: eq-delete must remain because small-0/1
@@ -567,7 +1114,7 @@ func TestRewriteDataFiles_PartialRewritePreservesEqDelete(t *testing.T) {
 	}
 
 	// commit 3: eq-delete.
-	tbl = appendEqualityDelete(t, tbl, []int{1}, `[{"id": 99}]`)
+	tbl = appendEqualityDelete(t, tbl, []int{1}, `[{"id": 1}]`)
 
 	// commit 4: preserve.parquet — the high-seq file we'll compact alone.
 	preserveDataPath := tbl.Location() + "/data/preserve.parquet"

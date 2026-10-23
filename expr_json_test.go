@@ -277,6 +277,62 @@ func TestMarshalExpressionNonFiniteFloat(t *testing.T) {
 	}
 }
 
+// TestMarshalExpressionExtractNotSerializable proves an extract term errors on JSON
+// marshal (both unbound and bound) rather than silently encoding to "term":{}.
+func TestMarshalExpressionExtractNotSerializable(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}},
+	)
+
+	unbound := iceberg.LiteralPredicate(iceberg.OpEQ,
+		iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64), iceberg.NewLiteral(int64(5)))
+	_, err := json.Marshal(unbound)
+	require.ErrorIs(t, err, iceberg.ErrExtractNotSerializable)
+
+	bound, err := iceberg.BindExpr(schema, unbound, true)
+	require.NoError(t, err)
+	_, err = json.Marshal(bound)
+	require.ErrorIs(t, err, iceberg.ErrExtractNotSerializable)
+}
+
+// TestSanitizeExpressionExtractCollapses proves an unbound extract term collapses to always-true so the sanitized scan-report filter still marshals.
+func TestSanitizeExpressionExtractCollapses(t *testing.T) {
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+
+	sanitized, err := iceberg.SanitizeExpression(
+		iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5))))
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, sanitized)
+	_, err = json.Marshal(sanitized)
+	require.NoError(t, err)
+
+	mixed := iceberg.NewAnd(
+		iceberg.EqualTo(iceberg.Reference("id"), int32(5)),
+		iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5))))
+	sanitized, err = iceberg.SanitizeExpression(mixed)
+	require.NoError(t, err)
+	raw, err := json.Marshal(sanitized)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"id"`, "the non-extract predicate survives in the sanitized filter")
+
+	schema := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "payload", Type: iceberg.VariantType{}})
+	boundExt, err := iceberg.BindExpr(schema,
+		iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5))), true)
+	require.NoError(t, err)
+	sanitizedBound, err := iceberg.SanitizeExpression(boundExt)
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, sanitizedBound)
+
+	negated, err := iceberg.SanitizeExpression(
+		iceberg.NewNot(iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(5)))))
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, negated)
+
+	negatedBound, err := iceberg.SanitizeExpression(iceberg.NewNot(boundExt))
+	require.NoError(t, err)
+	assert.Equal(t, iceberg.AlwaysTrue{}, negatedBound)
+}
+
 func mustLit(t *testing.T, s string, typ iceberg.Type) iceberg.Literal {
 	t.Helper()
 	lit, err := iceberg.NewLiteral(s).To(typ)
@@ -432,10 +488,23 @@ func TestExpressionTransformTermRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Truef(t, parsed.Equals(reparsed), "want %s, got %s", parsed, reparsed)
 
-	// Binding a predicate over a transform term isn't supported yet, but it must
-	// fail cleanly rather than panic.
-	_, err = iceberg.BindExpr(schema, parsed, true)
-	require.ErrorIs(t, err, iceberg.ErrNotImplemented)
+	// Transform terms bind like regular terms and can be evaluated against rows.
+	bound, err := iceberg.BindExpr(schema, parsed, true)
+	require.NoError(t, err)
+	assert.IsType(t, iceberg.PrimitiveTypes.Int32, bound.(iceberg.BoundPredicate).Term().Type())
+
+	transform := iceberg.BucketTransform{NumBuckets: 100}
+	bucketed := transform.Apply(iceberg.Optional[iceberg.Literal]{
+		Valid: true,
+		Val:   iceberg.Int32Literal(7),
+	})
+	bucketedValue := bucketed.Val.(iceberg.TypedLiteral[int32]).Value()
+	eval, err := iceberg.ExpressionEvaluator(schema, iceberg.EqualTo(
+		iceberg.NewUnboundTransform(transform, iceberg.Reference("id")), bucketedValue), true)
+	require.NoError(t, err)
+	matched, err := eval(rowOf(int32(7)))
+	require.NoError(t, err)
+	assert.True(t, matched)
 }
 
 // TestUnboundTransformBind checks the transform term itself binds to a
@@ -448,6 +517,77 @@ func TestUnboundTransformBind(t *testing.T) {
 	bound, err := term.Bind(schema, true)
 	require.NoError(t, err)
 	assert.True(t, bound.Type().Equals(iceberg.PrimitiveTypes.Int32))
+}
+
+func TestTransformTermPointerEqualityAndProjection(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+	)
+	transform := &iceberg.BucketTransform{NumBuckets: 16}
+	pointerTerm := iceberg.NewUnboundTransform(transform, iceberg.Reference("id"))
+	valueTerm := iceberg.NewUnboundTransform(iceberg.BucketTransform{NumBuckets: 16}, iceberg.Reference("id"))
+
+	assert.True(t, pointerTerm.Equals(pointerTerm))
+	assert.True(t, pointerTerm.Equals(valueTerm))
+	assert.True(t, valueTerm.Equals(pointerTerm))
+
+	bound, err := iceberg.BindExpr(schema, iceberg.EqualTo(pointerTerm, int32(1)), true)
+	require.NoError(t, err)
+	assert.True(t, bound.Equals(bound))
+
+	predicate, ok := bound.(iceberg.BoundPredicate)
+	require.True(t, ok)
+	projected, err := transform.Project("id_bucket", predicate)
+	require.NoError(t, err)
+	require.NotNil(t, projected)
+	assert.True(t, iceberg.EqualTo(iceberg.Reference("id_bucket"), int32(1)).Equals(projected))
+}
+
+func TestUnboundTransformBindRejectsNilTransform(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32},
+	)
+	tests := []struct {
+		name      string
+		transform iceberg.Transform
+	}{
+		{name: "nil interface", transform: nil},
+		{name: "typed nil pointer", transform: (*iceberg.BucketTransform)(nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			term := iceberg.NewUnboundTransform(tt.transform, iceberg.Reference("id"))
+
+			bound, err := term.Bind(schema, true)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			require.ErrorContains(t, err, "transform cannot be nil")
+			assert.Nil(t, bound)
+		})
+	}
+}
+
+func TestUnboundTransformNilTransformMethodsAreSafe(t *testing.T) {
+	tests := []struct {
+		name      string
+		transform iceberg.Transform
+	}{
+		{name: "nil interface", transform: nil},
+		{name: "typed nil pointer", transform: (*iceberg.BucketTransform)(nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			term := iceberg.NewUnboundTransform(tt.transform, iceberg.Reference("id"))
+
+			assert.NotPanics(t, func() { _ = term.String() })
+			assert.True(t, term.Equals(term))
+
+			_, err := json.Marshal(term)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			require.ErrorContains(t, err, "transform cannot be nil")
+		})
+	}
 }
 
 // TestUnmarshalExpressionTransformTermInvalid rejects an invalid transform
@@ -486,4 +626,64 @@ func TestUnmarshalExpressionCaseSensitive(t *testing.T) {
 	)
 	_, err := iceberg.ParseExpr([]byte(`{"type":"eq","term":"ID","value":1}`), schema)
 	require.Error(t, err)
+}
+
+// A leaf name can resolve successfully to the wrong top-level field, silently
+// changing a remote filter. Preserve the schema-qualified name when binding.
+func TestMarshalBoundNestedReferencePreservesPath(t *testing.T) {
+	t.Parallel()
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "Nested", Type: &iceberg.StructType{FieldList: []iceberg.NestedField{
+			{ID: 2, Name: "Value", Type: iceberg.PrimitiveTypes.Int32},
+		}}},
+		iceberg.NestedField{ID: 3, Name: "Value", Type: iceberg.PrimitiveTypes.Int32},
+	)
+	ref := iceberg.Reference("nested.value")
+	for _, tc := range []struct {
+		name string
+		expr iceberg.BooleanExpression
+		want string
+	}{
+		{"unary", iceberg.IsNull(ref), `{"type":"is-null","term":"Nested.Value"}`},
+		{"literal", iceberg.EqualTo(ref, int32(7)), `{"type":"eq","term":"Nested.Value","value":7}`},
+		{"set", iceberg.IsIn(ref, int32(7), int32(8)), `{"type":"in","term":"Nested.Value","values":[7,8]}`},
+		{
+			"transform", iceberg.EqualTo(iceberg.NewUnboundTransform(iceberg.BucketTransform{NumBuckets: 16}, ref), int32(7)),
+			`{"type":"eq","term":{"type":"transform","transform":"bucket[16]","term":"Nested.Value"},"value":7}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bound, err := iceberg.BindExpr(schema, tc.expr, false)
+			require.NoError(t, err)
+			assert.Equal(t, "Value", bound.(iceberg.BoundPredicate).Ref().Field().Name)
+			encoded, err := json.Marshal(bound)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.want, string(encoded))
+			parsed, err := iceberg.ParseExpr(encoded, schema)
+			require.NoError(t, err)
+			rebound, err := iceberg.BindExpr(schema, parsed, true)
+			require.NoError(t, err)
+			assert.True(t, bound.Equals(rebound), "the round trip must retain the nested field ID")
+			assert.Equal(t, 2, rebound.(iceberg.BoundPredicate).Ref().Field().ID)
+		})
+	}
+}
+
+func TestUnboundTransformRejectsWrappedReference(t *testing.T) {
+	t.Parallel()
+	// External wrappers can embed Reference, but binding
+	// rejects them before they can reach BoundTransform.MarshalJSON.
+	type wrappedReference struct {
+		iceberg.Reference
+	}
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "Nested", Type: &iceberg.StructType{FieldList: []iceberg.NestedField{
+			{ID: 2, Name: "Value", Type: iceberg.PrimitiveTypes.Int32},
+		}}},
+	)
+	term := iceberg.NewUnboundTransform(iceberg.BucketTransform{NumBuckets: 16},
+		wrappedReference{iceberg.Reference("Nested.Value")})
+	_, err := term.Bind(schema, true)
+	require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+	require.ErrorContains(t, err, "transform terms must wrap a direct reference")
 }

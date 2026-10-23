@@ -22,7 +22,7 @@ import (
 	"github.com/DataDog/iceberg-go/go-cloud/aws"
 	"github.com/DataDog/iceberg-go/go-cloud/aws/rds"
 	"github.com/DataDog/iceberg-go/go-cloud/blob/s3blob"
-	"github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb"
+	"github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb/v2"
 	"github.com/DataDog/iceberg-go/go-cloud/pubsub/awssnssqs"
 	"github.com/DataDog/iceberg-go/go-cloud/runtimevar/awsparamstore"
 	"github.com/DataDog/iceberg-go/go-cloud/secrets/awskms"
@@ -33,7 +33,6 @@ import (
 // implementations in the Go CDK and authenticates using the default session.
 var AWS = wire.NewSet(
 	Services,
-	aws.DefaultSession,
 	aws.NewDefaultV2Config,
 	wire.Value(http.DefaultClient),
 )

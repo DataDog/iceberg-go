@@ -418,7 +418,12 @@ func (r Reference) Bind(s *Schema, caseSensitive bool) (BoundTerm, error) {
 		return nil, ErrInvalidSchema
 	}
 
-	return createBoundRef(field, acc), nil
+	name, ok := s.FindColumnName(field.ID)
+	if !ok {
+		return nil, ErrInvalidSchema
+	}
+
+	return createBoundRef(field, acc, name), nil
 }
 
 // BoundReference is a named reference that has been bound to a particular field
@@ -432,40 +437,41 @@ type BoundReference interface {
 }
 
 type boundRef[T LiteralType] struct {
-	field NestedField
-	acc   accessor
+	field    NestedField
+	acc      accessor
+	fullName string
 }
 
-func createBoundRef(field NestedField, acc accessor) BoundReference {
+func createBoundRef(field NestedField, acc accessor, name string) BoundReference {
 	switch field.Type.(type) {
 	case BooleanType:
-		return &boundRef[bool]{field: field, acc: acc}
+		return &boundRef[bool]{field: field, acc: acc, fullName: name}
 	case Int32Type:
-		return &boundRef[int32]{field: field, acc: acc}
+		return &boundRef[int32]{field: field, acc: acc, fullName: name}
 	case Int64Type:
-		return &boundRef[int64]{field: field, acc: acc}
+		return &boundRef[int64]{field: field, acc: acc, fullName: name}
 	case Float32Type:
-		return &boundRef[float32]{field: field, acc: acc}
+		return &boundRef[float32]{field: field, acc: acc, fullName: name}
 	case Float64Type:
-		return &boundRef[float64]{field: field, acc: acc}
+		return &boundRef[float64]{field: field, acc: acc, fullName: name}
 	case DateType:
-		return &boundRef[Date]{field: field, acc: acc}
+		return &boundRef[Date]{field: field, acc: acc, fullName: name}
 	case TimeType:
-		return &boundRef[Time]{field: field, acc: acc}
+		return &boundRef[Time]{field: field, acc: acc, fullName: name}
 	case TimestampType, TimestampTzType:
-		return &boundRef[Timestamp]{field: field, acc: acc}
+		return &boundRef[Timestamp]{field: field, acc: acc, fullName: name}
 	case TimestampNsType, TimestampTzNsType:
-		return &boundRef[TimestampNano]{field: field, acc: acc}
+		return &boundRef[TimestampNano]{field: field, acc: acc, fullName: name}
 	case StringType:
-		return &boundRef[string]{field: field, acc: acc}
+		return &boundRef[string]{field: field, acc: acc, fullName: name}
 	case FixedType, BinaryType, GeographyType, GeometryType:
-		return &boundRef[[]byte]{field: field, acc: acc}
+		return &boundRef[[]byte]{field: field, acc: acc, fullName: name}
 	case DecimalType:
-		return &boundRef[Decimal]{field: field, acc: acc}
+		return &boundRef[Decimal]{field: field, acc: acc, fullName: name}
 	case UUIDType:
-		return &boundRef[uuid.UUID]{field: field, acc: acc}
+		return &boundRef[uuid.UUID]{field: field, acc: acc, fullName: name}
 	case VariantType:
-		return &boundRef[variant.Value]{field: field, acc: acc}
+		return &boundRef[variant.Value]{field: field, acc: acc, fullName: name}
 	}
 	panic("unhandled bound reference type: " + field.Type.String())
 }
@@ -500,6 +506,10 @@ func (b *boundRef[T]) Equals(other BoundTerm) bool {
 func (b *boundRef[T]) Ref() BoundReference { return b }
 func (b *boundRef[T]) Field() NestedField  { return b.field }
 func (b *boundRef[T]) Type() Type          { return b.field.Type }
+
+// referenceName preserves the canonical schema path without changing the
+// leaf field's name (which is part of the bound reference's type metadata).
+func (b *boundRef[T]) referenceName() string { return b.fullName }
 
 func (b *boundRef[T]) eval(st StructLike) Optional[T] {
 	switch v := b.acc.Get(st).(type) {
@@ -587,18 +597,28 @@ func (up *unboundUnaryPredicate) Bind(schema *Schema, caseSensitive bool) (Boole
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectTransformTerm(bound); err != nil {
-		return nil, err
-	}
-
 	// fast case optimizations
+	// An extract term's Ref() is the variant column, not the addressed sub-path; skip the required-field fast path.
+	_, isExtract := bound.(BoundExtract)
 	switch up.op {
 	case OpIsNull:
-		if bound.Ref().Field().Required && !schema.FieldHasOptionalParent(bound.Ref().Field().ID) {
+		if transform, ok := bound.(*BoundTransform); ok {
+			if _, alwaysNull := transform.transform.(VoidTransform); alwaysNull {
+				return AlwaysTrue{}, nil
+			}
+		}
+		if ref, ok := bound.(BoundReference); ok && !isExtract &&
+			ref.Field().Required && !schema.FieldHasOptionalParent(ref.Field().ID) {
 			return AlwaysFalse{}, nil
 		}
 	case OpNotNull:
-		if bound.Ref().Field().Required && !schema.FieldHasOptionalParent(bound.Ref().Field().ID) {
+		if transform, ok := bound.(*BoundTransform); ok {
+			if _, alwaysNull := transform.transform.(VoidTransform); alwaysNull {
+				return AlwaysFalse{}, nil
+			}
+		}
+		if ref, ok := bound.(BoundReference); ok && !isExtract &&
+			ref.Field().Required && !schema.FieldHasOptionalParent(ref.Field().ID) {
 			return AlwaysTrue{}, nil
 		}
 	case OpIsNan:
@@ -621,14 +641,8 @@ type BoundUnaryPredicate interface {
 	AsUnbound(Reference) UnboundPredicate
 }
 
-type bound[T LiteralType] interface {
-	BoundTerm
-
-	eval(StructLike) Optional[T]
-}
-
 func newBoundUnaryPred[T LiteralType](op Operation, term BoundTerm) BoundUnaryPredicate {
-	return &boundUnaryPredicate[T]{op: op, term: term.(bound[T])}
+	return &boundUnaryPredicate[T]{op: op, term: term}
 }
 
 func createBoundUnaryPredicate(op Operation, term BoundTerm) BoundUnaryPredicate {
@@ -667,11 +681,11 @@ func createBoundUnaryPredicate(op Operation, term BoundTerm) BoundUnaryPredicate
 
 type boundUnaryPredicate[T LiteralType] struct {
 	op   Operation
-	term bound[T]
+	term BoundTerm
 }
 
 func (bp *boundUnaryPredicate[T]) AsUnbound(r Reference) UnboundPredicate {
-	return &unboundUnaryPredicate{op: bp.op, term: r}
+	return &unboundUnaryPredicate{op: bp.op, term: unboundTermForBound(bp.term, r)}
 }
 
 func (bp *boundUnaryPredicate[T]) Equals(other BooleanExpression) bool {
@@ -744,10 +758,6 @@ func (ul *unboundLiteralPredicate) Bind(schema *Schema, caseSensitive bool) (Boo
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectTransformTerm(bound); err != nil {
-		return nil, err
-	}
-
 	if (ul.op == OpStartsWith || ul.op == OpNotStartsWith) &&
 		(!bound.Type().Equals(PrimitiveTypes.String) && !bound.Type().Equals(PrimitiveTypes.Binary)) {
 		return nil, fmt.Errorf("%w: StartsWith and NotStartsWith must bind to String type, not %s",
@@ -790,7 +800,7 @@ type BoundLiteralPredicate interface {
 
 func newBoundLiteralPredicate[T LiteralType](op Operation, term BoundTerm, lit Literal) BoundPredicate {
 	return &boundLiteralPredicate[T]{
-		op: op, term: term.(bound[T]),
+		op: op, term: term,
 		lit: lit.(TypedLiteral[T]),
 	}
 }
@@ -838,7 +848,7 @@ func createBoundLiteralPredicate(op Operation, term BoundTerm, lit Literal) (Bou
 
 type boundLiteralPredicate[T LiteralType] struct {
 	op   Operation
-	term bound[T]
+	term BoundTerm
 	lit  TypedLiteral[T]
 }
 
@@ -862,7 +872,7 @@ func (blp *boundLiteralPredicate[T]) String() string {
 }
 func (blp *boundLiteralPredicate[T]) Literal() Literal { return blp.lit }
 func (blp *boundLiteralPredicate[T]) AsUnbound(r Reference, l Literal) UnboundPredicate {
-	return &unboundLiteralPredicate{op: blp.op, term: r, lit: l}
+	return &unboundLiteralPredicate{op: blp.op, term: unboundTermForBound(blp.term, r), lit: l}
 }
 
 // SetPredicate creates a boolean expression representing a predicate that uses a set
@@ -932,9 +942,6 @@ func (usp *unboundSetPredicate) Bind(schema *Schema, caseSensitive bool) (Boolea
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectTransformTerm(bound); err != nil {
-		return nil, err
-	}
 
 	return createBoundSetPredicate(usp.op, bound, usp.lits)
 }
@@ -950,11 +957,15 @@ type BoundSetPredicate interface {
 func createBoundSetPredicate(op Operation, term BoundTerm, lits Set[Literal]) (BooleanExpression, error) {
 	boundType := term.Type()
 
-	typedSet := newLiteralSet()
+	typedSet := make(literalSet, lits.Len())
 	for _, v := range lits.Members() {
 		casted, err := v.To(boundType)
 		if err != nil {
 			return nil, err
+		}
+		switch casted.(type) {
+		case AboveMaxLiteral, BelowMinLiteral:
+			continue
 		}
 		typedSet.Add(cloneBoundLiteral(casted))
 	}
@@ -1009,14 +1020,64 @@ func createBoundSetPredicate(op Operation, term BoundTerm, lits Set[Literal]) (B
 		ErrType, term.Type())
 }
 
-func newBoundSetPredicate[T LiteralType](op Operation, term BoundTerm, lits Set[Literal]) *boundSetPredicate[T] {
-	return &boundSetPredicate[T]{op: op, term: term.(bound[T]), lits: lits}
+func newBoundSetPredicate[T LiteralType](op Operation, term BoundTerm, lits literalSet) *boundSetPredicate[T] {
+	predicate := &boundSetPredicate[T]{op: op, term: term, lits: lits}
+	if op == OpIn {
+		predicate.minLiteral, predicate.maxLiteral, predicate.hasExtrema = literalSetExtrema[T](lits)
+	}
+
+	return predicate
 }
 
 type boundSetPredicate[T LiteralType] struct {
-	op   Operation
-	term bound[T]
-	lits Set[Literal]
+	op         Operation
+	term       BoundTerm
+	lits       literalSet
+	minLiteral Literal
+	maxLiteral Literal
+	hasExtrema bool
+}
+
+func literalSetExtrema[T LiteralType](lits literalSet) (minLit, maxLit Literal, ok bool) {
+	var (
+		cmp                Comparator[T]
+		minValue, maxValue T
+		valid              = true
+	)
+
+	lits.All(func(lit Literal) bool {
+		typed, typeOK := lit.(TypedLiteral[T])
+		if !typeOK {
+			valid = false
+
+			return false
+		}
+
+		value := typed.Value()
+		if !ok {
+			cmp = typed.Comparator()
+			minLit, maxLit = lit, lit
+			minValue, maxValue = value, value
+			ok = true
+
+			return true
+		}
+
+		if cmp(value, minValue) < 0 {
+			minLit, minValue = lit, value
+		}
+		if cmp(value, maxValue) > 0 {
+			maxLit, maxValue = lit, value
+		}
+
+		return true
+	})
+
+	if !valid {
+		return nil, nil, false
+	}
+
+	return minLit, maxLit, ok
 }
 
 func (bsp *boundSetPredicate[T]) Equals(other BooleanExpression) bool {
@@ -1032,7 +1093,8 @@ func (bsp *boundSetPredicate[T]) Equals(other BooleanExpression) bool {
 func (bsp *boundSetPredicate[T]) Op() Operation { return bsp.op }
 func (bsp *boundSetPredicate[T]) Negate() BooleanExpression {
 	return &boundSetPredicate[T]{
-		op: bsp.op.Negate(), term: bsp.term,
+		op:   bsp.op.Negate(),
+		term: bsp.term,
 		lits: bsp.lits,
 	}
 }
@@ -1047,13 +1109,13 @@ func (bsp *boundSetPredicate[T]) AsUnbound(r Reference, lits []Literal) UnboundP
 	if litSet.Len() == 1 {
 		switch bsp.op {
 		case OpIn:
-			return LiteralPredicate(OpEQ, r, lits[0])
+			return LiteralPredicate(OpEQ, unboundTermForBound(bsp.term, r), lits[0])
 		case OpNotIn:
-			return LiteralPredicate(OpNEQ, r, lits[0])
+			return LiteralPredicate(OpNEQ, unboundTermForBound(bsp.term, r), lits[0])
 		}
 	}
 
-	return &unboundSetPredicate{op: bsp.op, term: r, lits: litSet}
+	return &unboundSetPredicate{op: bsp.op, term: unboundTermForBound(bsp.term, r), lits: litSet}
 }
 
 func (bsp *boundSetPredicate[T]) Literals() Set[Literal] {
@@ -1091,6 +1153,14 @@ func (b *BoundTransform) evalIsNull(st StructLike) bool {
 	return !b.evalToLiteral(st).Valid
 }
 
+func unboundTermForBound(term BoundTerm, ref Reference) UnboundTerm {
+	if transform, ok := term.(*BoundTransform); ok {
+		return NewUnboundTransform(transform.transform, ref)
+	}
+
+	return ref
+}
+
 // UnboundTransform is a transform applied to a term, not yet bound to a schema;
 // the unbound counterpart of BoundTransform. It's what a transform term in a
 // REST expression (e.g. bucket[16](id)) parses into.
@@ -1105,7 +1175,16 @@ func NewUnboundTransform(transform Transform, term UnboundTerm) *UnboundTransfor
 
 func (*UnboundTransform) isTerm() {}
 func (u *UnboundTransform) String() string {
-	return fmt.Sprintf("UnboundTransform(transform=%s, term=%s)", u.transform, u.term)
+	if u == nil {
+		return "UnboundTransform(<nil>)"
+	}
+
+	transform := "<nil>"
+	if !isNilTransform(u.transform) {
+		transform = u.transform.String()
+	}
+
+	return fmt.Sprintf("UnboundTransform(transform=%s, term=%s)", transform, u.term)
 }
 
 // Transform returns the transform applied to the term.
@@ -1116,12 +1195,40 @@ func (u *UnboundTransform) Equals(other UnboundTerm) bool {
 	if !ok {
 		return false
 	}
+	if u == nil || rhs == nil {
+		return u == rhs
+	}
+
+	leftNil, rightNil := isNilTransform(u.transform), isNilTransform(rhs.transform)
+	if leftNil || rightNil {
+		if !leftNil || !rightNil || reflect.TypeOf(u.transform) != reflect.TypeOf(rhs.transform) {
+			return false
+		}
+		if u.term == nil || rhs.term == nil {
+			return u.term == nil && rhs.term == nil
+		}
+
+		return u.term.Equals(rhs.term)
+	}
 
 	return u.transform.Equals(rhs.transform) && u.term.Equals(rhs.term)
 }
 
 func (u *UnboundTransform) Bind(schema *Schema, caseSensitive bool) (BoundTerm, error) {
-	bound, err := u.term.Bind(schema, caseSensitive)
+	if isNilTransform(u.transform) {
+		return nil, fmt.Errorf("%w: transform cannot be nil", ErrInvalidArgument)
+	}
+	if isUnknownTransform(u.transform) {
+		return nil, fmt.Errorf("%w: unknown transform %s cannot be evaluated", ErrNotImplemented, u.transform)
+	}
+
+	ref, ok := u.term.(Reference)
+	if !ok {
+		return nil, fmt.Errorf("%w: transform terms must wrap a direct reference, got %T",
+			ErrInvalidArgument, u.term)
+	}
+
+	bound, err := ref.Bind(schema, caseSensitive)
 	if err != nil {
 		return nil, err
 	}
@@ -1133,9 +1240,31 @@ func (u *UnboundTransform) Bind(schema *Schema, caseSensitive bool) (BoundTerm, 
 	return &BoundTransform{transform: u.transform, term: bound}, nil
 }
 
-// rejectTransformTerm guards the typed bound-predicate machinery, which only
-// accepts bound[T] terms (references). Binding a predicate over a transform term
-// isn't supported yet; without this it would panic in newBound*Predicate.
+func isNilTransform(transform Transform) bool {
+	if transform == nil {
+		return true
+	}
+
+	value := reflect.ValueOf(transform)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func isUnknownTransform(transform Transform) bool {
+	switch transform.(type) {
+	case UnknownTransform, *UnknownTransform:
+		return true
+	default:
+		return false
+	}
+}
+
+// rejectTransformTerm guards predicates that still do not support transform
+// terms, such as bounding-box predicates.
 func rejectTransformTerm(term BoundTerm) error {
 	if _, ok := term.(*BoundTransform); ok {
 		return fmt.Errorf("%w: binding a predicate over a transform term is not supported", ErrNotImplemented)
@@ -1278,7 +1407,7 @@ type BoundBBoxPredicate interface {
 // as a generic unary predicate (it would reach substrait and error, or be
 // dropped to AlwaysFalse when a column is absent). It has no record-filter or
 // REST-JSON form at all, so the two visitors that would otherwise rebuild a bound
-// predicate - columnNameTranslator.VisitBound and sanitizeVisitor.VisitBound -
+// predicate - scanTranslator.VisitBound and sanitizeVisitor.VisitBound -
 // special-case *boundBBoxPredicate and collapse it to AlwaysTrue. Data-file
 // pruning is done separately by inclusiveMetricsEval.
 type boundBBoxPredicate struct {

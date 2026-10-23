@@ -25,9 +25,6 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/DataDog/iceberg-go"
-	iceio "github.com/DataDog/iceberg-go/io"
-	"github.com/DataDog/iceberg-go/table"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
@@ -37,8 +34,14 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/arrow-go/v18/parquet/variant"
+	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/catalog"
+	"github.com/DataDog/iceberg-go/catalog/sql"
+	iceio "github.com/DataDog/iceberg-go/io"
+	"github.com/DataDog/iceberg-go/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uptrace/bun/driver/sqliteshim"
 )
 
 const shreddedFixtureDir = "testdata/shredded_variant"
@@ -83,7 +86,7 @@ func TestShreddedVariantTableScan(t *testing.T) {
 
 	ext, ok := scanned.Schema().Field(0).Type.(arrow.ExtensionType)
 	require.True(t, ok, "payload must be Variant extension type, got %T", scanned.Schema().Field(0).Type)
-	assert.Equal(t, "parquet.variant", ext.ExtensionName())
+	assert.Equal(t, extensions.VariantExtensionName, ext.ExtensionName())
 
 	// Scan order is not guaranteed; check the set of "a" values is {0..nData-1}.
 	col := scanned.Column(0).Data()
@@ -95,7 +98,7 @@ func TestShreddedVariantTableScan(t *testing.T) {
 		// The shredded layout must be invisible to the scanner: the column
 		// reads back as a plain (non-shredded) variant.
 		assert.False(t, varr.IsShredded(), "scanned variant column must not be shredded")
-		for i := 0; i < varr.Len(); i++ {
+		for i := range varr.Len() {
 			if varr.IsNull(i) {
 				nullCount++
 
@@ -122,7 +125,7 @@ func TestShreddedVariantTableScan(t *testing.T) {
 	}
 	assert.Equal(t, 1, nullCount, "exactly one null row")
 	assert.Len(t, seenA, nData, "distinct a values")
-	for i := int64(0); i < nData; i++ {
+	for i := range int64(nData) {
 		assert.True(t, seenA[i], "missing reassembled a=%d", i)
 	}
 }
@@ -219,7 +222,7 @@ func TestShreddedVariantReassemblyNoLeak(t *testing.T) {
 		arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int64},
 	))
 	bldr := extensions.NewVariantBuilder(mem, shredded)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		var b variant.Builder
 		require.NoError(t, b.Append(map[string]any{"a": int64(i), "city": "NYC"}))
 		v, err := b.Build()
@@ -338,33 +341,9 @@ func TestShreddedVariantArrowGoLeniency(t *testing.T) {
 	})
 }
 
-// writeShreddedVariantFile writes a shredded variant column "payload" (typed
-// {a, b} + residual "extra") with nRows data rows then one null row.
-func writeShreddedVariantFile(t *testing.T, path string, fieldID, nRows int) {
+// writeVariantColumnParquet writes bldr's contents as a single "payload" variant column (field id fieldID) of shreddedType to path.
+func writeVariantColumnParquet(t *testing.T, path string, fieldID int, shreddedType arrow.DataType, bldr *extensions.VariantBuilder) {
 	t.Helper()
-
-	shreddedType := extensions.NewShreddedVariantType(arrow.StructOf(
-		arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int64},
-		arrow.Field{Name: "b", Type: arrow.BinaryTypes.String},
-	))
-
-	mem := memory.DefaultAllocator
-	bldr := extensions.NewVariantBuilder(mem, shreddedType)
-	defer bldr.Release()
-
-	for i := 0; i < nRows; i++ {
-		var b variant.Builder
-		require.NoError(t, b.Append(map[string]any{
-			"a":     int64(i),
-			"b":     "row-" + string(rune('A'+i%26)),
-			"extra": int64(i * 10),
-		}))
-		v, err := b.Build()
-		require.NoError(t, err)
-		bldr.Append(v)
-	}
-	bldr.AppendNull()
-
 	arr := bldr.NewArray()
 	defer arr.Release()
 
@@ -372,7 +351,6 @@ func writeShreddedVariantFile(t *testing.T, path string, fieldID, nRows int) {
 		Name: "payload", Type: shreddedType, Nullable: true,
 		Metadata: arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{strconv.Itoa(fieldID)}),
 	}}, nil)
-
 	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{arr}, int64(arr.Len()))
 	defer rec.Release()
 
@@ -386,6 +364,35 @@ func writeShreddedVariantFile(t *testing.T, path string, fieldID, nRows int) {
 	require.NoError(t, err)
 	require.NoError(t, wr.Write(rec))
 	require.NoError(t, wr.Close())
+}
+
+// writeShreddedVariantFile writes a shredded variant column "payload" (typed
+// {a, b} + residual "extra") with nRows data rows then one null row.
+func writeShreddedVariantFile(t *testing.T, path string, fieldID, nRows int) {
+	t.Helper()
+
+	shreddedType := extensions.NewShreddedVariantType(arrow.StructOf(
+		arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int64},
+		arrow.Field{Name: "b", Type: arrow.BinaryTypes.String},
+	))
+
+	bldr := extensions.NewVariantBuilder(memory.DefaultAllocator, shreddedType)
+	defer bldr.Release()
+
+	for i := range nRows {
+		var b variant.Builder
+		require.NoError(t, b.Append(map[string]any{
+			"a":     int64(i),
+			"b":     "row-" + string(rune('A'+i%26)),
+			"extra": int64(i * 10),
+		}))
+		v, err := b.Build()
+		require.NoError(t, err)
+		bldr.Append(v)
+	}
+	bldr.AppendNull()
+
+	writeVariantColumnParquet(t, path, fieldID, shreddedType, bldr)
 }
 
 // variantInt normalizes the integer Go value a variant scalar may surface as
@@ -480,7 +487,7 @@ func requireFixtureShredded(t *testing.T, fixture string) {
 	tbl, err := rdr.ReadTable(t.Context())
 	require.NoError(t, err)
 	defer tbl.Release()
-	for c := 0; c < int(tbl.NumCols()); c++ {
+	for c := range int(tbl.NumCols()) {
 		if va, ok := tbl.Column(c).Data().Chunk(0).(*extensions.VariantArray); ok {
 			require.True(t, va.IsShredded(), "fixture %s must be stored shredded", fixture)
 
@@ -493,7 +500,7 @@ func requireFixtureShredded(t *testing.T, fixture string) {
 // shreddedVarColumn returns the single-chunk VariantArray for the "var" column.
 func shreddedVarColumn(t *testing.T, tbl arrow.Table) *extensions.VariantArray {
 	t.Helper()
-	for c := 0; c < int(tbl.NumCols()); c++ {
+	for c := range int(tbl.NumCols()) {
 		if tbl.Schema().Field(c).Name != "var" {
 			continue
 		}
@@ -556,28 +563,14 @@ func writeFullyShreddedVariantFile(t *testing.T, path string, fieldID, nRows int
 	))
 	bldr := extensions.NewVariantBuilder(memory.DefaultAllocator, shreddedType)
 	defer bldr.Release()
-	for i := 0; i < nRows; i++ {
+	for i := range nRows {
 		var b variant.Builder
 		require.NoError(t, b.Append(map[string]any{"a": int64(i), "b": "row-" + string(rune('A'+i%26))}))
 		v, err := b.Build()
 		require.NoError(t, err)
 		bldr.Append(v)
 	}
-	arr := bldr.NewArray()
-	defer arr.Release()
-	arrowSchema := arrow.NewSchema([]arrow.Field{{
-		Name: "payload", Type: shreddedType, Nullable: true,
-		Metadata: arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{strconv.Itoa(fieldID)}),
-	}}, nil)
-	rec := array.NewRecordBatch(arrowSchema, []arrow.Array{arr}, int64(arr.Len()))
-	defer rec.Release()
-	f, err := os.Create(path)
-	require.NoError(t, err)
-	defer f.Close()
-	wr, err := pqarrow.NewFileWriter(arrowSchema, f, parquet.NewWriterProperties(parquet.WithStats(true)), pqarrow.DefaultWriterProps())
-	require.NoError(t, err)
-	require.NoError(t, wr.Write(rec))
-	require.NoError(t, wr.Close())
+	writeVariantColumnParquet(t, path, fieldID, shreddedType, bldr)
 }
 
 // TestShreddedVariantAddFilesBounds pins that AddFiles (which opens the file and
@@ -623,4 +616,175 @@ func TestShreddedVariantAddFilesBounds(t *testing.T) {
 
 	assert.Equal(t, buildObj(0, "row-A"), tasks[0].File.LowerBoundValues()[1], "AddFiles lower bound")
 	assert.Equal(t, buildObj(nData-1, "row-E"), tasks[0].File.UpperBoundValues()[1], "AddFiles upper bound")
+}
+
+// setupVariantScanTable writes a shredded variant table from rows and returns a closure reading the "id" column of a filtered scan.
+func setupVariantScanTable(t *testing.T, name string, rows []map[string]any) (*table.Table, func(iceberg.BooleanExpression) []int64) {
+	t.Helper()
+	ctx := context.Background()
+	loc := "file://" + t.TempDir()
+
+	cat, err := catalog.Load(ctx, "default", iceberg.Properties{
+		"uri":          ":memory:",
+		"type":         "sql",
+		sql.DriverKey:  sqliteshim.ShimName,
+		sql.DialectKey: string(sql.SQLite),
+		"warehouse":    loc,
+	})
+	require.NoError(t, err)
+
+	iceSchema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "payload", Type: iceberg.VariantType{}},
+	)
+	require.NoError(t, cat.CreateNamespace(ctx, table.Identifier{"ns"}, nil))
+	tbl, err := cat.CreateTable(ctx, table.Identifier{"ns", name}, iceSchema,
+		catalog.WithProperties(iceberg.Properties{
+			table.PropertyFormatVersion:   "3",
+			table.ParquetShredVariantsKey: "true",
+		}),
+		catalog.WithLocation(loc))
+	require.NoError(t, err)
+
+	arrSchema, err := table.SchemaToArrowSchema(iceSchema, nil, true, false)
+	require.NoError(t, err)
+
+	mem := memory.DefaultAllocator
+	idb := array.NewInt64Builder(mem)
+	defer idb.Release()
+	vb := extensions.NewVariantBuilder(mem, extensions.NewDefaultVariantType())
+	defer vb.Release()
+	for i, m := range rows {
+		idb.Append(int64(i))
+		var b variant.Builder
+		require.NoError(t, b.Append(m))
+		v, err := b.Build()
+		require.NoError(t, err)
+		vb.Append(v)
+	}
+	idArr := idb.NewArray()
+	defer idArr.Release()
+	pArr := vb.NewArray()
+	defer pArr.Release()
+	rec := array.NewRecordBatch(arrSchema, []arrow.Array{idArr, pArr}, int64(len(rows)))
+	defer rec.Release()
+
+	rdr, err := array.NewRecordReader(arrSchema, []arrow.RecordBatch{rec})
+	require.NoError(t, err)
+	defer rdr.Release()
+	tbl, err = tbl.Append(ctx, rdr, nil)
+	require.NoError(t, err)
+
+	return tbl, func(filter iceberg.BooleanExpression) []int64 {
+		scan := tbl.Scan(table.WithRowFilter(filter))
+		result, err := scan.ToArrowTable(ctx)
+		require.NoError(t, err)
+		defer result.Release()
+		col := result.Column(result.Schema().FieldIndices("id")[0]).Data()
+		out := make([]int64, 0, result.NumRows())
+		for _, ch := range col.Chunks() {
+			c := ch.(*array.Int64)
+			for i := range c.Len() {
+				out = append(out, c.Value(i))
+			}
+		}
+
+		return out
+	}
+}
+
+// TestVariantExtractScanEndToEnd covers variant predicate pushdown through the public API: write a shredded variant table, read it back via Scan.ToArrowTable with extract row filters.
+func TestVariantExtractScanEndToEnd(t *testing.T) {
+	_, idsFor := setupVariantScanTable(t, "variant_scan", []map[string]any{
+		{"a": int64(1), "b": "x"},
+		{"a": int64(2), "b": "y"},
+		{"a": int64(3), "b": "z"},
+		{"b": "only-b"}, // a absent
+	})
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+
+	require.Equal(t, []int64{2}, idsFor(iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(3)))),
+		"$.a == 3 selects only row id 2")
+	require.ElementsMatch(t, []int64{0, 1, 2}, idsFor(iceberg.NotNull(ext)),
+		"NotNull($.a) selects the three a-present rows")
+	require.Equal(t, []int64{3}, idsFor(iceberg.IsNull(ext)),
+		"IsNull($.a) selects the a-absent row")
+}
+
+// TestVariantExtractResidualAndHeterogeneous covers extract over a non-uniform $.a, which stays in the residual value column, exercising arrow-go's reassembly and cast-to-null for the string-typed row.
+func TestVariantExtractResidualAndHeterogeneous(t *testing.T) {
+	_, idsFor := setupVariantScanTable(t, "variant_resid", []map[string]any{
+		{"a": int64(10), "b": "x"},
+		{"a": "hello", "b": "y"},
+		{"a": int64(30), "b": "z"},
+		{"b": "only-b"},
+	})
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+
+	require.Equal(t, []int64{0}, idsFor(iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(10)))),
+		"$.a == 10 selects the residual-backed int row")
+	require.Empty(t, idsFor(iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(0)))),
+		"string $.a='hello' never matches an Int64 predicate")
+	require.ElementsMatch(t, []int64{0, 2}, idsFor(iceberg.NotNull(ext)),
+		"NotNull($.a as Int64) = the two int rows only")
+	require.ElementsMatch(t, []int64{1, 3}, idsFor(iceberg.IsNull(ext)),
+		"IsNull($.a as Int64) = the string row and the absent row")
+}
+
+// NOT($.a == 1) must keep the $.a == 2 row, not prune its row group.
+func TestVariantExtractNegatedNotPruned(t *testing.T) {
+	tbl, idsFor := setupVariantScanTable(t, "variant_neg", []map[string]any{
+		{"a": int64(1), "b": "x"},
+		{"a": int64(2), "b": "y"},
+	})
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+	filter := iceberg.NewNot(iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(1))))
+
+	require.Equal(t, []int64{1}, idsFor(filter),
+		"NOT($.a == 1) must keep the a=2 row (id 1), not prune its row group")
+
+	result, err := tbl.Scan(table.WithRowFilter(filter)).ToArrowTable(context.Background())
+	require.NoError(t, err)
+	defer result.Release()
+	require.Equal(t, int64(1), result.NumRows(), "exactly one surviving row")
+	payload := result.Column(result.Schema().FieldIndices("payload")[0]).Data().Chunk(0).(*extensions.VariantArray)
+	v, err := payload.Value(0)
+	require.NoError(t, err)
+	obj, ok := v.Value().(variant.ObjectValue)
+	require.True(t, ok, "surviving payload must be a variant object")
+	aField, err := obj.ValueByKey("a")
+	require.NoError(t, err)
+	require.EqualValues(t, 2, aField.Value.Value(), "surviving row's $.a must be 2")
+}
+
+// An extract filter on the incremental-scan read path must not abort with ErrNotImplemented.
+func TestVariantExtractIncrementalScanReadTasks(t *testing.T) {
+	ctx := context.Background()
+	tbl, _ := setupVariantScanTable(t, "variant_incr", []map[string]any{
+		{"a": int64(1), "b": "x"},
+		{"a": int64(2), "b": "y"},
+		{"a": int64(3), "b": "z"},
+	})
+	ext := iceberg.Extract("payload", "$.a", iceberg.PrimitiveTypes.Int64)
+	filter := iceberg.LiteralPredicate(iceberg.OpEQ, ext, iceberg.NewLiteral(int64(2)))
+
+	tasks, err := tbl.NewIncrementalAppendScan(table.WithRowFilter(filter)).PlanFiles(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	require.NotNil(t, tasks[0].Residual, "incremental tasks carry a non-nil residual")
+
+	_, recs, err := tbl.Scan(table.WithRowFilter(filter)).ReadTasks(ctx, tasks)
+	require.NoError(t, err)
+	var ids []int64
+	for rec, err := range recs {
+		require.NoError(t, err, "extract filter on incremental read must not abort")
+		if idxs := rec.Schema().FieldIndices("id"); len(idxs) == 1 {
+			c := rec.Column(idxs[0]).(*array.Int64)
+			for i := range c.Len() {
+				ids = append(ids, c.Value(i))
+			}
+		}
+		rec.Release()
+	}
+	require.Equal(t, []int64{1}, ids, "$.a == 2 selects the a=2 row (id 1) on the incremental path")
 }

@@ -15,16 +15,25 @@
 # limitations under the License.
 
 # golangci-lint version (keep in sync with CI and README)
-GOLANGCI_LINT_VERSION := v2.8.0
+GOLANGCI_LINT_VERSION := v2.14.0
 
-.PHONY: test test-race lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-spark integration-hadoop integration-down integration-logs docs-gen
+.PHONY: test test-assert test-race vet lint lint-install integration-setup integration-setup-spark4 integration-test integration-scanner integration-io integration-rest integration-rest-scan-planning integration-spark integration-hadoop integration-down integration-logs docs-gen
 
 test:
 	go test -v ./...
 
-# Race detector is opt-in per package/test.
+test-assert:
+	go test -tags=assert -v -run='^(TestInspectFilesTablesEarlyRelease|TestInspectDataFilesEmitsEmptyBatchWhenAllEntriesAreDeleted|TestInspectDataFilesEmptyTableEarlyRelease|TestInspectPositionDeletesEarlyRelease)$$' ./table
+
 test-race:
-	go test -race -v ./codec/... ./metrics/...
+	go test -race -v ./...
+
+# vet also type-checks the //go:build integration files, which the default
+# toolchain skips. Without the tagged pass, code behind that tag (for example
+# table/maintenance's integration test) can break without any target noticing.
+vet:
+	go vet ./...
+	go vet -tags=integration ./...
 
 docs-gen:
 	go run ./website/gen
@@ -37,7 +46,7 @@ lint-install:
 
 integration-setup:
 	mkdir -p /tmp/iceberg-hadoop-warehouse
-	docker compose -f internal/recipe/docker-compose.yml up -d --wait
+	docker compose -f internal/recipe/docker-compose.yml up -d --build --wait
 	docker compose -f internal/recipe/docker-compose.yml exec -T spark-iceberg ipython ./provision.py
 
 integration-setup-spark4:
@@ -53,12 +62,14 @@ integration-logs:
 	docker compose -f internal/recipe/docker-compose.yml logs
 
 integration-env:
-	@echo "export AWS_S3_ENDPOINT=http://$$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minio):9000"
+	@echo "export AWS_S3_ENDPOINT=http://$$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' object-store):9000"
 	@echo "export AWS_REGION=us-east-1"
 	@echo "export SPARK_CONTAINER_ID=$$(docker ps -qf 'name=spark-iceberg')"
 	@echo "export DOCKER_API_VERSION=$$(docker version -f '{{.Server.APIVersion}}')"
 
-integration-test: integration-scanner integration-io integration-rest integration-spark integration-hive integration-hadoop
+# Keep the isolated Java scan-planning suite in umbrella CI so its wire
+# compatibility coverage runs alongside the other integration tests.
+integration-test: integration-scanner integration-io integration-rest integration-rest-scan-planning integration-spark integration-hive integration-hadoop
 
 integration-scanner:
 	go test -tags=integration -v -run="^TestScanner" ./table
@@ -68,6 +79,9 @@ integration-io:
 
 integration-rest:
 	go test -tags=integration -v -run="^(TestRestIntegration|TestRestCatalogConformance)$$" ./catalog/rest
+
+integration-rest-scan-planning:
+	RUN_INTEGRATION_TESTS=1 go test -tags=integration -v -run="^TestRestIntegration/TestScanPlanningJava" ./catalog/rest
 
 integration-spark:
 	go test -tags=integration -v -run="^TestSparkIntegration" ./table

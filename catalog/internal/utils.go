@@ -33,7 +33,7 @@ import (
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
-	"github.com/DataDog/iceberg-go/internal"
+	iceinternal "github.com/DataDog/iceberg-go/internal"
 	icebergio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
 	"github.com/google/uuid"
@@ -52,21 +52,21 @@ func WriteTableMetadata(metadata table.Metadata, fs icebergio.WriteFileIO, loc s
 	if err != nil {
 		return err
 	}
-	defer internal.CheckedClose(out, &err)
+	defer iceinternal.CheckedClose(out, &err)
 
 	var writer io.Writer = out
 	switch compression {
 	case table.MetadataCompressionCodecGzip:
 		gzw := gzip.NewWriter(out)
 		writer = gzw
-		defer internal.CheckedClose(gzw, &err)
+		defer iceinternal.CheckedClose(gzw, &err)
 	case table.MetadataCompressionCodecZstd:
 		enc, zErr := zstd.NewWriter(out)
 		if zErr != nil {
 			return zErr
 		}
 		writer = enc
-		defer internal.CheckedClose(enc, &err)
+		defer iceinternal.CheckedClose(enc, &err)
 	}
 
 	err = json.NewEncoder(writer).Encode(metadata)
@@ -228,19 +228,29 @@ func getDefaultWarehouseLocation(namespaceKey, tablename string, nsprops, catpro
 // -                -> separator
 // ([\w-]{36})      -> UUID (36 characters, including hyphens)
 // (?:\.\w+)?       -> optional codec name
-// \.metadata\.json -> file extension
-var tableMetadataFileNameRegex = regexp.MustCompile(`^(\d+)-([\w-]{36})(?:\.\w+)?\.metadata\.json`)
+// \.metadata\.json -> file extension at the end of the filename
+var (
+	tableMetadataFileNameRegex       = regexp.MustCompile(`^(\d+)-([\w-]{36})(?:\.\w+)?\.metadata\.json$`)
+	legacyTableMetadataFileNameRegex = regexp.MustCompile(`^v(\d+)(?:\.gz)?\.metadata\.json$`)
+)
 
 func ParseMetadataVersion(location string) int {
-	fileName := path.Base(location)
-	matches := tableMetadataFileNameRegex.FindStringSubmatch(fileName)
-
-	if len(matches) != 3 {
+	if strings.HasSuffix(location, "/") {
 		return -1
 	}
 
-	if _, err := uuid.Parse(matches[2]); err != nil {
-		return -1
+	fileName := path.Base(location)
+	matches := tableMetadataFileNameRegex.FindStringSubmatch(fileName)
+
+	if len(matches) == 3 {
+		if _, err := uuid.Parse(matches[2]); err != nil {
+			return -1
+		}
+	} else {
+		matches = legacyTableMetadataFileNameRegex.FindStringSubmatch(fileName)
+		if len(matches) != 2 {
+			return -1
+		}
 	}
 
 	v, err := strconv.Atoi(matches[1])
@@ -269,6 +279,14 @@ func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, curre
 			return nil, err
 		}
 	}
+	newVersion := 0
+	if current != nil {
+		metadataVersion := ParseMetadataVersion(metadataLoc)
+		if metadataVersion < 0 {
+			return nil, fmt.Errorf("invalid metadata location: %s", metadataLoc)
+		}
+		newVersion = metadataVersion + 1
+	}
 	for _, r := range reqs {
 		if err := r.Validate(currentMetadata); err != nil {
 			return nil, err
@@ -285,7 +303,6 @@ func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, curre
 		return nil, err
 	}
 
-	newVersion := ParseMetadataVersion(metadataLoc) + 1
 	newLocation, err := provider.NewTableMetadataFileLocation(newVersion)
 	if err != nil {
 		return nil, err
@@ -306,4 +323,54 @@ func UpdateAndStageTable(ctx context.Context, catprops iceberg.Properties, curre
 			cat,
 		),
 	}, nil
+}
+
+func checkForOverlap(removals []string, updates iceberg.Properties) error {
+	overlap := []string{}
+	for _, key := range removals {
+		if _, ok := updates[key]; ok {
+			overlap = append(overlap, key)
+		}
+	}
+	if len(overlap) > 0 {
+		return fmt.Errorf("conflict between removals and updates for keys: %v", overlap)
+	}
+
+	return nil
+}
+
+// GetUpdatedPropsAndUpdateSummary applies removals and updates to currentProps
+// and returns the updated properties alongside a summary of the changes. It is
+// shared by the catalog backend implementations.
+func GetUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals []string, updates iceberg.Properties) (iceberg.Properties, catalog.PropertiesUpdateSummary, error) {
+	if err := checkForOverlap(removals, updates); err != nil {
+		return nil, catalog.PropertiesUpdateSummary{}, err
+	}
+	var (
+		updatedProps = maps.Clone(currentProps)
+		removed      = make([]string, 0, len(removals))
+		updated      = make([]string, 0, len(updates))
+	)
+
+	for _, key := range removals {
+		if _, exists := updatedProps[key]; exists {
+			delete(updatedProps, key)
+			removed = append(removed, key)
+		}
+	}
+
+	for key, value := range updates {
+		if updatedProps[key] != value {
+			updated = append(updated, key)
+			updatedProps[key] = value
+		}
+	}
+
+	summary := catalog.PropertiesUpdateSummary{
+		Removed: removed,
+		Updated: updated,
+		Missing: iceinternal.Difference(removals, removed),
+	}
+
+	return updatedProps, summary, nil
 }

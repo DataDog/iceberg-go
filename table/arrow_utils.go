@@ -29,6 +29,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/config"
@@ -46,7 +47,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/scalar"
 	"github.com/geoarrow/geoarrow-go"
 	"github.com/google/uuid"
-	"github.com/pterm/pterm"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -436,7 +436,7 @@ func (c convertToIceberg) Primitive(dt arrow.DataType) (result iceberg.NestedFie
 		switch dt.ExtensionName() {
 		case "arrow.uuid":
 			result.Type = iceberg.PrimitiveTypes.UUID
-		case "parquet.variant":
+		case extensions.VariantExtensionName, extensions.LegacyVariantExtensionName:
 			result.Type = iceberg.VariantType{}
 		case "geoarrow.wkb":
 			wkb, ok := dt.(*geoarrow.WKBType)
@@ -662,7 +662,8 @@ func (c convertToArrow) Map(m iceberg.MapType, keyResult, valResult arrow.Field)
 }
 
 func (c convertToArrow) Primitive(iceberg.PrimitiveType) arrow.Field { panic("shouldn't be called") }
-func (c convertToArrow) Variant(iceberg.VariantType) arrow.Field     { panic("shouldn't be called") }
+
+func (c convertToArrow) Variant(iceberg.VariantType) arrow.Field { panic("shouldn't be called") }
 
 func (c convertToArrow) VisitFixed(f iceberg.FixedType) arrow.Field {
 	return arrow.Field{Type: &arrow.FixedSizeBinaryType{ByteWidth: f.Len()}}
@@ -1047,13 +1048,15 @@ func defaultToArray(v any, t iceberg.Type, dt arrow.DataType, n int, alloc memor
 }
 
 type arrowProjectionVisitor struct {
-	ctx                 context.Context
-	fileSchema          *iceberg.Schema
-	tableProperties     iceberg.Properties
-	includeFieldIDs     bool
-	downcastNsTimestamp bool
-	useLargeTypes       bool
-	useWriteDefault     bool
+	ctx                  context.Context
+	fileSchema           *iceberg.Schema
+	tableProperties      iceberg.Properties
+	formatVersion        int
+	includeFieldIDs      bool
+	downcastNsTimestamp  bool
+	useLargeTypes        bool
+	useWriteDefault      bool
+	allowMissingRequired bool
 }
 
 func (a *arrowProjectionVisitor) typeToArrowType(t iceberg.Type) arrow.DataType {
@@ -1079,8 +1082,13 @@ func (a *arrowProjectionVisitor) castIfNeeded(field iceberg.NestedField, vals ar
 
 	if !field.Type.Equals(typ) {
 		if !canDowncastTimestampPrecision(fileField.Type, field.Type, a.downcastNsTimestamp) {
-			promoted := retOrPanic(iceberg.PromoteType(fileField.Type, field.Type))
-			targetType := a.typeToArrowType(promoted)
+			var targetType arrow.DataType
+			if a.formatVersion >= 3 && canPromoteDateToTimestamp(fileField.Type, field.Type) {
+				targetType = a.typeToArrowType(field.Type)
+			} else {
+				promoted := retOrPanic(iceberg.PromoteType(fileField.Type, field.Type))
+				targetType = a.typeToArrowType(promoted)
+			}
 			if !a.useLargeTypes {
 				targetType = retOrPanic(ensureSmallArrowTypes(targetType))
 			}
@@ -1189,6 +1197,19 @@ func canDowncastTimestampPrecision(fileType, readType iceberg.Type, enabled bool
 	}
 }
 
+func canPromoteDateToTimestamp(fileType, readType iceberg.Type) bool {
+	if _, ok := fileType.(iceberg.DateType); !ok {
+		return false
+	}
+
+	switch readType.(type) {
+	case iceberg.TimestampType, iceberg.TimestampNsType:
+		return true
+	default:
+		return false
+	}
+}
+
 func floorTimestampNanosecondsToMicroseconds(
 	mem memory.Allocator,
 	vals *array.Timestamp,
@@ -1232,6 +1253,16 @@ func (a *arrowProjectionVisitor) Schema(_ *iceberg.Schema, _ arrow.Array, result
 	return result
 }
 
+func ownsChildResult(arr arrow.Array) bool {
+	if arr == nil {
+		return false
+	}
+
+	_, nested := arr.DataType().(arrow.NestedType)
+
+	return nested
+}
+
 func (a *arrowProjectionVisitor) Struct(st iceberg.StructType, structArr arrow.Array, fieldResults []arrow.Array) arrow.Array {
 	if structArr == nil {
 		return nil
@@ -1242,7 +1273,7 @@ func (a *arrowProjectionVisitor) Struct(st iceberg.StructType, structArr arrow.A
 	for i, field := range st.FieldList {
 		arr := fieldResults[i]
 		if arr != nil {
-			if _, ok := arr.DataType().(arrow.NestedType); ok {
+			if ownsChildResult(arr) {
 				defer arr.Release()
 			}
 
@@ -1259,7 +1290,7 @@ func (a *arrowProjectionVisitor) Struct(st iceberg.StructType, structArr arrow.A
 				arr = defaultToArray(field.WriteDefault, field.Type, dt, structArr.Len(), alloc)
 			case field.InitialDefault != nil && !a.useWriteDefault:
 				arr = defaultToArray(field.InitialDefault, field.Type, dt, structArr.Len(), alloc)
-			case !field.Required:
+			case !field.Required || a.allowMissingRequired:
 				arr = array.MakeArrayOfNull(alloc, dt, structArr.Len())
 			default:
 				panic(fmt.Errorf("%w: required field is missing and has no default value: %s",
@@ -1299,6 +1330,10 @@ func (a *arrowProjectionVisitor) Field(_ iceberg.NestedField, _ arrow.Array, fie
 }
 
 func (a *arrowProjectionVisitor) List(listType iceberg.ListType, listArr arrow.Array, valArr arrow.Array) arrow.Array {
+	if ownsChildResult(valArr) {
+		defer valArr.Release()
+	}
+
 	arr, ok := listArr.(array.ListLike)
 	if !ok || valArr == nil {
 		return nil
@@ -1345,6 +1380,14 @@ func (a *arrowProjectionVisitor) List(listType iceberg.ListType, listArr arrow.A
 }
 
 func (a *arrowProjectionVisitor) Map(m iceberg.MapType, mapArray, keyResult, valResult arrow.Array) arrow.Array {
+	if ownsChildResult(keyResult) {
+		defer keyResult.Release()
+	}
+
+	if ownsChildResult(valResult) {
+		defer valResult.Release()
+	}
+
 	if keyResult == nil || valResult == nil {
 		return nil
 	}
@@ -1389,7 +1432,8 @@ func (a *arrowProjectionVisitor) Variant(_ iceberg.VariantType, arr arrow.Array)
 	}
 	// UnshredVariant returns a caller-owned array whose ref is balanced by
 	// castIfNeeded's Retain/Release. This holds only because VariantType is not
-	// an arrow.NestedType; if it were, Struct would also Release and double-free.
+	// an arrow.NestedType; if it were, ownsChildResult would report true and the
+	// parent Struct/List/Map would Release and double-free.
 	// The checked-allocator leak tests guard this invariant.
 	out, err := extensions.UnshredVariant(varr, compute.GetAllocator(a.ctx))
 	if err != nil {
@@ -1402,27 +1446,45 @@ func (a *arrowProjectionVisitor) Variant(_ iceberg.VariantType, arr arrow.Array)
 // SchemaOptions controls the behaviour of ToRequestedSchema.
 type SchemaOptions struct {
 	DowncastTimestamp bool
-	IncludeFieldIDs   bool
-	UseLargeTypes     bool
-	UseWriteDefault   bool
-	TableProperties   iceberg.Properties
+	// FormatVersion enables format-version-specific read promotions.
+	FormatVersion        int
+	IncludeFieldIDs      bool
+	UseLargeTypes        bool
+	UseWriteDefault      bool
+	AllowMissingRequired bool
+	TableProperties      iceberg.Properties
 }
 
 // ToRequestedSchema will construct a new record batch matching the requested iceberg schema
 // casting columns if necessary as appropriate.
 func ToRequestedSchema(ctx context.Context, requested, fileSchema *iceberg.Schema, batch arrow.RecordBatch, opts SchemaOptions) (arrow.RecordBatch, error) {
+	return toRequestedSchema(ctx, requested, fileSchema, batch, opts, nil)
+}
+
+// toRequestedSchema is the internal write-path variant of ToRequestedSchema.
+// When targetArrowSchema is provided, an exact Arrow schema match can reuse the
+// input batch without walking the Iceberg schema or rebuilding any arrays.
+func toRequestedSchema(ctx context.Context, requested, fileSchema *iceberg.Schema, batch arrow.RecordBatch, opts SchemaOptions, targetArrowSchema *arrow.Schema) (arrow.RecordBatch, error) {
+	if targetArrowSchema != nil && arrowSchemaEqual(batch.Schema(), targetArrowSchema) {
+		batch.Retain()
+
+		return batch, nil
+	}
+
 	st := array.RecordToStructArray(batch)
 	defer st.Release()
 
 	result, err := iceberg.VisitSchemaWithPartner[arrow.Array, arrow.Array](requested, st,
 		&arrowProjectionVisitor{
-			ctx:                 ctx,
-			fileSchema:          fileSchema,
-			tableProperties:     opts.TableProperties,
-			includeFieldIDs:     opts.IncludeFieldIDs,
-			downcastNsTimestamp: opts.DowncastTimestamp,
-			useLargeTypes:       opts.UseLargeTypes,
-			useWriteDefault:     opts.UseWriteDefault,
+			ctx:                  ctx,
+			fileSchema:           fileSchema,
+			tableProperties:      opts.TableProperties,
+			formatVersion:        opts.FormatVersion,
+			includeFieldIDs:      opts.IncludeFieldIDs,
+			downcastNsTimestamp:  opts.DowncastTimestamp,
+			useLargeTypes:        opts.UseLargeTypes,
+			useWriteDefault:      opts.UseWriteDefault,
+			allowMissingRequired: opts.AllowMissingRequired,
 		}, arrowAccessor{fileSchema: fileSchema})
 	if err != nil {
 		return nil, err
@@ -1433,16 +1495,26 @@ func ToRequestedSchema(ctx context.Context, requested, fileSchema *iceberg.Schem
 	return out, nil
 }
 
+func arrowSchemaEqual(left, right *arrow.Schema) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+
+	// Schema.Equal ignores top-level metadata. Full projection strips it, so
+	// guard it here; otherwise the fast path would preserve metadata projection drops.
+	return left.Equal(right) && left.Metadata().Equal(right.Metadata())
+}
+
 type schemaCompatVisitor struct {
 	provided *iceberg.Schema
 
-	errorData pterm.TableData
+	errorData [][]string
 }
 
 func checkSchemaCompat(requested, provided *iceberg.Schema) error {
 	sc := &schemaCompatVisitor{
 		provided:  provided,
-		errorData: pterm.TableData{{"", "Table Field", "Requested Field"}},
+		errorData: [][]string{{"", "Table Field", "Requested Field"}},
 	}
 
 	_, compat := iceberg.PreOrderVisit(requested, sc)
@@ -1544,12 +1616,20 @@ func (sc *schemaCompatVisitor) isFieldCompat(lhs iceberg.NestedField) bool {
 
 func (sc *schemaCompatVisitor) Schema(s *iceberg.Schema, v func() bool) bool {
 	if !v() {
-		pterm.DisableColor()
-		tbl := pterm.DefaultTable.WithHasHeader(true).WithData(sc.errorData)
-		tbl.Render()
-		txt, _ := tbl.Srender()
-		pterm.EnableColor()
-		panic("mismatch in fields:\n" + txt)
+		// Render the collected mismatch rows into the error message with the
+		// stdlib tabwriter. Unlike the former pterm renderer this writes only to
+		// the returned error and has no stdout side effect. tabwriter measures
+		// column width by rune count, so the leading status column (✅/❌) may be
+		// off by one display cell in terminals that render those double-width;
+		// the reported content is unaffected.
+		var buf strings.Builder
+		w := tabwriter.NewWriter(&buf, 0, 0, 2, ' ', 0)
+		for _, row := range sc.errorData {
+			fmt.Fprintln(w, strings.Join(row, "\t"))
+		}
+		_ = w.Flush()
+
+		panic("mismatch in fields:\n" + buf.String())
 	}
 
 	return true
@@ -1593,66 +1673,33 @@ func must[T any](v T, err error) T {
 }
 
 type arrowStatsCollector struct {
-	fieldID     int
-	schema      *iceberg.Schema
-	props       iceberg.Properties
-	defaultMode string
-}
-
-func (a *arrowStatsCollector) Schema(_ *iceberg.Schema, results func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
-	return results()
-}
-
-func (a *arrowStatsCollector) Struct(_ iceberg.StructType, results []func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
-	result := make([]tblutils.StatisticsCollector, 0, len(results))
-	for _, res := range results {
-		result = append(result, res()...)
-	}
-
-	return result
-}
-
-func (a *arrowStatsCollector) Field(field iceberg.NestedField, fieldRes func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
-	a.fieldID = field.ID
-
-	return fieldRes()
-}
-
-func (a *arrowStatsCollector) List(list iceberg.ListType, elemResult func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
-	a.fieldID = list.ElementID
-
-	return elemResult()
-}
-
-func (a *arrowStatsCollector) Map(m iceberg.MapType, keyResult, valResult func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
-	a.fieldID = m.KeyID
-	keyRes := keyResult()
-
-	a.fieldID = m.ValueID
-	valRes := valResult()
-
-	return append(keyRes, valRes...)
+	fieldID          int
+	schema           *iceberg.Schema
+	defaultMode      tblutils.MetricsMode
+	defaultModeError error
+	columnModes      map[string]tblutils.MetricsMode
+	columnModeErrors map[string]error
 }
 
 func (a *arrowStatsCollector) resolveColumnMetricsMode(colName string) tblutils.MetricsMode {
-	metMode, err := tblutils.MatchMetricsMode(a.defaultMode)
-	if err != nil {
+	if a.defaultModeError != nil {
+		panic(a.defaultModeError)
+	}
+
+	if metMode, ok := a.columnModes[colName]; ok {
+		return metMode
+	}
+	if err, ok := a.columnModeErrors[colName]; ok {
 		panic(err)
 	}
-	if colMode, ok := a.props[MetricsModeColumnConfPrefix+"."+colName]; ok {
-		metMode, err = tblutils.MatchMetricsMode(colMode)
-		if err != nil {
-			panic(err)
-		}
-	}
 
-	return metMode
+	return a.defaultMode
 }
 
-func (a *arrowStatsCollector) Primitive(dt iceberg.PrimitiveType) []tblutils.StatisticsCollector {
+func (a *arrowStatsCollector) primitiveCollector(dt iceberg.PrimitiveType, isNested bool) (tblutils.StatisticsCollector, bool) {
 	colName, ok := a.schema.FindColumnName(a.fieldID)
 	if !ok {
-		return []tblutils.StatisticsCollector{}
+		return tblutils.StatisticsCollector{}, false
 	}
 
 	metMode := a.resolveColumnMetricsMode(colName)
@@ -1666,47 +1713,141 @@ func (a *arrowStatsCollector) Primitive(dt iceberg.PrimitiveType) []tblutils.Sta
 		}
 	}
 
-	isNested := strings.Contains(colName, ".")
 	if isNested && (metMode.Typ == tblutils.MetricModeTruncate || metMode.Typ == tblutils.MetricModeFull) {
 		metMode = tblutils.MetricsMode{Typ: tblutils.MetricModeCounts}
 	}
 
-	return []tblutils.StatisticsCollector{{
+	return tblutils.StatisticsCollector{
 		FieldID:    a.fieldID,
 		IcebergTyp: dt,
 		ColName:    colName,
 		Mode:       metMode,
-	}}
+	}, true
 }
 
-func (a *arrowStatsCollector) Variant(_ iceberg.VariantType) []tblutils.StatisticsCollector {
+func (a *arrowStatsCollector) variantCollector() (tblutils.StatisticsCollector, bool) {
 	colName, ok := a.schema.FindColumnName(a.fieldID)
 	if !ok {
-		return []tblutils.StatisticsCollector{}
+		return tblutils.StatisticsCollector{}, false
 	}
 
-	return []tblutils.StatisticsCollector{{
+	return tblutils.StatisticsCollector{
 		FieldID: a.fieldID,
 		ColName: colName,
 		Mode:    a.resolveColumnMetricsMode(colName),
-	}}
+	}, true
 }
 
-func computeStatsPlan(sc *iceberg.Schema, props iceberg.Properties) (map[int]tblutils.StatisticsCollector, error) {
-	result := make(map[int]tblutils.StatisticsCollector)
+func statsPlanFieldCount(field iceberg.NestedField) int {
+	switch typ := field.Type.(type) {
+	case *iceberg.StructType:
+		count := 0
+		for _, nestedField := range typ.FieldList {
+			count += statsPlanFieldCount(nestedField)
+		}
+
+		return count
+	case *iceberg.ListType:
+		return statsPlanFieldCount(typ.ElementField())
+	case *iceberg.MapType:
+		return statsPlanFieldCount(typ.KeyField()) + statsPlanFieldCount(typ.ValueField())
+	default:
+		return 1
+	}
+}
+
+func collectStatsPlanField(visitor *arrowStatsCollector, result map[int]tblutils.StatisticsCollector, field iceberg.NestedField, isNested bool) {
+	switch typ := field.Type.(type) {
+	case *iceberg.StructType:
+		for _, nestedField := range typ.FieldList {
+			collectStatsPlanField(visitor, result, nestedField, true)
+		}
+	case *iceberg.ListType:
+		collectStatsPlanField(visitor, result, typ.ElementField(), true)
+	case *iceberg.MapType:
+		collectStatsPlanField(visitor, result, typ.KeyField(), true)
+		collectStatsPlanField(visitor, result, typ.ValueField(), true)
+	case iceberg.VariantType:
+		visitor.fieldID = field.ID
+		if collector, ok := visitor.variantCollector(); ok {
+			result[collector.FieldID] = collector
+		}
+	default:
+		visitor.fieldID = field.ID
+		collector, ok := visitor.primitiveCollector(field.Type.(iceberg.PrimitiveType), isNested)
+		if ok {
+			result[collector.FieldID] = collector
+		}
+	}
+}
+
+func computeStatsPlan(sc *iceberg.Schema, props iceberg.Properties) (result map[int]tblutils.StatisticsCollector, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			switch e := r.(type) {
+			case string:
+				err = fmt.Errorf("%w: %s", iceberg.ErrInvalidSchema, e)
+			case error:
+				err = fmt.Errorf("error encountered during schema visitor: %w", e)
+			}
+		}
+	}()
+
+	if sc == nil {
+		return nil, fmt.Errorf("%w: cannot visit nil schema", iceberg.ErrInvalidArgument)
+	}
+
+	defaultMode, defaultModeErr := tblutils.MatchMetricsMode(
+		props.Get(DefaultWriteMetricsModeKey, DefaultWriteMetricsModeDefault))
+	overrideCount := 0
+	for key := range props {
+		if strings.HasPrefix(key, MetricsModeColumnConfPrefix+".") {
+			overrideCount++
+		}
+	}
+
+	var columnModes map[string]tblutils.MetricsMode
+	var columnModeErrors map[string]error
+	for key, rawMode := range props {
+		colName, ok := strings.CutPrefix(key, MetricsModeColumnConfPrefix+".")
+		if !ok {
+			continue
+		}
+
+		mode, err := tblutils.MatchMetricsMode(rawMode)
+		if err != nil {
+			if columnModeErrors == nil {
+				columnModeErrors = make(map[string]error, overrideCount)
+			}
+
+			columnModeErrors[colName] = err
+
+			continue
+		}
+		if columnModes == nil {
+			columnModes = make(map[string]tblutils.MetricsMode, overrideCount)
+		}
+		columnModes[colName] = mode
+	}
 
 	visitor := &arrowStatsCollector{
-		schema: sc, props: props,
-		defaultMode: props.Get(DefaultWriteMetricsModeKey, DefaultWriteMetricsModeDefault),
+		schema:           sc,
+		defaultMode:      defaultMode,
+		defaultModeError: defaultModeErr,
+		columnModes:      columnModes,
+		columnModeErrors: columnModeErrors,
 	}
 
-	collectors, err := iceberg.PreOrderVisit(sc, visitor)
-	if err != nil {
-		return nil, err
+	fields := sc.FieldsRef(internal.SchemaRef{})
+	resultCount := 0
+	for _, field := range fields {
+		resultCount += statsPlanFieldCount(field)
 	}
 
-	for _, entry := range collectors {
-		result[entry.FieldID] = entry
+	result = make(map[int]tblutils.StatisticsCollector, resultCount)
+	for _, field := range fields {
+		collectStatsPlanField(visitor, result, field, strings.Contains(field.Name, "."))
 	}
 
 	return result, nil
@@ -1740,7 +1881,10 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 				}
 			}()
 
-			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, meta.props)
+			// Pass 0 so AddFiles does not claim sort_order_id on files
+			// it did not write (#1184). Callers that know the file's
+			// sort layout use FileToDataFile with an explicit id.
+			dataFiles[i] = fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, 0, meta.props)
 
 			return nil
 		})
@@ -1753,9 +1897,30 @@ func filesToDataFiles(ctx context.Context, fileIO iceio.IO, meta *MetadataBuilde
 	return dataFiles, nil
 }
 
-// fileToDataFile builds a DataFile for a pre-existing file. The caller cannot
-// convey its sort layout, so no sort_order_id is claimed.
-func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, props iceberg.Properties) iceberg.DataFile {
+// FileToDataFile builds a DataFile for an existing parquet file at
+// filePath, reading its footer to populate record count, file size,
+// column sizes, value/null counts and lower/upper bounds, and to infer
+// partition values for order-preserving transforms. sortOrderID is
+// stamped onto the DataFile so callers converting foreign parquet
+// footers can convey the file's sort layout (spec data-file field
+// sort_order_id); pass 0 to make no claim. Panics from the unexported
+// conversion are recovered into an error.
+func FileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties) (df iceberg.DataFile, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			switch e := r.(type) {
+			case error:
+				err = fmt.Errorf("error encountered during file conversion: %w", e)
+			default:
+				err = fmt.Errorf("error encountered during file conversion: %v", e)
+			}
+		}
+	}()
+
+	return fileToDataFile(ctx, fileIO, filePath, currentSchema, currentSpec, sortOrderID, props), nil
+}
+
+func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, currentSchema *iceberg.Schema, currentSpec iceberg.PartitionSpec, sortOrderID int, props iceberg.Properties) iceberg.DataFile {
 	format := tblutils.FormatFromFileName(filePath)
 	rdr := must(format.Open(ctx, fileIO, filePath))
 	defer rdr.Close()
@@ -1802,6 +1967,7 @@ func fileToDataFile(ctx context.Context, fileIO iceio.IO, filePath string, curre
 		Content:         iceberg.EntryContentData,
 		FileSize:        rdr.SourceFileSize(),
 		PartitionValues: partitionValues,
+		SortOrderID:     sortOrderID,
 	})
 }
 
@@ -1837,6 +2003,11 @@ type recordWritingArgs struct {
 	maxWriteWorkers int
 	clustered       bool
 	factoryOpts     []writerFactoryOption
+
+	// recordBatchBufferSize overrides the rolling writers' record
+	// channel capacity; non-positive uses the default (see
+	// rollingDataWriterQueueCapacity).
+	recordBatchBufferSize int
 	// existingDVs maps a data file path to the positions already recorded in
 	// its current deletion vector. On the v3 DV write path these are folded
 	// into the newly written DV so a data file that already had a DV ends up
@@ -2047,7 +2218,7 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 	// V3+ tables write deletion vectors via Puffin regardless of partitioning,
 	// matching the Java reference implementation, which hardcodes DV for v3 and
 	// does not expose a property to opt out. The DV path threads each data
-	// file's spec id and partition record through DVWriter.Add so partitioned
+	// file's spec id and partition record through DVWriter so partitioned
 	// outputs carry the correct manifest-entry partition.
 	if latestMetadata.Version() >= 3 {
 		return positionDeleteRecordsToDataFilesDV(ctx, rootLocation, args, latestMetadata, partitionContextByFilePath)
@@ -2105,7 +2276,7 @@ func positionDeleteRecordsToDataFiles(ctx context.Context, rootLocation string, 
 // positionDeleteRecordsToDataFilesDV produces deletion-vector Puffin output
 // for v3+ tables. Each row's data file path must have an entry in
 // partitionContextByFilePath: the (specID, partitionData) is captured on
-// DVWriter.Add and lands on the output DataFile manifest entry, mirroring
+// DVWriter.Load/AddPosition and lands on the output DataFile manifest entry, mirroring
 // Java's BaseDVFileWriter, which keys deletes by (path, spec, partition).
 // A missing entry is a programming error (the caller failed to pre-register
 // every data file targeted by the delete) and surfaces as an error rather
@@ -2157,7 +2328,7 @@ func positionDeleteRecordsToDataFilesDV(ctx context.Context, rootLocation string
 
 					return
 				}
-				if err := writer.Add(filePath, []int64{positions.Value(int(i))}, pCtx.specID, pCtx.partitionData); err != nil {
+				if err := writer.AddPosition(filePath, positions.Value(int(i)), pCtx.specID, pCtx.partitionData); err != nil {
 					yield(nil, err)
 
 					return

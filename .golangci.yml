@@ -21,7 +21,11 @@ linters:
   enable:
     - errcheck
     - govet
+    - intrange
+    - copyloopvar
+    - usestdlibvars
     - misspell
+    - modernize
     - nlreturn
     - perfsprint
     - staticcheck

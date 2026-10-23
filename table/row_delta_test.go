@@ -621,7 +621,7 @@ func TestRowDeltaIntegrationPosDeleteRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		idCol := rec.Column(0).(*array.Int64)
 		dataCol := rec.Column(1).(*array.String)
-		for i := 0; i < idCol.Len(); i++ {
+		for i := range idCol.Len() {
 			ids = append(ids, idCol.Value(i))
 			data = append(data, dataCol.Value(i))
 		}
@@ -1108,6 +1108,127 @@ func TestRowDeltaRemoveDeletesFailsInsteadOfReplaying(t *testing.T) {
 		"the data file must carry exactly one live DV: the peer's")
 }
 
+func TestRowDeltaRejectsInvalidDeletionVector(t *testing.T) {
+	const (
+		dataPath = "s3://bucket/data/insert.parquet"
+		dvPath   = "s3://bucket/data/dv-001.puffin"
+	)
+	offset, length := int64(4), int64(64)
+	negativeOffset, zeroLength := int64(-1), int64(0)
+
+	tests := []struct {
+		name          string
+		formatVersion int
+		rows          []iceberg.DataFile
+		deletes       []iceberg.DataFile
+		errContains   string
+	}{
+		{
+			name:          "deletion vector alone on v2",
+			formatVersion: 2,
+			deletes:       []iceberg.DataFile{buildDVFile(t, dvPath, dataPath)},
+			errContains:   "requires table format version >= 3",
+		},
+		{
+			name:          "deletion vector beside valid files on v2",
+			formatVersion: 2,
+			rows:          []iceberg.DataFile{buildDataFile(t, dataPath)},
+			deletes: []iceberg.DataFile{
+				buildPosDeleteFile(t, "s3://bucket/data/pos-del.parquet"),
+				buildEqDeleteFile(t, "s3://bucket/data/eq-del.parquet", []int{1}),
+				buildDVFile(t, dvPath, dataPath),
+			},
+			errContains: "requires table format version >= 3",
+		},
+		{
+			name:          "format version check precedes field checks on v2",
+			formatVersion: 2,
+			deletes:       []iceberg.DataFile{newRewriteDeletionVector(t, dvPath, "", nil, nil)},
+			errContains:   "requires table format version >= 3",
+		},
+		{
+			// v1 rejects every delete file before the DV check is reached.
+			name:          "deletion vector on v1",
+			formatVersion: 1,
+			deletes:       []iceberg.DataFile{buildDVFile(t, dvPath, dataPath)},
+			errContains:   "format version >= 2",
+		},
+		{
+			name:          "missing referenced data file on v3",
+			formatVersion: 3,
+			deletes:       []iceberg.DataFile{newRewriteDeletionVector(t, dvPath, "", &offset, &length)},
+			errContains:   "missing referenced_data_file",
+		},
+		{
+			name:          "missing content offset on v3",
+			formatVersion: 3,
+			deletes:       []iceberg.DataFile{newRewriteDeletionVector(t, dvPath, dataPath, nil, &length)},
+			errContains:   "missing content_offset",
+		},
+		{
+			name:          "negative content offset on v3",
+			formatVersion: 3,
+			deletes:       []iceberg.DataFile{newRewriteDeletionVector(t, dvPath, dataPath, &negativeOffset, &length)},
+			errContains:   "invalid content_offset -1",
+		},
+		{
+			name:          "missing content size on v3",
+			formatVersion: 3,
+			deletes:       []iceberg.DataFile{newRewriteDeletionVector(t, dvPath, dataPath, &offset, nil)},
+			errContains:   "missing content_size_in_bytes",
+		},
+		{
+			name:          "nonpositive content size on v3",
+			formatVersion: 3,
+			deletes:       []iceberg.DataFile{newRewriteDeletionVector(t, dvPath, dataPath, &offset, &zeroLength)},
+			errContains:   "invalid content_size_in_bytes 0",
+		},
+		{
+			name:          "parquet position delete on v3",
+			formatVersion: 3,
+			deletes:       []iceberg.DataFile{buildPosDeleteFile(t, "s3://bucket/data/pos-del.parquet")},
+			errContains:   "must be a deletion vector for v3 table",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tbl := newRowDeltaCommitTestTableVersion(t, tt.formatVersion)
+
+			rd := tbl.NewTransaction().NewRowDelta(nil).AddRows(tt.rows...).AddDeletes(tt.deletes...)
+
+			err := rd.Commit(t.Context())
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.errContains)
+			assert.Empty(t, writtenManifests(t, tbl.Location()), "a rejected row delta must not leave manifests behind")
+
+			validTx := tbl.NewTransaction()
+			require.NoError(t, validTx.NewRowDelta(nil).AddRows(buildDataFile(t, dataPath)).Commit(t.Context()))
+			assert.NotEmpty(t, writtenManifests(t, tbl.Location()), "the same probe must observe the manifests a successful commit writes")
+		})
+	}
+}
+
+func TestRowDeltaAcceptsDeletionVectorOnV3(t *testing.T) {
+	tbl := newRowDeltaCommitTestTableVersion(t, 3)
+	dataPath := tbl.Location() + "/data/insert.parquet"
+	dvPath := tbl.Location() + "/data/dv-001.puffin"
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.NewRowDelta(nil).AddDeletes(buildDVFile(t, dvPath, dataPath)).Commit(t.Context()))
+	tbl, err := tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	snap := tbl.CurrentSnapshot()
+	require.NotNil(t, snap)
+
+	live, removed := snapshotDeleteEntryFiles(t, snap, iceio.LocalFS{})
+	assert.Empty(t, removed)
+	require.Len(t, live, 1)
+	assert.Equal(t, dvPath, live[0].FilePath())
+	assert.Equal(t, dataPath, refOf(live[0]))
+}
+
 // Why: deletion vectors exist only in format v3; a v2 table cannot
 // carry the entries RemoveDeletes targets, and the error should say so
 // instead of failing resolution with a confusing lookup error.
@@ -1134,13 +1255,15 @@ func TestRowDeltaRemoveDeletesRequiresV3(t *testing.T) {
 // DV) while adding a valid DV.
 // Assertion: Commit fails identifying the live entry as not a DV.
 func TestRowDeltaRemoveDeletesRejectsNonDV(t *testing.T) {
-	tbl := newRowDeltaCommitTestTableVersion(t, 3)
+	tbl := newRowDeltaCommitTestTableVersion(t, 2)
 	location := tbl.Location()
 
+	// v3 rejects new Parquet pos-deletes, so the live one predates an upgrade.
 	posDelPath := location + "/data/pos-del-001.parquet"
 	tx := tbl.NewTransaction()
 	require.NoError(t, tx.NewRowDelta(nil).
 		AddDeletes(buildPosDeleteFile(t, posDelPath)).Commit(t.Context()))
+	require.NoError(t, tx.UpgradeFormatVersion(3))
 	tbl, err := tx.Commit(t.Context())
 	require.NoError(t, err)
 
@@ -1426,4 +1549,165 @@ func assertRowCount(t *testing.T, tbl *table.Table, expected int64) {
 	}
 
 	assert.Equal(t, expected, total, "unexpected row count")
+}
+
+func unregisteredSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpecID(99, iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: 1000, Name: "id_identity", Transform: iceberg.IdentityTransform{},
+	})
+}
+
+func buildPosDeleteFileForSpec(t *testing.T, spec iceberg.PartitionSpec, path string, partition map[int]any) iceberg.DataFile {
+	t.Helper()
+
+	b, err := iceberg.NewDataFileBuilder(
+		spec, iceberg.EntryContentPosDeletes,
+		path, iceberg.ParquetFile, partition, nil, nil, 5, 512)
+	require.NoError(t, err)
+
+	return b.Build()
+}
+
+func buildDataFileForSpec(t *testing.T, spec iceberg.PartitionSpec, path string, partition map[int]any) iceberg.DataFile {
+	t.Helper()
+
+	b, err := iceberg.NewDataFileBuilder(
+		spec, iceberg.EntryContentData,
+		path, iceberg.ParquetFile, partition, nil, nil, 10, 1024)
+	require.NoError(t, err)
+
+	return b.Build()
+}
+
+func TestRowDeltaRejectsDeleteFileWithUnregisteredSpec(t *testing.T) {
+	tbl := newRowDeltaCommitTestTable(t)
+
+	tx := tbl.NewTransaction()
+	rd := tx.NewRowDelta(nil)
+	rd.AddDeletes(buildPosDeleteFileForSpec(t, unregisteredSpec(),
+		"s3://bucket/data/pos-del.parquet", map[int]any{1000: int64(7)}))
+
+	err := rd.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+
+	result, err := tx.Commit(t.Context())
+	require.NoError(t, err)
+	assert.Nil(t, result.CurrentSnapshot(), "a rejected row delta must not produce a snapshot")
+}
+
+func TestRowDeltaRejectsDataFileWithUnregisteredSpec(t *testing.T) {
+	tbl := newRowDeltaCommitTestTable(t)
+
+	tx := tbl.NewTransaction()
+	rd := tx.NewRowDelta(nil)
+	rd.AddRows(buildDataFileForSpec(t, unregisteredSpec(),
+		"s3://bucket/data/insert.parquet", map[int]any{1000: int64(7)}))
+
+	err := rd.Commit(t.Context())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, table.ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+}
+
+func TestRowDeltaWritesRegisteredNonDefaultSpec(t *testing.T) {
+	tbl := newRowDeltaCommitTestTable(t)
+
+	evolveTx := tbl.NewTransaction()
+	require.NoError(t, evolveTx.UpdateSpec(false).
+		AddField("id", iceberg.IdentityTransform{}, "id_identity").
+		Commit())
+	evolved, err := evolveTx.Commit(t.Context())
+	require.NoError(t, err)
+
+	spec := evolved.Metadata().PartitionSpec()
+	require.NotEqual(t, 0, spec.ID(), "spec evolution must register a new spec id")
+	require.Equal(t, 1, spec.NumFields())
+	fieldID := spec.Field(0).FieldID
+	partition := map[int]any{fieldID: int64(7)}
+
+	tx := evolved.NewTransaction()
+	rd := tx.NewRowDelta(nil)
+	rd.AddRows(buildDataFileForSpec(t, spec, "s3://bucket/data/insert.parquet", partition))
+	rd.AddDeletes(buildPosDeleteFileForSpec(t, spec, "s3://bucket/data/pos-del.parquet", partition))
+	require.NoError(t, rd.Commit(t.Context()))
+
+	result, err := tx.Commit(t.Context())
+	require.NoError(t, err)
+
+	snap := result.CurrentSnapshot()
+	require.NotNil(t, snap)
+
+	fs := iceio.LocalFS{}
+	manifests, err := snap.Manifests(fs)
+	require.NoError(t, err)
+	require.Len(t, manifests, 2)
+
+	for _, m := range manifests {
+		assert.Equal(t, int32(spec.ID()), m.PartitionSpecID(),
+			"manifest must declare the spec its entries were written under")
+		entries := 0
+		for e, err := range m.Entries(fs, true) {
+			require.NoError(t, err)
+			assert.Equal(t, int32(spec.ID()), e.DataFile().SpecID())
+			assert.Equal(t, int64(7), e.DataFile().Partition()[fieldID])
+			entries++
+		}
+		assert.Equal(t, 1, entries)
+	}
+}
+
+func TestRowDeltaMixedSpecCommitLeavesNoManifests(t *testing.T) {
+	validData := func() iceberg.DataFile { return buildDataFile(t, "s3://bucket/data/insert.parquet") }
+	validDelete := func() iceberg.DataFile { return buildPosDeleteFile(t, "s3://bucket/data/pos-del.parquet") }
+	orphanData := func() iceberg.DataFile {
+		return buildDataFileForSpec(t, unregisteredSpec(), "s3://bucket/data/orphan.parquet", map[int]any{1000: int64(7)})
+	}
+	orphanDelete := func() iceberg.DataFile {
+		return buildPosDeleteFileForSpec(t, unregisteredSpec(), "s3://bucket/data/orphan-del.parquet", map[int]any{1000: int64(7)})
+	}
+
+	tests := []struct {
+		name    string
+		rows    []iceberg.DataFile
+		deletes []iceberg.DataFile
+	}{
+		{"valid data with unregistered delete", []iceberg.DataFile{validData()}, []iceberg.DataFile{orphanDelete()}},
+		{"valid delete with unregistered data", []iceberg.DataFile{orphanData()}, []iceberg.DataFile{validDelete()}},
+		{"valid data group before unregistered one", []iceberg.DataFile{validData(), orphanData()}, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tbl := newRowDeltaCommitTestTable(t)
+
+			tx := tbl.NewTransaction()
+			rd := tx.NewRowDelta(nil)
+			rd.AddRows(tt.rows...)
+			rd.AddDeletes(tt.deletes...)
+
+			err := rd.Commit(t.Context())
+			require.Error(t, err)
+			assert.ErrorIs(t, err, table.ErrPartitionSpecNotFound)
+			assert.Empty(t, writtenManifests(t, tbl.Location()),
+				"a rejected row delta must not leave manifests behind")
+
+			validTx := tbl.NewTransaction()
+			validRd := validTx.NewRowDelta(nil)
+			validRd.AddRows(validData())
+			require.NoError(t, validRd.Commit(t.Context()))
+			assert.NotEmpty(t, writtenManifests(t, tbl.Location()),
+				"the same probe must observe the manifests a successful commit writes")
+		})
+	}
+}
+
+func writtenManifests(t *testing.T, location string) []string {
+	t.Helper()
+
+	paths, err := filepath.Glob(filepath.Join(location, "metadata", "*.avro"))
+	require.NoError(t, err)
+
+	return paths
 }

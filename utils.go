@@ -18,24 +18,59 @@
 package iceberg
 
 import (
+	"encoding/binary"
 	"fmt"
 	"hash/maphash"
 	"maps"
 	"runtime/debug"
+
+	"github.com/apache/arrow-go/v18/parquet/variant"
 )
 
-var version string
+const (
+	icebergModulePath = "github.com/apache/iceberg-go"
+	unknownVersion    = "(unknown version)"
+)
 
-func init() {
-	version = "(unknown version)"
-	if info, ok := debug.ReadBuildInfo(); ok {
-		if info.Main.Version != "(devel)" {
-			version = info.Main.Version
+var version = detectVersion()
+
+func detectVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return unknownVersion
+	}
+
+	return versionFromBuildInfo(info)
+}
+
+func versionFromBuildInfo(info *debug.BuildInfo) string {
+	if info.Main.Path == icebergModulePath {
+		return moduleVersion(&info.Main)
+	}
+
+	for _, dep := range info.Deps {
+		if dep != nil && dep.Path == icebergModulePath {
+			return moduleVersion(dep)
 		}
 	}
+
+	return unknownVersion
+}
+
+func moduleVersion(module *debug.Module) string {
+	if module.Replace != nil {
+		module = module.Replace
+	}
+	if module.Version == "" || module.Version == "(devel)" {
+		return unknownVersion
+	}
+
+	return module.Version
 }
 
 func Version() string { return version }
+
+func fullVersion() string { return "Apache Iceberg Go " + Version() }
 
 // Optional represents a typed value that could be null
 type Optional[T any] struct {
@@ -87,8 +122,32 @@ var lzseed = maphash.MakeSeed()
 
 type literalSet map[any]struct{ orig Literal }
 
+// variantKey hashes the metadata and value bytes that VariantLiteral.Equals
+// compares. It must hash exactly what Equals compares: if Equals changes (e.g.
+// to logical equality), this key has to change with it.
+//
+// The metadata is length-prefixed so values that differ only in where the
+// metadata ends and the value begins hash different input. This matters for
+// correctness, not just collision odds: addliteral overwrites on a key match
+// without calling Equals, and metadata may carry trailing bytes, so such pairs
+// are constructible. A genuine 64-bit hash collision still drops the earlier
+// member, the same trade-off as the Binary, Fixed, and Geo cases.
+func variantKey(v VariantLiteral) uint64 {
+	val := variant.Value(v)
+	meta := val.Metadata().Bytes()
+
+	var lenBuf [binary.MaxVarintLen64]byte
+	var h maphash.Hash
+	h.SetSeed(lzseed)
+	h.Write(lenBuf[:binary.PutUvarint(lenBuf[:], uint64(len(meta)))])
+	h.Write(meta)
+	h.Write(val.Bytes())
+
+	return h.Sum64()
+}
+
 func newLiteralSet(vals ...Literal) Set[Literal] {
-	s := literalSet{}
+	s := make(literalSet, len(vals))
 	for _, v := range vals {
 		s.addliteral(v)
 	}
@@ -105,6 +164,9 @@ func (l literalSet) addliteral(v Literal) {
 	case GeoLiteral:
 		// GeoLiteral holds a []byte, so it cannot be used as a map key directly.
 		l[maphash.Bytes(lzseed, v.Value())] = struct{ orig Literal }{v}
+	case VariantLiteral:
+		// VariantLiteral holds []byte buffers, so it cannot be used as a map key directly.
+		l[variantKey(v)] = struct{ orig Literal }{v}
 	default:
 		l[v] = struct{ orig Literal }{}
 	}
@@ -134,6 +196,13 @@ func (l literalSet) Contains(lit Literal) bool {
 		return lit.Equals(v.orig)
 	case GeoLiteral:
 		v, ok := l[maphash.Bytes(lzseed, lit.Value())]
+		if !ok {
+			return false
+		}
+
+		return lit.Equals(v.orig)
+	case VariantLiteral:
+		v, ok := l[variantKey(lit)]
 		if !ok {
 			return false
 		}
