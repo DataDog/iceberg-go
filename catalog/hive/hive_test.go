@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/DataDog/iceberg-go"
@@ -890,6 +891,33 @@ func TestHiveRenameTableRejectsChangedMetadataAfterLock(t *testing.T) {
 	mockClient.AssertExpectations(t)
 }
 
+func TestHiveRenameTableToExistingTable(t *testing.T) {
+	mockClient := &mockHiveClient{}
+	destination := *testIcebergHiveTable1
+	destination.TableName = "renamed"
+	destination.DbName = "target_database"
+
+	mockClient.On("GetDatabase", mock.Anything, "target_database").
+		Return(&hive_metastore.Database{Name: "target_database"}, nil).Once()
+	mockClient.On("GetTable", mock.Anything, "test_database", "test_table").
+		Return(testIcebergHiveTable1, nil).Twice()
+	mockClient.On("Lock", mock.Anything, mock.Anything).
+		Return(&hive_metastore.LockResponse{Lockid: 2, State: hive_metastore.LockState_ACQUIRED}, nil).Once()
+	mockClient.On("GetTable", mock.Anything, "target_database", "renamed").
+		Return(&destination, nil).Once()
+	mockClient.On("Unlock", mock.Anything, int64(2)).Return(nil).Once()
+	hiveCatalog := NewCatalogWithClient(mockClient, iceberg.Properties{})
+
+	_, err := hiveCatalog.RenameTable(
+		context.Background(),
+		TableIdentifier("test_database", "test_table"),
+		TableIdentifier("target_database", "renamed"),
+	)
+	require.ErrorIs(t, err, catalog.ErrTableAlreadyExists)
+	mockClient.AssertNotCalled(t, "AlterTable", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	mockClient.AssertExpectations(t)
+}
+
 func TestHivePurgeTable(t *testing.T) {
 	assert := require.New(t)
 	ctx := context.Background()
@@ -916,16 +944,18 @@ func TestHivePurgeTableSwallowsPurgeFilesError(t *testing.T) {
 	assert := require.New(t)
 	ctx := context.Background()
 	const scheme = "hivepurgefail"
-	dropCalled := false
-	removeBeforeDrop := false
-	removeCalls := 0
+	var (
+		dropCalled       atomic.Bool
+		removeBeforeDrop atomic.Bool
+		removeCalls      atomic.Int64
+	)
 	failingFS := failRemoveIO{
 		MemFS: iceio.NewMemFS(),
 		err:   errHivePurgeRemove,
 		onRemove: func() {
-			removeCalls++
-			if !dropCalled {
-				removeBeforeDrop = true
+			removeCalls.Add(1)
+			if !dropCalled.Load() {
+				removeBeforeDrop.Store(true)
 			}
 		},
 	}
@@ -948,15 +978,15 @@ func TestHivePurgeTableSwallowsPurgeFilesError(t *testing.T) {
 		Return(hiveTable, nil).Twice()
 	mockClient.On("DropTable", mock.Anything, "test_database", "test_table", false).
 		Run(func(mock.Arguments) {
-			dropCalled = true
+			dropCalled.Store(true)
 		}).Return(nil).Once()
 
 	hiveCatalog := NewCatalogWithClient(mockClient, iceberg.Properties{})
 
 	assert.NoError(hiveCatalog.PurgeTable(ctx, TableIdentifier("test_database", "test_table")))
-	assert.True(dropCalled)
-	assert.Positive(removeCalls)
-	assert.False(removeBeforeDrop, "PurgeTable should drop the catalog entry before removing files")
+	assert.True(dropCalled.Load())
+	assert.Positive(removeCalls.Load())
+	assert.False(removeBeforeDrop.Load(), "PurgeTable should drop the catalog entry before removing files")
 	file, err := failingFS.Open(dataFile)
 	assert.NoError(err, "data file should remain when FileIO remove fails")
 	assert.NotNil(file)

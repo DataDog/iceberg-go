@@ -19,8 +19,9 @@ package iceberg
 
 import (
 	"bytes"
-	"github.com/goccy/go-json"
 	"testing"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go/internal"
 	"github.com/stretchr/testify/assert"

@@ -20,10 +20,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/goccy/go-json"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/table"

@@ -23,6 +23,7 @@ import (
 	"maps"
 
 	"github.com/DataDog/iceberg-go"
+	iceberginternal "github.com/DataDog/iceberg-go/internal"
 	tblutils "github.com/DataDog/iceberg-go/table/internal"
 	"github.com/apache/arrow-go/v18/parquet/metadata"
 )
@@ -352,11 +353,12 @@ func verifyReferencedDataFile(df iceberg.DataFile, ref string) error {
 		return string(s), nil
 	}
 
-	lower, err := decode(df.LowerBoundValues(), "lower")
+	lowerBounds, upperBounds := iceberginternal.BorrowedDataFileBounds(df)
+	lower, err := decode(lowerBounds, "lower")
 	if err != nil {
 		return err
 	}
-	upper, err := decode(df.UpperBoundValues(), "upper")
+	upper, err := decode(upperBounds, "upper")
 	if err != nil {
 		return err
 	}

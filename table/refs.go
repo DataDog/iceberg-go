@@ -20,8 +20,9 @@ package table
 import (
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"reflect"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 )

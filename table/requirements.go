@@ -20,8 +20,9 @@ package table
 import (
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"io"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go/internal"
 	"github.com/google/uuid"

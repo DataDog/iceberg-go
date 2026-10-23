@@ -18,9 +18,10 @@
 package iceberg_test
 
 import (
-	"github.com/goccy/go-json"
 	"math"
 	"testing"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/stretchr/testify/assert"

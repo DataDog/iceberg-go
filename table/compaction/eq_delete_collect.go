@@ -21,6 +21,7 @@ import (
 	"context"
 
 	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/internal"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
 )
@@ -129,10 +130,11 @@ func collectDeadEqualityDeletes(
 			if _, beingRewritten := rewrittenPaths[df.FilePath()]; beingRewritten {
 				continue
 			}
+			partition := internal.BorrowedDataFilePartition(df)
 			if specs == nil {
-				survey.AddSurvivor(df.Partition(), e.SequenceNum())
+				survey.AddSurvivor(partition, e.SequenceNum())
 			} else {
-				survey.AddSurvivorWithSpec(df.SpecID(), df.Partition(), e.SequenceNum())
+				survey.AddSurvivorWithSpec(df.SpecID(), partition, e.SequenceNum())
 			}
 		}
 	}

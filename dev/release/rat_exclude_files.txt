@@ -20,6 +20,10 @@ LICENSE
 NOTICE
 go.sum
 build
+CLAUDE.md
+DataDog.md
+initialize-fork.sh
+go-cloud/*
 rat-results.txt
 operation_string.go
 duckdb_v3_manifest_list.avro

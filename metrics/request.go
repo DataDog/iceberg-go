@@ -20,6 +20,7 @@ package metrics
 import (
 	"errors"
 	"fmt"
+
 	"github.com/goccy/go-json"
 )
 

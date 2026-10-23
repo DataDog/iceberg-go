@@ -235,6 +235,85 @@ func TestDecideDeadEqualityDeletesConservativelyMatchesAcrossSpecs(t *testing.T)
 		survey, []iceberg.ManifestEntry{voidCandidate}))
 }
 
+func TestDecideDeadEqualityDeletesUsesConservativeMinimum(t *testing.T) {
+	type candidate struct {
+		path string
+		seq  int64
+	}
+
+	tests := []struct {
+		name       string
+		survivors  []survivor
+		candidates []candidate
+		wantPaths  []string
+	}{
+		{
+			name: "minimum across partition buckets",
+			survivors: []survivor{
+				{partition: map[int]any{1000: "us"}, seq: 3},
+				{partition: map[int]any{1000: "eu"}, seq: 9},
+			},
+			candidates: []candidate{
+				{path: "/dead-before-min.parquet", seq: 2},
+				{path: "/dead-at-min.parquet", seq: 3},
+				{path: "/alive-after-min.parquet", seq: 4},
+				{path: "/unknown-seq.parquet", seq: -1},
+			},
+			wantPaths: []string{
+				"/dead-before-min.parquet",
+				"/dead-at-min.parquet",
+			},
+		},
+		{
+			name: "includes empty-partition bucket",
+			survivors: []survivor{
+				{partition: nil, seq: 7},
+				{partition: map[int]any{1000: "us"}, seq: 10},
+			},
+			candidates: []candidate{
+				{path: "/dead-at-empty-min.parquet", seq: 7},
+				{path: "/alive-after-empty-min.parquet", seq: 8},
+			},
+			wantPaths: []string{"/dead-at-empty-min.parquet"},
+		},
+		{
+			name: "deduplicates paths",
+			survivors: []survivor{
+				{partition: map[int]any{1000: "us"}, seq: 5},
+			},
+			candidates: []candidate{
+				{path: "/duplicate.parquet", seq: 5},
+				{path: "/duplicate.parquet", seq: 5},
+				{path: "/unknown-seq.parquet", seq: -1},
+			},
+			wantPaths: []string{"/duplicate.parquet"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			specs := compactionTestSpecs()
+			survey := compaction.NewSurvivorSurvey()
+			for _, s := range tt.survivors {
+				survey.AddSurvivor(s.partition, s.seq)
+			}
+
+			candidates := make([]iceberg.ManifestEntry, 0, len(tt.candidates))
+			for _, c := range tt.candidates {
+				candidates = append(candidates,
+					makeEqDeleteEntry(t, specs[0], nil, c.seq, c.path))
+			}
+
+			got := compaction.DecideDeadEqualityDeletes(survey, candidates)
+			gotPaths := make([]string, len(got))
+			for i, file := range got {
+				gotPaths[i] = file.FilePath()
+			}
+			assert.Equal(t, tt.wantPaths, gotPaths)
+		})
+	}
+}
+
 // TestSurvivorSurvey_AddSurvivor_DefensiveSeq asserts that a survivor
 // with sequence number < 0 is recorded as if seq=0 — guaranteeing it
 // stays "alive" against every eq-delete.
@@ -250,6 +329,30 @@ func TestSurvivorSurvey_AddSurvivor_DefensiveSeq(t *testing.T) {
 		survey, []iceberg.ManifestEntry{candidate}, specs)
 	require.NoError(t, err)
 	assert.Empty(t, got, "negative-seq survivor must keep eq-delete alive")
+}
+
+func TestSurvivorSurvey_AddSurvivorWithSpec_UsesMinimumSequence(t *testing.T) {
+	specs := compactionTestSpecs()
+	partition := map[int]any{1000: "us"}
+	survey := compaction.NewSurvivorSurvey()
+	survey.AddSurvivorWithSpec(1, partition, 9)
+	survey.AddSurvivorWithSpec(1, partition, 3)
+
+	alive, err := compaction.DecideDeadEqualityDeletesWithSpecs(
+		survey,
+		[]iceberg.ManifestEntry{makeEqDeleteEntry(t, specs[1], partition, 4, "/alive.parquet")},
+		specs,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, alive, "the lowest sequence survivor must keep the delete alive")
+
+	dead, err := compaction.DecideDeadEqualityDeletesWithSpecs(
+		survey,
+		[]iceberg.ManifestEntry{makeEqDeleteEntry(t, specs[1], partition, 3, "/dead.parquet")},
+		specs,
+	)
+	require.NoError(t, err)
+	assert.Len(t, dead, 1, "a delete at the survivor sequence must be dead")
 }
 
 type survivor struct {
@@ -293,7 +396,7 @@ func compactionTestSpecs() compactionTestSpecLookup {
 // reads only path, partition, content type, and seq, so a minimal
 // builder configuration is enough.
 func makeEqDeleteEntry(
-	t *testing.T,
+	t testing.TB,
 	spec iceberg.PartitionSpec,
 	part map[int]any,
 	seq int64,

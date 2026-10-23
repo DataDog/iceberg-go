@@ -20,10 +20,11 @@ package view
 import (
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"maps"
 	"slices"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/view/internal"
@@ -435,8 +436,11 @@ func (b *MetadataBuilder) Build() (*MetadataBuildResult, error) {
 		return nil, fmt.Errorf("unsupported format version %d", b.formatVersion)
 	}
 
+	// Build may run more than once on the same builder, so the history entry is
+	// appended to a copy. Appending to b.versionLog would add it again on every call.
+	versionLog := slices.Clone(b.versionLog)
 	if b.versionHistoryEntry != nil {
-		b.versionLog = append(b.versionLog, *b.versionHistoryEntry)
+		versionLog = append(versionLog, *b.versionHistoryEntry)
 	}
 
 	// If we had a previous version, check if we allow dropping dialects and if we did drop one
@@ -459,10 +463,10 @@ func (b *MetadataBuilder) Build() (*MetadataBuildResult, error) {
 	if len(b.versionList) > versionsToKeep {
 		retainedVersions = expireVersions(b.versionsById, versionsToKeep, b.versionsById[b.currentVersionID])
 		retainedVersionIDs := internal.ToSet(internal.MapSlice(retainedVersions, func(v *Version) int64 { return v.VersionID }))
-		retainedHistory = updateHistory(b.versionLog, retainedVersionIDs)
+		retainedHistory = updateHistory(versionLog, retainedVersionIDs)
 	} else {
 		retainedVersions = b.versionList
-		retainedHistory = b.versionLog
+		retainedHistory = versionLog
 	}
 
 	md, err := b.buildMetadata(retainedVersions, retainedHistory)

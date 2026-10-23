@@ -20,6 +20,7 @@ package rest
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,9 @@ import (
 	"time"
 
 	"github.com/DataDog/iceberg-go"
+	"github.com/DataDog/iceberg-go/go-cloud/blob/memblob"
 	iceio "github.com/DataDog/iceberg-go/io"
+	"github.com/DataDog/iceberg-go/io/gocloud/blobfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/semaphore"
@@ -139,12 +142,10 @@ func TestVendedCredsConcurrentAccess(t *testing.T) {
 	// No cached IO — concurrent initial loads should only create IO once.
 	var wg sync.WaitGroup
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, err := r.loadFS(context.Background())
 			assert.NoError(t, err)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -360,6 +361,18 @@ func TestVendedCredsServerExpiryUsedOnRefresh(t *testing.T) {
 
 	// expiresAt should be the server-provided value, not now+default.
 	assert.Equal(t, serverExpiry.UnixMilli(), r.expiresAt.UnixMilli())
+}
+
+func TestParseCredentialExpirySupportsAccountScopedADLSKey(t *testing.T) {
+	t.Parallel()
+
+	want := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	got, ok := parseCredentialExpiry(iceberg.Properties{
+		keyAdlsSasExpiresAtMs + ".account.dfs.core.windows.net": strconv.FormatInt(want.UnixMilli(), 10),
+	})
+
+	require.True(t, ok)
+	assert.Equal(t, want, got)
 }
 
 func TestVendedCredsRefreshTriggeredWithinExpiryBuffer(t *testing.T) {
@@ -637,4 +650,737 @@ func TestResolveStorageCredentials(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestPrefixScopedIOUsesLongestCredentialPerLocation(t *testing.T) {
+	t.Parallel()
+
+	p := newPrefixScopedIO(context.Background(), iceberg.Properties{"base": "yes"}, []StorageCredential{
+		{Prefix: "s3://metadata/table/", Config: iceberg.Properties{"credential": "metadata"}},
+		{Prefix: "s3://data/table/", Config: iceberg.Properties{"credential": "data"}},
+		{Prefix: "s3://data/table/private/", Config: iceberg.Properties{"credential": "private"}},
+	})
+
+	assert.Equal(t, "metadata", p.propertiesForLocation("s3://metadata/table/metadata.json")["credential"])
+	assert.Equal(t, "data", p.propertiesForLocation("s3://data/table/file.parquet")["credential"])
+	assert.Equal(t, "private", p.propertiesForLocation("s3://data/table/private/file.parquet")["credential"])
+	assert.Equal(t, "yes", p.propertiesForLocation("s3://other/table/file.parquet")["base"])
+}
+
+func TestPrefixScopedIOReplacesS3CredentialAtomically(t *testing.T) {
+	t.Parallel()
+
+	p := newPrefixScopedIO(context.Background(), iceberg.Properties{
+		iceio.S3EndpointURL:     "https://s3.local",
+		iceio.S3AccessKeyID:     "load-access",
+		iceio.S3SecretAccessKey: "load-secret",
+		iceio.S3SessionToken:    "load-token",
+		keyS3TokenExpiresAtMs:   "1000",
+	}, []StorageCredential{{
+		Prefix: "s3://bucket/data/",
+		Config: iceberg.Properties{
+			iceio.S3AccessKeyID:     "plan-access",
+			iceio.S3SecretAccessKey: "plan-secret",
+		},
+	}})
+
+	props := p.propertiesForLocation("s3://bucket/data/file.parquet")
+	assert.Equal(t, "https://s3.local", props[iceio.S3EndpointURL])
+	assert.Equal(t, "plan-access", props[iceio.S3AccessKeyID])
+	assert.Equal(t, "plan-secret", props[iceio.S3SecretAccessKey])
+	assert.NotContains(t, props, iceio.S3SessionToken)
+	assert.NotContains(t, props, keyS3TokenExpiresAtMs)
+}
+
+func TestPrefixScopedIOClearsStaleADLSAuthForVendedToken(t *testing.T) {
+	t.Parallel()
+
+	const (
+		host      = "acct.dfs.core.windows.net"
+		otherHost = "other.dfs.core.windows.net"
+	)
+
+	p := newPrefixScopedIO(context.Background(), iceberg.Properties{
+		iceio.ADLSEndpoint:                         "dfs.core.windows.net",
+		iceio.ADLSSharedKeyAccountName:             "acct",
+		iceio.ADLSSharedKeyAccountKey:              "stale-key",
+		iceio.ADLSSasTokenPrefix + host:            "stale-sas",
+		keyAdlsSasExpiresAtMs + "." + host:         "1000",
+		keyAdlsSasExpiresAtMs:                      "1000",
+		iceio.ADLSConnectionStringPrefix + "acct":  "stale-connection-string",
+		iceio.ADLSSasTokenPrefix + otherHost:       "other-sas",
+		keyAdlsSasExpiresAtMs + "." + otherHost:    "1000",
+		iceio.ADLSConnectionStringPrefix + "other": "other-connection-string",
+	}, []StorageCredential{{
+		Prefix: "abfss://container@" + host + "/",
+		Config: iceberg.Properties{iceio.ADLSToken: "vended-token"},
+	}})
+
+	props := p.propertiesForLocation("abfss://container@" + host + "/table/metadata.json")
+
+	// The vended token and unrelated tuning properties survive.
+	assert.Equal(t, "vended-token", props[iceio.ADLSToken])
+	assert.Equal(t, "dfs.core.windows.net", props[iceio.ADLSEndpoint])
+
+	// Everything that outranks adls.token in the Azure auth chain is gone, so the
+	// vended token is what actually authenticates the read.
+	assert.NotContains(t, props, iceio.ADLSSharedKeyAccountName)
+	assert.NotContains(t, props, iceio.ADLSSharedKeyAccountKey)
+	assert.NotContains(t, props, iceio.ADLSSasTokenPrefix+host)
+	assert.NotContains(t, props, keyAdlsSasExpiresAtMs+"."+host)
+	assert.NotContains(t, props, keyAdlsSasExpiresAtMs)
+	assert.NotContains(t, props, iceio.ADLSConnectionStringPrefix+"acct")
+
+	// Another account's SAS expiry would still set this IO's expiry, so it goes;
+	// its SAS token and connection string never apply here and are kept.
+	assert.NotContains(t, props, keyAdlsSasExpiresAtMs+"."+otherHost)
+	assert.Equal(t, "other-sas", props[iceio.ADLSSasTokenPrefix+otherHost])
+	assert.Equal(t, "other-connection-string", props[iceio.ADLSConnectionStringPrefix+"other"])
+}
+
+func TestPrefixScopedIOKeepsCredentialsWhenVendedADLSTokenIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	const host = "acct.dfs.core.windows.net"
+
+	p := newPrefixScopedIO(context.Background(), iceberg.Properties{
+		iceio.ADLSSharedKeyAccountName:  "acct",
+		iceio.ADLSSharedKeyAccountKey:   "working-key",
+		iceio.ADLSSasTokenPrefix + host: "working-sas",
+	}, []StorageCredential{{
+		Prefix: "abfss://container@" + host + "/",
+		Config: iceberg.Properties{iceio.ADLSToken: ""},
+	}})
+
+	props := p.propertiesForLocation("abfss://container@" + host + "/table/metadata.json")
+
+	// The Azure bucket factory skips an empty adls.token, so clearing on key
+	// presence alone would discard these working credentials and fall through to
+	// a weaker auth method.
+	assert.Equal(t, "acct", props[iceio.ADLSSharedKeyAccountName])
+	assert.Equal(t, "working-key", props[iceio.ADLSSharedKeyAccountKey])
+	assert.Equal(t, "working-sas", props[iceio.ADLSSasTokenPrefix+host])
+}
+
+func TestVendedCredsRefreshClearsStaleADLSAuth(t *testing.T) {
+	const (
+		scheme    = "vended-adls-refresh-test"
+		host      = "acct.dfs.core.windows.net"
+		otherHost = "other.dfs.core.windows.net"
+	)
+
+	// loadFS calls the factory synchronously, so captured needs no lock.
+	var captured iceberg.Properties
+	iceio.Register(scheme, func(_ context.Context, _ *url.URL, props map[string]string) (iceio.IO, error) {
+		captured = iceberg.Properties(props)
+
+		return iceio.LocalFS{}, nil
+	})
+	t.Cleanup(func() { iceio.Unregister(scheme) })
+
+	r := newTestRefresher(func(context.Context, []string) (iceberg.Properties, error) {
+		return iceberg.Properties{iceio.ADLSToken: "fresh-token"}, nil
+	})
+	r.location = scheme + "://container@" + host + "/table/metadata.json"
+	r.props = iceberg.Properties{
+		iceio.ADLSSharedKeyAccountName:       "acct",
+		iceio.ADLSSharedKeyAccountKey:        "stale-key",
+		iceio.ADLSSasTokenPrefix + host:      "stale-sas",
+		iceio.ADLSSasTokenPrefix + otherHost: "other-sas",
+	}
+	// Force the refresh branch: a cached IO whose credentials have expired.
+	r.cachedIO = iceio.LocalFS{}
+	r.expiresAt = time.Now().Add(-time.Hour)
+
+	_, err := r.loadFS(context.Background())
+	require.NoError(t, err)
+
+	// The refresher merges through mergeVendedCredentials, so the freshly vended
+	// token is not shadowed by credentials inherited from the catalog config.
+	assert.Equal(t, "fresh-token", captured[iceio.ADLSToken])
+	assert.NotContains(t, captured, iceio.ADLSSharedKeyAccountName)
+	assert.NotContains(t, captured, iceio.ADLSSharedKeyAccountKey)
+	assert.NotContains(t, captured, iceio.ADLSSasTokenPrefix+host)
+	assert.Equal(t, "other-sas", captured[iceio.ADLSSasTokenPrefix+otherHost])
+}
+
+// TestVendedCredsRefreshedADLSTokenExpiry checks that a vended adls.token gets
+// its expiry from expiration-time, or the default TTL without one, and never
+// from an inherited expiry, whether a SAS expiry for its own account or another
+// or an expiry for another kind of credential, which would otherwise win as the
+// earliest expiry. An already-expired one would make every
+// later filesystem load fetch credentials and rebuild the IO again.
+func TestVendedCredsRefreshedADLSTokenExpiry(t *testing.T) {
+	const (
+		scheme    = "vended-adls-expiry-test"
+		host      = "acct.dfs.core.windows.net"
+		otherHost = "other.dfs.core.windows.net"
+	)
+
+	iceio.Register(scheme, func(context.Context, *url.URL, map[string]string) (iceio.IO, error) {
+		return iceio.LocalFS{}, nil
+	})
+	t.Cleanup(func() { iceio.Unregister(scheme) })
+
+	now := time.Now()
+	tokenExpiry := now.Add(45 * time.Minute)
+	staleExpiry := strconv.FormatInt(now.Add(-time.Hour).UnixMilli(), 10)
+
+	for _, tc := range []struct {
+		name   string
+		vended iceberg.Properties
+		want   time.Time
+	}{
+		{
+			name: "expiration-time is honored",
+			vended: iceberg.Properties{
+				iceio.ADLSToken:   "fresh-token",
+				keyExpirationTime: strconv.FormatInt(tokenExpiry.UnixMilli(), 10),
+			},
+			want: tokenExpiry,
+		},
+		{
+			name:   "no expiry falls back to the default TTL",
+			vended: iceberg.Properties{iceio.ADLSToken: "fresh-token"},
+			want:   now.Add(defaultVendedCredentialsTTL),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fetches atomic.Int32
+			r := newTestRefresher(func(context.Context, []string) (iceberg.Properties, error) {
+				fetches.Add(1)
+
+				return tc.vended, nil
+			})
+			r.nowFunc = func() time.Time { return now }
+			r.location = scheme + "://container@" + host + "/table/metadata.json"
+			r.props = iceberg.Properties{
+				iceio.ADLSSasTokenPrefix + host:    "stale-sas",
+				keyAdlsSasExpiresAtMs + "." + host: staleExpiry,
+				keyAdlsSasExpiresAtMs:              staleExpiry,
+				keyS3TokenExpiresAtMs:              staleExpiry,
+				keyGcsOAuthExpiresAt:               staleExpiry,
+				// Overwritten when the token is vended with its own expiration-time.
+				keyExpirationTime:                       staleExpiry,
+				iceio.ADLSSasTokenPrefix + otherHost:    "other-sas",
+				keyAdlsSasExpiresAtMs + "." + otherHost: staleExpiry,
+			}
+			// Force the refresh branch: a cached IO whose credentials have expired.
+			r.cachedIO = iceio.LocalFS{}
+			r.expiresAt = now.Add(-time.Minute)
+
+			_, err := r.loadFS(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tc.want.UnixMilli(), r.expiresAt.UnixMilli())
+
+			// The token is still valid, so the next load reuses the IO instead of
+			// fetching credentials again.
+			_, err = r.loadFS(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, int32(1), fetches.Load())
+		})
+	}
+}
+
+func TestPrefixScopedIODoesNotHoldLockDuringFilesystemLoad(t *testing.T) {
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLoad) }) }
+
+	iceio.Register("prefix-scoped-lock-test", func(context.Context, *url.URL, map[string]string) (iceio.IO, error) {
+		close(loadStarted)
+		<-releaseLoad
+
+		return iceio.LocalFS{}, nil
+	})
+	defer iceio.Unregister("prefix-scoped-lock-test")
+	defer release()
+
+	p := newPrefixScopedIO(context.Background(), nil, nil)
+	loaded := make(chan error, 1)
+	go func() {
+		_, err := p.filesystemFor("prefix-scoped-lock-test://bucket/file.parquet")
+		loaded <- err
+	}()
+
+	<-loadStarted
+	lockAcquired := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		close(lockAcquired)
+		p.mu.Unlock()
+	}()
+
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("filesystem cache lock was held during filesystem loading")
+	}
+
+	release()
+	require.NoError(t, <-loaded)
+}
+
+type closeTrackingIO struct {
+	iceio.IO
+	closeCount *atomic.Int32
+}
+
+func (f *closeTrackingIO) Close() error {
+	f.closeCount.Add(1)
+
+	return nil
+}
+
+type blockingCloseIO struct {
+	iceio.IO
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (f *blockingCloseIO) Close() error {
+	close(f.started)
+	<-f.release
+
+	return nil
+}
+
+func TestPrefixScopedIOClosesFilesystemLostToCacheRace(t *testing.T) {
+	const scheme = "prefix-scoped-cache-race-test"
+
+	loadStarted := make(chan struct{}, 2)
+	releaseLoad := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLoad) }) }
+	defer release()
+
+	var closeCount atomic.Int32
+	iceio.Register(scheme, func(context.Context, *url.URL, map[string]string) (iceio.IO, error) {
+		loadStarted <- struct{}{}
+		<-releaseLoad
+
+		return &closeTrackingIO{IO: iceio.LocalFS{}, closeCount: &closeCount}, nil
+	})
+	defer iceio.Unregister(scheme)
+
+	p := newPrefixScopedIO(context.Background(), nil, nil)
+	type result struct {
+		fs  iceio.IO
+		err error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			fs, err := p.filesystemFor(scheme + "://bucket/file.parquet")
+			results <- result{fs: fs, err: err}
+		}()
+	}
+
+	for range 2 {
+		select {
+		case <-loadStarted:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for concurrent filesystem loads")
+		}
+	}
+	release()
+
+	var cached iceio.IO
+	for range 2 {
+		select {
+		case result := <-results:
+			require.NoError(t, result.err)
+			if cached == nil {
+				cached = result.fs
+			} else {
+				assert.Same(t, cached, result.fs)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for filesystem loads")
+		}
+	}
+
+	assert.Equal(t, int32(1), closeCount.Load(),
+		"the filesystem that lost the cache race must be closed")
+	require.NoError(t, p.Close())
+	assert.Equal(t, int32(2), closeCount.Load(),
+		"the cached filesystem must be closed when the scoped IO closes")
+}
+
+func TestPrefixScopedIOClosesFilesystemLoadedAfterClose(t *testing.T) {
+	const scheme = "prefix-scoped-close-during-load-test"
+
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseLoad) }) }
+	defer release()
+
+	var closeCount atomic.Int32
+	iceio.Register(scheme, func(context.Context, *url.URL, map[string]string) (iceio.IO, error) {
+		close(loadStarted)
+		<-releaseLoad
+
+		return &closeTrackingIO{IO: iceio.LocalFS{}, closeCount: &closeCount}, nil
+	})
+	defer iceio.Unregister(scheme)
+
+	p := newPrefixScopedIO(context.Background(), nil, nil)
+	loaded := make(chan error, 1)
+	go func() {
+		_, err := p.filesystemFor(scheme + "://bucket/file.parquet")
+		loaded <- err
+	}()
+
+	select {
+	case <-loadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for filesystem load")
+	}
+	require.NoError(t, p.Close())
+	release()
+
+	select {
+	case err := <-loaded:
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "prefix-scoped IO is closed")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for filesystem load to finish")
+	}
+	assert.Equal(t, int32(1), closeCount.Load(),
+		"a filesystem loaded after Close must be closed before returning")
+}
+
+func TestPrefixScopedIODoesNotHoldLockDuringFilesystemClose(t *testing.T) {
+	t.Parallel()
+
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseClose) }) }
+	defer release()
+
+	p := newPrefixScopedIO(context.Background(), nil, nil)
+	p.filesystems["cached"] = &blockingCloseIO{
+		IO:      iceio.LocalFS{},
+		started: closeStarted,
+		release: releaseClose,
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- p.Close() }()
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for filesystem close")
+	}
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		close(lockAcquired)
+		p.mu.Unlock()
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("filesystem cache lock was held during filesystem close")
+	}
+
+	release()
+	require.NoError(t, <-closeDone)
+}
+
+// An Azure IO is bound to one container@host authority, so two containers in
+// the same account need their own filesystems, whether or not a credential
+// matches them.
+func TestPrefixScopedIOKeysFilesystemsByContainer(t *testing.T) {
+	const scheme = "prefix-scoped-container-test"
+
+	var (
+		mu     sync.Mutex
+		opened []string
+	)
+	iceio.Register(scheme, func(_ context.Context, parsed *url.URL, _ map[string]string) (iceio.IO, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		opened = append(opened, parsed.User.Username())
+
+		return iceio.LocalFS{}, nil
+	})
+	t.Cleanup(func() { iceio.Unregister(scheme) })
+
+	for _, tc := range []struct {
+		name        string
+		credentials []StorageCredential
+	}{
+		{name: "no matching credential"},
+		{name: "one credential covering both containers", credentials: []StorageCredential{{
+			Prefix: scheme + "://",
+			Config: iceberg.Properties{iceio.ADLSSasTokenPrefix + "acct.dfs.core.windows.net": "sig=sas"},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			opened = nil
+			mu.Unlock()
+
+			p := newPrefixScopedIO(context.Background(), nil, tc.credentials)
+			for _, location := range []string{
+				scheme + "://c1@acct.dfs.core.windows.net/a.parquet",
+				scheme + "://c2@acct.dfs.core.windows.net/b.parquet",
+				scheme + "://c1@acct.dfs.core.windows.net/c.parquet",
+			} {
+				_, err := p.filesystemFor(location)
+				require.NoError(t, err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Equal(t, []string{"c1", "c2"}, opened)
+		})
+	}
+}
+
+func TestPrefixScopedIODoesNotApplyCredentialOutsidePrefix(t *testing.T) {
+	t.Parallel()
+
+	p := newPrefixScopedIO(context.Background(), iceberg.Properties{
+		iceio.S3EndpointURL: "https://s3.local",
+	}, []StorageCredential{{
+		Prefix: "s3://bucket/data/",
+		Config: iceberg.Properties{
+			iceio.S3AccessKeyID:     "plan-access",
+			iceio.S3SecretAccessKey: "plan-secret",
+		},
+	}})
+
+	props := p.propertiesForLocation("s3://other-bucket/data/file.parquet")
+	assert.Equal(t, "https://s3.local", props[iceio.S3EndpointURL])
+	assert.NotContains(t, props, iceio.S3AccessKeyID)
+	assert.NotContains(t, props, iceio.S3SecretAccessKey)
+}
+
+// newPrefixScopedIO does no detaching of its own: it keeps the context it is
+// given, which is how the refresher's close reaches the filesystems it opens.
+// loadFS hands it the refresher-owned context, never a caller's.
+func TestPrefixScopedIOPreservesReadContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p := newPrefixScopedIO(ctx, nil, nil)
+
+	cancel()
+	require.ErrorIs(t, p.ctx.Err(), context.Canceled)
+}
+
+// contextCapturingScheme is a filesystem that behaves like the gocloud
+// backends: every load returns a blobfs.FileIO over its own in-memory bucket,
+// opened on the context it is given, which blobfs keeps and uses for every
+// operation. It records each context and counts closes; closing an IO closes
+// its bucket.
+type contextCapturingScheme struct {
+	mu     sync.Mutex
+	opened []context.Context
+	closes []*atomic.Int32
+}
+
+func registerContextCapturingScheme(t *testing.T, scheme string) *contextCapturingScheme {
+	t.Helper()
+
+	c := &contextCapturingScheme{}
+
+	iceio.Register(scheme, func(ctx context.Context, u *url.URL, _ map[string]string) (iceio.IO, error) {
+		closes := &atomic.Int32{}
+
+		c.mu.Lock()
+		c.opened = append(c.opened, ctx)
+		c.closes = append(c.closes, closes)
+		c.mu.Unlock()
+
+		bfs := blobfs.New(ctx, memblob.OpenBucket(nil), blobfs.DefaultObjectLocationExtractor(u.Host, scheme))
+
+		return &closeCountingIO{FileIO: bfs, closeCount: closes}, nil
+	})
+	t.Cleanup(func() { iceio.Unregister(scheme) })
+
+	return c
+}
+
+// closeCountingIO counts closes and forwards them, so a closed IO fails the
+// way a closed gocloud bucket does.
+type closeCountingIO struct {
+	*blobfs.FileIO
+	closeCount *atomic.Int32
+}
+
+func (f *closeCountingIO) Close() error {
+	f.closeCount.Add(1)
+
+	return f.FileIO.Close()
+}
+
+func (c *contextCapturingScheme) loads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return len(c.opened)
+}
+
+func (c *contextCapturingScheme) ctx(i int) context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.opened[i]
+}
+
+func (c *contextCapturingScheme) closeCount(i int) int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.closes[i].Load()
+}
+
+// writeAndRead writes a file through fs and reads it back, failing the test if
+// either operation fails.
+func writeAndRead(t *testing.T, fs iceio.IO, location string) {
+	t.Helper()
+
+	wfs, ok := fs.(iceio.WriteFileIO)
+	require.True(t, ok, "%T is not writable", fs)
+	require.NoError(t, wfs.WriteFile(location, []byte("data")))
+
+	f, err := fs.Open(location)
+	require.NoError(t, err)
+	defer f.Close()
+
+	buf := make([]byte, 4)
+	_, err = f.ReadAt(buf, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "data", string(buf))
+}
+
+type vendedCtxKey struct{}
+
+// The cached IO outlives the call that built it, so a caller that scopes one
+// operation to its own context (cancelled when the operation returns) must not
+// leave every later operation with a filesystem opened on a dead context.
+// Renewal must not tear down the superseded IO either: callers that loaded it
+// may still be using it.
+func TestVendedCredsCachedIODoesNotInheritCallerCancellation(t *testing.T) {
+	const scheme = "vended-ctx-detach-test"
+
+	fs := registerContextCapturingScheme(t, scheme)
+
+	r := newTestRefresher(func(context.Context, []string) (iceberg.Properties, error) {
+		return iceberg.Properties{}, nil
+	})
+	r.location = scheme + "://bucket/tbl"
+
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), vendedCtxKey{}, "first"))
+	first, err := r.loadFS(ctx)
+	require.NoError(t, err)
+	cancel()
+
+	// A later caller gets the cached IO; it works although the first caller's
+	// context is done.
+	cached, err := r.loadFS(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, fs.loads())
+	writeAndRead(t, cached, scheme+"://bucket/tbl/a")
+
+	require.NoError(t, fs.ctx(0).Err(), "the cached IO must not be bound to the caller's cancellation")
+	// WithoutCancel keeps values, so the first caller's values reach the shared
+	// IO. This documents the current behaviour; it is a trade-off, not a promise.
+	assert.Equal(t, "first", fs.ctx(0).Value(vendedCtxKey{}))
+
+	// Renewal rebuilds the IO on the renewing caller's values.
+	r.expiresAt = time.Now().Add(-time.Minute)
+	ctx, cancel = context.WithCancel(context.WithValue(context.Background(), vendedCtxKey{}, "second"))
+	renewed, err := r.loadFS(ctx)
+	require.NoError(t, err)
+	cancel()
+
+	require.Equal(t, 2, fs.loads(), "renewal must rebuild the IO")
+	require.NoError(t, fs.ctx(1).Err(), "the renewed IO must not be bound to the caller's cancellation")
+	assert.Equal(t, "second", fs.ctx(1).Value(vendedCtxKey{}))
+	writeAndRead(t, renewed, scheme+"://bucket/tbl/b")
+
+	// The superseded IO stays usable for callers that still hold it.
+	writeAndRead(t, first, scheme+"://bucket/tbl/c")
+	require.NoError(t, fs.ctx(0).Err(), "renewal must not cancel the superseded IO's context")
+	assert.Equal(t, int32(0), fs.closeCount(0), "renewal must not close the superseded IO")
+}
+
+func TestVendedCredsCloseEndsTheIOContext(t *testing.T) {
+	const scheme = "vended-ctx-close-test"
+
+	fs := registerContextCapturingScheme(t, scheme)
+
+	r := newTestRefresher(func(context.Context, []string) (iceberg.Properties, error) {
+		return iceberg.Properties{}, nil
+	})
+	r.location = scheme + "://bucket/tbl"
+
+	_, err := r.loadFS(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, r.close())
+
+	require.ErrorIs(t, fs.ctx(0).Err(), context.Canceled)
+	assert.Equal(t, int32(1), fs.closeCount(0))
+}
+
+func TestVendedCredsFailedRenewalKeepsTheCachedIO(t *testing.T) {
+	const scheme = "vended-ctx-failed-renewal-test"
+
+	fs := registerContextCapturingScheme(t, scheme)
+
+	r := newTestRefresher(func(context.Context, []string) (iceberg.Properties, error) {
+		return iceberg.Properties{}, nil
+	})
+	r.location = scheme + "://bucket/tbl"
+
+	cached, err := r.loadFS(context.Background())
+	require.NoError(t, err)
+
+	// The renewed load resolves to a scheme with no registered filesystem.
+	r.location = "vended-ctx-unregistered://bucket/tbl"
+	r.expiresAt = time.Now().Add(-time.Minute)
+	_, err = r.loadFS(context.Background())
+	require.Error(t, err)
+
+	assert.Same(t, cached, r.cachedIO, "a failed renewal leaves the cached IO in place")
+	require.NoError(t, fs.ctx(0).Err(), "and its context alive")
+	assert.Equal(t, int32(0), fs.closeCount(0))
+}
+
+func TestVendedCredsPrefixScopedIODoesNotInheritCallerCancellation(t *testing.T) {
+	const scheme = "vended-prefix-ctx-detach-test"
+
+	fs := registerContextCapturingScheme(t, scheme)
+
+	r := newTestRefresher(nil)
+	r.location = scheme + "://bucket/tbl"
+	r.credentials = []StorageCredential{{Prefix: scheme + "://bucket/", Config: iceberg.Properties{}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loaded, err := r.loadFS(ctx)
+	require.NoError(t, err)
+	cancel()
+
+	p, ok := loaded.(*prefixScopedIO)
+	require.True(t, ok, "scan-plan credentials load a prefixScopedIO, got %T", loaded)
+
+	// prefixScopedIO opens its filesystems lazily, after the call that built it returned.
+	location := scheme + "://bucket/tbl/data/file.parquet"
+	opened, err := p.filesystemFor(location)
+	require.NoError(t, err)
+	writeAndRead(t, opened, location)
+
+	require.Equal(t, 1, fs.loads())
+	require.NoError(t, fs.ctx(0).Err(), "filesystems opened later must not inherit the first caller's cancellation")
+
+	require.NoError(t, r.close())
+	require.ErrorIs(t, fs.ctx(0).Err(), context.Canceled, "close ends the context its filesystems were opened with")
 }

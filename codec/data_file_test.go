@@ -277,10 +277,10 @@ var expectedDataFileMethods = []string{
 // changes; the round-trip test then enforces it is covered by an
 // explicit assertion above.
 func dataFileInterfaceMethods() []string {
-	t := reflect.TypeOf((*iceberg.DataFile)(nil)).Elem()
+	t := reflect.TypeFor[iceberg.DataFile]()
 	out := make([]string, 0, t.NumMethod())
-	for i := 0; i < t.NumMethod(); i++ {
-		out = append(out, t.Method(i).Name)
+	for method := range t.Methods() {
+		out = append(out, method.Name)
 	}
 	sort.Strings(out)
 
@@ -311,3 +311,20 @@ func (stubDataFile) FirstRowID() *int64                        { return nil }
 func (stubDataFile) ReferencedDataFile() *string               { return nil }
 func (stubDataFile) ContentOffset() *int64                     { return nil }
 func (stubDataFile) ContentSizeInBytes() *int64                { return nil }
+
+func TestEncodeDataFileRejectsProjectedMetadata(t *testing.T) {
+	for _, version := range []int{1, 2, 3} {
+		t.Run("v"+strconv.Itoa(version), func(t *testing.T) {
+			spec, schema, original := fullyPopulatedDataFile(t, version)
+			projected := iceberg.DataFileWithoutColumnStats(original)
+			encoded, err := codec.EncodeDataFile(projected, spec, schema, version)
+			require.ErrorIs(t, err, iceberg.ErrInvalidArgument)
+			require.Nil(t, encoded)
+			require.ErrorContains(t, err, "projected data file")
+
+			encoded, err = codec.EncodeDataFile(original, spec, schema, version)
+			require.NoError(t, err)
+			require.NotEmpty(t, encoded)
+		})
+	}
+}

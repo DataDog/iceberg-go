@@ -18,10 +18,11 @@
 package metrics
 
 import (
-	"github.com/goccy/go-json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/stretchr/testify/assert"

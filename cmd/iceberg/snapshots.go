@@ -20,10 +20,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/goccy/go-json"
 	"os"
+	"slices"
 	"strconv"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/table"
@@ -61,8 +63,7 @@ func buildSnapshotEntries(tbl *table.Table) []SnapshotEntry {
 	snapshots := tbl.Metadata().Snapshots()
 	entries := make([]SnapshotEntry, 0, len(snapshots))
 
-	for i := len(snapshots) - 1; i >= 0; i-- {
-		s := snapshots[i]
+	for _, s := range slices.Backward(snapshots) {
 
 		op := ""
 		addedFiles := "-"

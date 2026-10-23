@@ -21,17 +21,20 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/goccy/go-json"
 	"io"
 	"io/fs"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/goccy/go-json"
+
 	"github.com/DataDog/iceberg-go"
-	"github.com/DataDog/iceberg-go/internal"
+	"github.com/DataDog/iceberg-go/internal/iomock"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -103,7 +106,7 @@ func (m *memIO) Open(name string) (iceio.File, error) {
 		return nil, fs.ErrNotExist
 	}
 
-	return &internal.MockFile{Contents: bytes.NewReader(data)}, nil
+	return &iomock.MockFile{Contents: bytes.NewReader(data)}, nil
 }
 
 func (m *memIO) Create(name string) (iceio.FileWriter, error) {
@@ -217,7 +220,7 @@ func manifestSize(t *testing.T, version int, spec iceberg.PartitionSpec, schema 
 	return buf.Len()
 }
 
-func newTestDataFile(t *testing.T, spec iceberg.PartitionSpec, path string, partition map[int]any) iceberg.DataFile {
+func newTestDataFile(t testing.TB, spec iceberg.PartitionSpec, path string, partition map[int]any) iceberg.DataFile {
 	return newTestDataFileWithCount(t, spec, path, partition, 1)
 }
 
@@ -282,7 +285,7 @@ func newTestPosDeleteFileForSpec(
 	return builder.ReferencedDataFile(referencedDataFile).Build()
 }
 
-func newTestDataFileWithCount(t *testing.T, spec iceberg.PartitionSpec, path string, partition map[int]any, count int64) iceberg.DataFile {
+func newTestDataFileWithCount(t testing.TB, spec iceberg.PartitionSpec, path string, partition map[int]any, count int64) iceberg.DataFile {
 	t.Helper()
 
 	builder, err := iceberg.NewDataFileBuilder(
@@ -313,7 +316,7 @@ func partitionedSpec() iceberg.PartitionSpec {
 	})
 }
 
-func createTestTransaction(t *testing.T, io iceio.IO, spec iceberg.PartitionSpec) *Transaction {
+func createTestTransaction(t testing.TB, io iceio.IO, spec iceberg.PartitionSpec) *Transaction {
 	schema := simpleSchema()
 	meta, err := NewMetadata(schema, &spec, UnsortedSortOrder, "table-location", nil)
 	require.NoError(t, err, "new metadata")
@@ -576,6 +579,205 @@ func TestManifestMergeManagerClosesWriterOnError(t *testing.T) {
 	require.ErrorIs(t, err, errLimitedWrite)
 }
 
+func TestManifestMergeManagerClosesWriterBeforeFileOnReadFailure(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	trackIO := newTrackingIO()
+	txn := createTestTransaction(t, trackIO, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, trackIO, nil, nil)
+	df := newTestDataFile(t, spec, "file://data-1.parquet", nil)
+	manifest := writeTestManifestWithContent(t, trackIO, spec, schema, sp.snapshotID,
+		"table-location/metadata/manifest-1.avro", iceberg.ManifestContentData,
+		[]iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &sp.snapshotID, nil, nil, df),
+		})
+	missingManifest := iceberg.NewManifestFile(2, "table-location/metadata/missing.avro", 1,
+		int32(spec.ID()), sp.snapshotID).Build()
+
+	mgr := manifestMergeManager{snap: sp}
+	_, err := mgr.createManifest(spec.ID(), []iceberg.ManifestFile{manifest, missingManifest})
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.NotContains(t, err.Error(), "write after close",
+		"buffered entries must flush before the underlying file closes")
+	require.Equal(t, 1, trackIO.GetWriterCount())
+	require.Empty(t, trackIO.GetUnclosedWriters())
+}
+
+func TestManifestMergeReturnsReadErrorBeforeCreatingWriter(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	trackIO := newTrackingIO()
+	txn := createTestTransaction(t, trackIO, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, trackIO, nil, nil)
+
+	oldSnapshotID := sp.snapshotID - 1
+	sequenceNumber := int64(1)
+	df := newTestDataFile(t, spec, "file://deleted.parquet", nil)
+	deletedManifest := writeTestManifestWithContent(t, trackIO, spec, schema, oldSnapshotID,
+		"table-location/metadata/historical-delete.avro", iceberg.ManifestContentData,
+		[]iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusDELETED, &oldSnapshotID, &sequenceNumber, nil, df),
+		})
+	missingManifest := iceberg.NewManifestFile(2, "table-location/metadata/missing.avro", 1,
+		int32(spec.ID()), sp.snapshotID).Build()
+
+	mgr := manifestMergeManager{snap: sp}
+	_, err := mgr.createManifest(spec.ID(), []iceberg.ManifestFile{deletedManifest, missingManifest})
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.Zero(t, trackIO.GetWriterCount())
+}
+
+func TestManifestMergeSkipsHistoricalDeletedOnlyManifest(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	trackIO := newTrackingIO()
+	txn := createTestTransaction(t, trackIO, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, trackIO, nil, nil)
+
+	oldSnapshotID := sp.snapshotID - 1
+	sequenceNumber := int64(1)
+	df := newTestDataFile(t, spec, "file://deleted.parquet", nil)
+	manifestFile := writeTestManifestWithContent(t, trackIO, spec, schema, oldSnapshotID,
+		"table-location/metadata/historical-delete.avro", iceberg.ManifestContentData,
+		[]iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusDELETED, &oldSnapshotID, &sequenceNumber, nil, df),
+		})
+
+	mgr := manifestMergeManager{snap: sp}
+	created, err := mgr.createManifest(spec.ID(), []iceberg.ManifestFile{manifestFile})
+	require.NoError(t, err)
+	require.Nil(t, created)
+	require.Zero(t, trackIO.GetWriterCount())
+}
+
+func TestManifestMergeKeepsCurrentSnapshotDeletedEntries(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+
+	sequenceNumber := int64(1)
+	df := newTestDataFile(t, spec, "file://deleted.parquet", nil)
+	manifestFile := writeTestManifestWithContent(t, wfs, spec, schema, sp.snapshotID,
+		"mem://default/table-location/metadata/current-delete.avro", iceberg.ManifestContentData,
+		[]iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusDELETED, &sp.snapshotID, &sequenceNumber, nil, df),
+		})
+
+	mgr := manifestMergeManager{snap: sp}
+	created, err := mgr.createManifest(spec.ID(), []iceberg.ManifestFile{manifestFile})
+	require.NoError(t, err)
+	require.NotNil(t, created)
+
+	var entries []iceberg.ManifestEntry
+	for entry, err := range created.Entries(wfs, false) {
+		require.NoError(t, err)
+		entries = append(entries, entry)
+	}
+	require.Len(t, entries, 1)
+	require.Equal(t, iceberg.EntryStatusDELETED, entries[0].Status())
+	require.Equal(t, sp.snapshotID, entries[0].SnapshotID())
+	require.Equal(t, df.FilePath(), entries[0].DataFile().FilePath())
+}
+
+func TestManifestMergeGroupDropsEmptyMergedBin(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+
+	oldSnapshotID := sp.snapshotID - 1
+	sequenceNumber := int64(1)
+	manifests := make([]iceberg.ManifestFile, 0, 2)
+	for i := range 2 {
+		df := newTestDataFile(t, spec, "file://deleted-"+strconv.Itoa(i)+".parquet", nil)
+		manifests = append(manifests, writeTestManifestWithContent(t, wfs, spec, schema, oldSnapshotID,
+			"mem://default/table-location/metadata/historical-delete-"+strconv.Itoa(i)+".avro",
+			iceberg.ManifestContentData,
+			[]iceberg.ManifestEntry{
+				iceberg.NewManifestEntry(iceberg.EntryStatusDELETED, &oldSnapshotID, &sequenceNumber, nil, df),
+			}))
+	}
+
+	mgr := manifestMergeManager{
+		targetSizeBytes:  manifests[0].Length() + manifests[1].Length(),
+		minCountToMerge:  1,
+		mergeEnabled:     true,
+		mergeConcurrency: 1,
+		snap:             sp,
+	}
+
+	merged, err := mgr.mergeGroup(manifests[0], spec.ID(), manifests)
+	require.NoError(t, err)
+	require.Empty(t, merged)
+}
+
+func TestMergeAppendCommitSkipsHistoricalDeleteOnlyBin(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+	schema := simpleSchema()
+	parentSnapshotID := txn.meta.newSnapshotID()
+	sequenceNumber := int64(1)
+	historicalManifests := make([]iceberg.ManifestFile, 0, 2)
+	for i := range 2 {
+		dataFile := newTestDataFile(t, spec, "file://deleted-"+strconv.Itoa(i)+".parquet", nil)
+		historicalManifests = append(historicalManifests, writeTestManifestWithContent(t, wfs, spec, schema,
+			parentSnapshotID, "mem://default/table-location/metadata/historical-delete-bin-"+strconv.Itoa(i)+".avro",
+			iceberg.ManifestContentData, []iceberg.ManifestEntry{
+				iceberg.NewManifestEntry(iceberg.EntryStatusDELETED, &parentSnapshotID, &sequenceNumber, nil, dataFile),
+			}))
+	}
+	manifestListPath := "mem://default/table-location/metadata/snap-historical-delete-bin.avro"
+	manifestList, err := wfs.Create(manifestListPath)
+	require.NoError(t, err)
+	require.NoError(t, iceberg.WriteManifestList(
+		2, manifestList, parentSnapshotID, nil, &sequenceNumber, 0, historicalManifests))
+	require.NoError(t, manifestList.Close())
+	parentSnapshot := &Snapshot{
+		SnapshotID:     parentSnapshotID,
+		SequenceNumber: sequenceNumber,
+		TimestampMs:    time.Now().UnixMilli(),
+		ManifestList:   manifestListPath,
+		Summary:        &Summary{Operation: OpAppend, Properties: iceberg.Properties{}},
+	}
+	require.NoError(t, txn.meta.AddSnapshot(parentSnapshot))
+	require.NoError(t, txn.meta.SetSnapshotRef(MainBranch, parentSnapshotID, BranchRef))
+	meta, err := txn.meta.Build()
+	require.NoError(t, err)
+
+	mergeTxn := New(Identifier{"db", "tbl"}, meta, "metadata.json", func(context.Context) (iceio.IO, error) {
+		return wfs, nil
+	}, nil).NewTransaction()
+	if mergeTxn.meta.props == nil {
+		mergeTxn.meta.props = make(iceberg.Properties)
+	}
+	mergeTxn.meta.props[ManifestMergeEnabledKey] = "true"
+	mergeTxn.meta.props[ManifestMinMergeCountKey] = "2"
+	mergeTxn.meta.props[ManifestTargetSizeBytesKey] = strconv.FormatInt(
+		historicalManifests[0].Length()+historicalManifests[1].Length(), 10)
+	mergeAppend := newMergeAppendFilesProducer(OpAppend, mergeTxn, wfs, nil, nil)
+	newFile := newTestDataFile(t, spec, "file://new-data.parquet", nil)
+	mergeAppend.appendDataFile(newFile)
+	updates, requirements, err := mergeAppend.commit(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, mergeTxn.apply(updates, requirements))
+	meta, err = mergeTxn.meta.Build()
+	require.NoError(t, err)
+
+	outputManifests, err := meta.CurrentSnapshot().Manifests(wfs)
+	require.NoError(t, err)
+	require.Len(t, outputManifests, 1)
+	require.Equal(t, int32(1), outputManifests[0].AddedDataFiles())
+	var outputEntries []iceberg.ManifestEntry
+	for entry, entryErr := range outputManifests[0].Entries(wfs, false) {
+		require.NoError(t, entryErr)
+		outputEntries = append(outputEntries, entry)
+	}
+	require.Len(t, outputEntries, 1)
+	require.Equal(t, iceberg.EntryStatusADDED, outputEntries[0].Status())
+	require.Equal(t, newFile.FilePath(), outputEntries[0].DataFile().FilePath())
+}
+
 func TestOverwriteFilesExistingManifestsClosesWriterOnError(t *testing.T) {
 	spec := partitionedSpec()
 	schema := simpleSchema()
@@ -628,7 +830,7 @@ func TestOverwriteFilesExistingManifestsClosesWriterOnError(t *testing.T) {
 	sp := newOverwriteFilesProducer(OpOverwrite, txn, mem, nil, nil)
 	sp.deleteDataFile(deletedFile)
 
-	_, err = sp.existingManifests(&snap)
+	_, err = sp.parentDependentManifests(context.Background(), &snap)
 	require.ErrorIs(t, err, errLimitedWrite)
 }
 
@@ -713,7 +915,7 @@ func (t *trackingIO) Open(name string) (iceio.File, error) {
 		return nil, fs.ErrNotExist
 	}
 
-	return &internal.MockFile{Contents: bytes.NewReader(data)}, nil
+	return &iomock.MockFile{Contents: bytes.NewReader(data)}, nil
 }
 
 func (t *trackingIO) Create(name string) (iceio.FileWriter, error) {
@@ -974,7 +1176,7 @@ func TestRebuildManifestListSummaryFailureCreatesNoOutput(t *testing.T) {
 	parentManifestList := "mem://default/table-location/metadata/fresh-parent.avro"
 	out, err := wfs.Create(parentManifestList)
 	require.NoError(t, err)
-	require.NoError(t, iceberg.WriteManifestList(2, out, 77, nil, ptr(int64(0)), 0, nil))
+	require.NoError(t, iceberg.WriteManifestList(2, out, 77, nil, new(int64(0)), 0, nil))
 	require.NoError(t, out.Close())
 
 	sp.op = Operation("unsupported")
@@ -1062,6 +1264,61 @@ func TestAddedDeleteManifestsUseDeleteFileSpecID(t *testing.T) {
 	require.ElementsMatch(t, []int32{0, 1}, deleteManifestSpecIDs)
 }
 
+// changedPartitionPaths returns the partition paths named by a snapshot
+// summary's changed-partition entries.
+func changedPartitionPaths(summary iceberg.Properties) map[string]bool {
+	paths := make(map[string]bool)
+	for key := range summary {
+		if path, ok := strings.CutPrefix(key, changedPartitionPrefix); ok {
+			paths[path] = true
+		}
+	}
+
+	return paths
+}
+
+// TestAccumulateSummaryDeltaResolvesRemovedFileSpecByID checks that removed
+// files resolve their partition spec by ID, the way added files already do.
+// Removing a non-default spec that precedes the default one leaves a specs
+// slice whose positions no longer line up with spec IDs, so treating a spec ID
+// as a slice index reads the wrong spec or runs off the end of the slice.
+func TestAccumulateSummaryDeltaResolvesRemovedFileSpecByID(t *testing.T) {
+	txn, wfs := createTestTransactionWithMemIO(t, iceberg.NewPartitionSpec())
+	require.NoError(t, txn.meta.SetProperties(iceberg.Properties{WritePartitionSummaryLimitKey: "10"}))
+
+	bucketSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: 1000, Name: "id_bucket", Transform: iceberg.BucketTransform{NumBuckets: 4},
+	})
+	require.NoError(t, txn.meta.AddPartitionSpec(&bucketSpec, false))
+	truncSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: 1001, Name: "id_trunc", Transform: iceberg.TruncateTransform{Width: 8},
+	})
+	require.NoError(t, txn.meta.AddPartitionSpec(&truncSpec, false))
+	require.NoError(t, txn.meta.SetDefaultSpecID(-1))
+	require.NoError(t, txn.meta.RemovePartitionSpecs([]int{1}))
+
+	currentSpec, err := txn.meta.CurrentSpec()
+	require.NoError(t, err)
+	require.Equal(t, 2, currentSpec.ID(), "test setup should leave spec 2 as the default")
+	require.Len(t, txn.meta.specs, 2, "removing spec 1 should decouple slice positions from spec IDs")
+
+	df := newTestDataFile(t, *currentSpec, "mem://default/table-location/data/spec-2.parquet",
+		map[int]any{currentSpec.Field(0).FieldID: int32(0)})
+
+	appended := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
+	appended.appendDataFile(df)
+	addedSummary, err := appended.accumulateSummaryDelta(nil)
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{"id_trunc=0": true}, changedPartitionPaths(addedSummary))
+
+	deleted := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
+	deleted.deleteDataFile(df)
+	removedSummary, err := deleted.accumulateSummaryDelta(nil)
+	require.NoError(t, err)
+	require.Equal(t, changedPartitionPaths(addedSummary), changedPartitionPaths(removedSummary),
+		"adding and removing the same file must report the same changed partition")
+}
+
 // TestCreateManifestClosesUnderlyingFile tests that createManifest properly
 // closes the underlying file writer. This is related to issue #644 and #681.
 func TestCreateManifestClosesUnderlyingFile(t *testing.T) {
@@ -1126,7 +1383,7 @@ func TestManifestMergeGroupLimitsConcurrentBins(t *testing.T) {
 	sp := newFastAppendFilesProducer(OpAppend, txn, blockingIO, nil, nil)
 
 	manifests := make([]iceberg.ManifestFile, 0, 8)
-	for i := 0; i < cap(manifests); i++ {
+	for i := range cap(manifests) {
 		manifests = append(manifests, writeTestManifestFile(t, blockingIO, spec, schema, sp.snapshotID, i))
 	}
 
@@ -1150,9 +1407,6 @@ func TestManifestMergeGroupLimitsConcurrentBins(t *testing.T) {
 		require.FailNow(t, "timed out waiting for merge workers")
 	}
 
-	// Give any incorrectly-unbounded workers a chance to enter Create before
-	// releasing the blocked merge outputs.
-	time.Sleep(50 * time.Millisecond)
 	require.Equal(t, mergeConcurrency, blockingIO.MaxActive())
 
 	blockingIO.Release()
@@ -1167,9 +1421,10 @@ func TestManifestMergeGroupLimitsConcurrentBins(t *testing.T) {
 	require.LessOrEqual(t, blockingIO.MaxActive(), mergeConcurrency)
 }
 
-// TestOverwriteExistingManifestsClosesUnderlyingFile tests that existingManifests
-// in overwriteFiles properly closes the underlying file writer. This is related to issue #644 and #681.
-func TestOverwriteExistingManifestsClosesUnderlyingFile(t *testing.T) {
+// TestOverwriteParentDependentManifestsClosesUnderlyingFile tests that the
+// overwrite parent-dependent path properly closes the underlying file writer.
+// This is related to issue #644 and #681.
+func TestOverwriteParentDependentManifestsClosesUnderlyingFile(t *testing.T) {
 	trackIO := newTrackingIO()
 	spec := partitionedSpec()
 	txn := createTestTransaction(t, trackIO, spec)
@@ -1212,31 +1467,296 @@ func TestOverwriteExistingManifestsClosesUnderlyingFile(t *testing.T) {
 
 	trackIO.writers = make(map[string]*trackingWriteCloser)
 
-	_, err = sp.existingManifests(&snap)
-	require.NoError(t, err, "existingManifests should succeed")
+	_, err = sp.parentDependentManifests(context.Background(), &snap)
+	require.NoError(t, err, "parentDependentManifests should succeed")
 
 	unclosed := trackIO.GetUnclosedWriters()
-	require.Empty(t, unclosed, "all file writerFactory should be closed after existingManifests, but these are still open: %v", unclosed)
+	require.Empty(t, unclosed, "all file writerFactory should be closed after parentDependentManifests, but these are still open: %v", unclosed)
 }
 
-// errorOnDeletedEntries is a producerImpl that returns an error from deletedEntries()
-// to test that file writerFactory are properly closed even when deletedEntries fails.
-type errorOnDeletedEntries struct {
+func TestOverwriteParentDependentManifestsLimitsConcurrencyAndPreservesOrder(t *testing.T) {
+	const (
+		concurrency   = 2
+		manifestCount = 4
+	)
+
+	spec := partitionedSpec()
+	schema := simpleSchema()
+	blockingIO := newBlockingCreateIO(1<<20, nil, concurrency)
+	defer blockingIO.Release()
+	txn := createTestTransaction(t, blockingIO, spec)
+	sp := newOverwriteFilesProducer(OpOverwrite, txn, blockingIO, nil, nil)
+	of := sp.producerImpl.(*overwriteFiles)
+	of.manifestConcurrency = concurrency
+
+	snapshotID := int64(100)
+	sequenceNumber := int64(-1)
+	manifestSequenceNumber := int64(42)
+	manifests := make([]iceberg.ManifestFile, 0, manifestCount)
+	for i := range manifestCount {
+		deletedFile := newTestDataFile(t, spec, "file://deleted-"+strconv.Itoa(i)+".parquet", nil)
+		keptFile := newTestDataFile(t, spec, "file://kept-"+strconv.Itoa(i)+".parquet", nil)
+		sp.deleteDataFile(deletedFile)
+
+		entries := []iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &manifestSequenceNumber, nil, deletedFile),
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &manifestSequenceNumber, nil, keptFile),
+		}
+		path := "table-location/metadata/source-" + strconv.Itoa(i) + ".avro"
+		manifests = append(manifests, writeTestManifestWithEntries(t, blockingIO, spec, schema, snapshotID, path, entries))
+	}
+
+	manifestListPath := "table-location/metadata/snap-1.avro"
+	var listBuf bytes.Buffer
+	err := iceberg.WriteManifestList(2, &listBuf, snapshotID, nil, &sequenceNumber, 0, manifests)
+	require.NoError(t, err, "write manifest list")
+	require.NoError(t, blockingIO.WriteFile(manifestListPath, listBuf.Bytes()))
+
+	snap := Snapshot{
+		SnapshotID:     snapshotID,
+		SequenceNumber: sequenceNumber,
+		ManifestList:   manifestListPath,
+	}
+	txn.meta.snapshotList = []Snapshot{snap}
+	txn.meta.currentSnapshotID = &snapshotID
+
+	type result struct {
+		manifests []iceberg.ManifestFile
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := sp.parentDependentManifests(context.Background(), &snap)
+		done <- result{manifests: got, err: err}
+	}()
+
+	select {
+	case <-blockingIO.reached:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for overwrite manifest workers")
+	}
+	require.Equal(t, concurrency, blockingIO.MaxActive(), "manifest rewrites must respect the configured worker limit")
+
+	blockingIO.Release()
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Len(t, result.manifests, manifestCount+1)
+		require.Equal(t, iceberg.ManifestContentData, result.manifests[0].ManifestContent())
+		tombstones := make([]iceberg.ManifestEntry, 0, manifestCount)
+		for entry, err := range result.manifests[0].Entries(blockingIO, false) {
+			require.NoError(t, err)
+			tombstones = append(tombstones, entry)
+		}
+		require.Len(t, tombstones, manifestCount)
+		for i, manifest := range result.manifests {
+			if i == 0 {
+				continue
+			}
+			manifestIndex := i - 1
+			require.NotEqual(t, manifests[manifestIndex].FilePath(), manifest.FilePath(), "manifest %d should be rewritten", manifestIndex)
+			entries := make([]iceberg.ManifestEntry, 0, 1)
+			for entry, err := range manifest.Entries(blockingIO, false) {
+				require.NoError(t, err)
+				entries = append(entries, entry)
+			}
+			require.Len(t, entries, 1)
+			require.Equal(t, "file://kept-"+strconv.Itoa(manifestIndex)+".parquet", entries[0].DataFile().FilePath())
+		}
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for overwrite manifest workers to finish")
+	}
+}
+
+func TestOverwriteParentDependentManifestsCleansCompletedRewritesOnError(t *testing.T) {
+	spec := partitionedSpec()
+	schema := simpleSchema()
+	mem := newMemIO(1<<20, nil)
+	txn := createTestTransaction(t, mem, spec)
+	sp := newOverwriteFilesProducer(OpOverwrite, txn, mem, nil, nil)
+	of := sp.producerImpl.(*overwriteFiles)
+	// One worker ensures the first rewrite completes before the missing
+	// manifest fails, leaving a completed result for cleanup to remove.
+	of.manifestConcurrency = 1
+
+	snapshotID := int64(100)
+	sequenceNumber := int64(-1)
+	manifestSequenceNumber := int64(42)
+	deletedFile := newTestDataFile(t, spec, "file://deleted.parquet", nil)
+	keptFile := newTestDataFile(t, spec, "file://kept.parquet", nil)
+	sp.deleteDataFile(deletedFile)
+	entries := []iceberg.ManifestEntry{
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &manifestSequenceNumber, nil, deletedFile),
+		iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &snapshotID, &manifestSequenceNumber, nil, keptFile),
+	}
+	validPath := "table-location/metadata/source-valid.avro"
+	validManifest := writeTestManifestWithEntries(t, mem, spec, schema, snapshotID, validPath, entries)
+	missingManifest := iceberg.NewManifestFile(2,
+		"table-location/metadata/source-missing.avro", 1, int32(spec.ID()), snapshotID).Build()
+	manifests := []iceberg.ManifestFile{validManifest, missingManifest}
+
+	manifestListPath := "table-location/metadata/snap-1.avro"
+	var listBuf bytes.Buffer
+	err := iceberg.WriteManifestList(2, &listBuf, snapshotID, nil, &sequenceNumber, 0, manifests)
+	require.NoError(t, err, "write manifest list")
+	require.NoError(t, mem.WriteFile(manifestListPath, listBuf.Bytes()))
+
+	snap := Snapshot{
+		SnapshotID:     snapshotID,
+		SequenceNumber: sequenceNumber,
+		ManifestList:   manifestListPath,
+	}
+	txn.meta.snapshotList = []Snapshot{snap}
+	txn.meta.currentSnapshotID = &snapshotID
+
+	_, err = sp.parentDependentManifests(context.Background(), &snap)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.Equal(t, int32(1), sp.manifestCount.Load(), "the first manifest should have been rewritten before the failure")
+	for path := range mem.files {
+		require.NotContains(t, path, sp.commitUuid.String(), "failed filtering must remove completed replacement manifests")
+	}
+}
+
+// failParentDependentDeleteCreateIO lets the first manifest rewrite finish and
+// fails the following tombstone-manifest Create call.
+type failParentDependentDeleteCreateIO struct {
+	*memIO
+	failAt int
+	err    error
+
+	mu      sync.Mutex
+	creates int
+}
+
+func (f *failParentDependentDeleteCreateIO) Create(name string) (iceio.FileWriter, error) {
+	f.mu.Lock()
+	f.creates++
+	createNumber := f.creates
+	f.mu.Unlock()
+	if createNumber == f.failAt {
+		return nil, f.err
+	}
+
+	return f.memIO.Create(name)
+}
+
+func TestOverwriteParentDependentManifestsCleansRewritesWhenDeleteWriteFails(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	deleteErr := errors.New("delete manifest create failed")
+	mem := &failParentDependentDeleteCreateIO{
+		memIO:  newMemIO(1<<20, nil),
+		failAt: 2,
+		err:    deleteErr,
+	}
+	txn := createTestTransaction(t, mem, spec)
+	sp := newOverwriteFilesProducer(OpOverwrite, txn, mem, nil, nil)
+
+	parentSnapshotID := int64(100)
+	sequenceNumber := int64(20)
+	entrySequenceNumber := int64(11)
+	deletedFile := newTestDataFile(t, spec, "file://deleted.parquet", nil)
+	keptFile := newTestDataFile(t, spec, "file://kept.parquet", nil)
+	sp.deleteDataFile(deletedFile)
+	manifest := writeTestManifestWithEntries(t, mem, spec, schema, parentSnapshotID,
+		"table-location/metadata/source.avro", []iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &parentSnapshotID, &entrySequenceNumber, nil, deletedFile),
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &parentSnapshotID, &entrySequenceNumber, nil, keptFile),
+		})
+
+	manifestListPath := "table-location/metadata/snap-parent.avro"
+	var listBuf bytes.Buffer
+	err := iceberg.WriteManifestList(2, &listBuf, parentSnapshotID, nil, &sequenceNumber, 0,
+		[]iceberg.ManifestFile{manifest})
+	require.NoError(t, err)
+	require.NoError(t, mem.WriteFile(manifestListPath, listBuf.Bytes()))
+
+	parent := &Snapshot{
+		SnapshotID:     parentSnapshotID,
+		SequenceNumber: sequenceNumber,
+		ManifestList:   manifestListPath,
+	}
+	_, err = sp.parentDependentManifests(context.Background(), parent)
+	require.ErrorIs(t, err, deleteErr)
+	require.Equal(t, int32(2), sp.manifestCount.Load(), "the rewrite and failed tombstone Create should both reserve manifest numbers")
+
+	mem.mu.Lock()
+	paths := make([]string, 0, len(mem.files))
+	for path := range mem.files {
+		paths = append(paths, path)
+	}
+	mem.mu.Unlock()
+	for _, path := range paths {
+		require.NotContains(t, path, sp.commitUuid.String(), "second-stage failure must remove rewritten manifests")
+	}
+}
+
+func writeTestManifestWithEntries(
+	t testing.TB,
+	fs iceio.WriteFileIO,
+	spec iceberg.PartitionSpec,
+	schema *iceberg.Schema,
+	snapshotID int64,
+	path string,
+	entries []iceberg.ManifestEntry,
+) iceberg.ManifestFile {
+	t.Helper()
+
+	return writeTestManifestWithContent(t, fs, spec, schema, snapshotID, path,
+		iceberg.ManifestContentData, entries)
+}
+
+func writeTestManifestWithContent(
+	t testing.TB,
+	fs iceio.WriteFileIO,
+	spec iceberg.PartitionSpec,
+	schema *iceberg.Schema,
+	snapshotID int64,
+	path string,
+	content iceberg.ManifestContent,
+	entries []iceberg.ManifestEntry,
+) iceberg.ManifestFile {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer, err := iceberg.NewManifestWriter(2, &buf, spec, schema, snapshotID,
+		iceberg.WithManifestWriterContent(content))
+	require.NoError(t, err, "new manifest writer")
+	for _, entry := range entries {
+		switch entry.Status() {
+		case iceberg.EntryStatusDELETED:
+			err = writer.Delete(entry)
+		case iceberg.EntryStatusEXISTING:
+			err = writer.Existing(entry)
+		default:
+			err = writer.Add(entry)
+		}
+		require.NoError(t, err, "write manifest entry")
+	}
+	require.NoError(t, writer.Close(), "close manifest writer")
+	manifest, err := writer.ToManifestFile(path, int64(buf.Len()),
+		iceberg.WithManifestFileContent(content))
+	require.NoError(t, err, "write manifest")
+	require.NoError(t, fs.WriteFile(path, buf.Bytes()))
+
+	return manifest
+}
+
+// errorOnParentDependentManifests is a producerImpl that returns an error from
+// parentDependentManifests to test that added manifest writers are not started
+// before the parent-dependent work succeeds.
+type errorOnParentDependentManifests struct {
 	base                *snapshotProducer
 	err                 error
 	waitForWriter       <-chan struct{} // optional signal before returning error
 	cancelWaitForWriter <-chan struct{} // optional cancel channel
 }
 
-func (e *errorOnDeletedEntries) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+func (e *errorOnParentDependentManifests) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 	return manifests, nil
 }
 
-func (e *errorOnDeletedEntries) existingManifests(_ *Snapshot) ([]iceberg.ManifestFile, error) {
-	return nil, nil
-}
-
-func (e *errorOnDeletedEntries) deletedEntries(_ context.Context, _ *Snapshot) ([]iceberg.ManifestEntry, error) {
+func (e *errorOnParentDependentManifests) parentDependentManifests(_ context.Context, _ *Snapshot) ([]iceberg.ManifestFile, error) {
 	if e.waitForWriter != nil {
 		select {
 		case <-e.waitForWriter:
@@ -1248,11 +1768,11 @@ func (e *errorOnDeletedEntries) deletedEntries(_ context.Context, _ *Snapshot) (
 	return nil, e.err
 }
 
-func (e *errorOnDeletedEntries) validate(_ *conflictContext) error {
+func (e *errorOnParentDependentManifests) validate(_ *conflictContext) error {
 	return nil
 }
 
-func (e *errorOnDeletedEntries) needsValidation() bool { return true }
+func (e *errorOnParentDependentManifests) needsValidation() bool { return true }
 
 // blockingTrackingIO extends trackingIO to signal when a writer is created.
 type blockingTrackingIO struct {
@@ -1277,21 +1797,21 @@ func (b *blockingTrackingIO) Create(name string) (iceio.FileWriter, error) {
 	return writer, err
 }
 
-// This test verifies that NO writerFactory are created when deletedEntries() fails,
-// because the error should be returned before any goroutines start.
-func TestManifestsClosesWriterWhenDeletedEntriesFails(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// This test verifies that NO writerFactory are created when the
+// parent-dependent step fails, because the error should be returned before
+// added-content writers start.
+func TestManifestsClosesWriterWhenParentDependentManifestsFails(t *testing.T) {
+	ctx := t.Context()
 
 	blockingIO := newBlockingTrackingIO()
 	spec := iceberg.NewPartitionSpec()
 	txn := createTestTransaction(t, blockingIO, spec)
 
 	sp := createSnapshotProducer(OpAppend, txn, blockingIO, nil, nil)
-	errDeletedEntries := errors.New("simulated deletedEntries error")
-	sp.producerImpl = &errorOnDeletedEntries{
+	errParentDependentManifests := errors.New("simulated parent-dependent manifests error")
+	sp.producerImpl = &errorOnParentDependentManifests{
 		base:                sp,
-		err:                 errDeletedEntries,
+		err:                 errParentDependentManifests,
 		waitForWriter:       blockingIO.writerCreated,
 		cancelWaitForWriter: ctx.Done(),
 	}
@@ -1308,18 +1828,18 @@ func TestManifestsClosesWriterWhenDeletedEntriesFails(t *testing.T) {
 
 	select {
 	case <-done:
-		require.ErrorIs(t, manifestsErr, errDeletedEntries)
+		require.ErrorIs(t, manifestsErr, errParentDependentManifests)
 		writerCount := blockingIO.GetWriterCount()
 		require.NotZero(t, writerCount, "test setup error: expected writer to be created")
-		require.Fail(t, "goroutine started before deletedEntries() check, creating a writer that could be orphaned")
+		require.Fail(t, "added-content writer started before parent-dependent manifests completed")
 
 	case <-time.After(100 * time.Millisecond):
 		writerCount := blockingIO.GetWriterCount()
-		require.Zero(t, writerCount, "expected no writerFactory to be created when deletedEntries is called first")
+		require.Zero(t, writerCount, "expected no writerFactory to be created before parent-dependent manifests completes")
 	}
 }
 
-// TestFastAppendInheritsZeroCountManifests verifies that fastAppendFiles.existingManifests
+// TestFastAppendInheritsZeroCountManifests verifies that fastAppendFiles.parentDependentManifests
 // includes manifests with added_files_count=0 and existing_files_count=0. This is the
 // standard Iceberg v2 "inherited manifest" representation written by Athena and other
 // external writers. The previous filter (HasAddedFiles || HasExistingFiles) silently
@@ -1474,6 +1994,38 @@ func TestSummary_InheritsPreviousSnapshotTotals(t *testing.T) {
 	require.Equal(t, "1", sum.Properties[addedDataFilesKey])
 }
 
+func TestCommitPersistsEnvironmentContextInSnapshotSummary(t *testing.T) {
+	keys := []string{
+		iceberg.EnvironmentEngineNameKey,
+		iceberg.EnvironmentEngineVersionKey,
+	}
+	preserveEnvironmentProperties(t, keys...)
+	iceberg.SetEnvironmentProperty(iceberg.EnvironmentEngineNameKey, "iceberg-go-test")
+	iceberg.SetEnvironmentProperty(iceberg.EnvironmentEngineVersionKey, "1.0")
+
+	spec := iceberg.NewPartitionSpec()
+	txn, memIO := createTestTransactionWithMemIO(t, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, memIO, nil, iceberg.Properties{
+		iceberg.EnvironmentEngineNameKey: "snapshot-property",
+		"user-summary":                   "present",
+	})
+	sp.appendDataFile(newTestDataFile(t, spec, "file://data.parquet", nil))
+
+	updates, requirements, err := sp.commit(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, txn.apply(updates, requirements))
+	meta, err := txn.meta.Build()
+	require.NoError(t, err)
+
+	snapshot := meta.CurrentSnapshot()
+	require.NotNil(t, snapshot)
+	require.NotNil(t, snapshot.Summary)
+	require.Equal(t, "Apache Iceberg Go "+iceberg.Version(), snapshot.Summary.Properties["iceberg-version"])
+	require.Equal(t, "iceberg-go-test", snapshot.Summary.Properties[iceberg.EnvironmentEngineNameKey])
+	require.Equal(t, "1.0", snapshot.Summary.Properties[iceberg.EnvironmentEngineVersionKey])
+	require.Equal(t, "present", snapshot.Summary.Properties["user-summary"])
+}
+
 // TestSummary_ParentSnapshotWithoutSummary verifies that summary computation
 // does not panic when the parent snapshot exists but has no summary (V1 /
 // omitempty). Totals fall back to the zero baseline like a new table.
@@ -1572,7 +2124,7 @@ func TestSummaryOnRetry_SkipsAlreadyRemovedDeleteFile(t *testing.T) {
 	parentManifestList := "mem://default/table-location/metadata/fresh-parent-skip.avro"
 	out, err := wfs.Create(parentManifestList)
 	require.NoError(t, err)
-	require.NoError(t, iceberg.WriteManifestList(2, out, 77, nil, ptr(int64(0)), 0, nil))
+	require.NoError(t, iceberg.WriteManifestList(2, out, 77, nil, new(int64(0)), 0, nil))
 	require.NoError(t, out.Close())
 
 	freshParent := &Snapshot{
@@ -1675,7 +2227,7 @@ func TestCheckRemovedFiles_AbortsWhenRewriteTargetMissing(t *testing.T) {
 	parentManifestList := "mem://default/table-location/metadata/fresh-parent-diverged.avro"
 	out, err := wfs.Create(parentManifestList)
 	require.NoError(t, err)
-	require.NoError(t, iceberg.WriteManifestList(2, out, 99, nil, ptr(int64(0)), 0, nil))
+	require.NoError(t, iceberg.WriteManifestList(2, out, 99, nil, new(int64(0)), 0, nil))
 	require.NoError(t, out.Close())
 
 	freshParent := &Snapshot{SnapshotID: 99, ManifestList: parentManifestList}
@@ -1780,12 +2332,12 @@ func TestCheckRemovedFiles_ExactDVPresentAndSubtracted(t *testing.T) {
 		"a DV still present on the fresh parent must be subtracted (1→0)")
 }
 
-// TestExistingManifests_SupersededDVSurvivesRetry pins the manifest-filter half
+// TestParentDependentManifests_SupersededDVSurvivesRetry pins the manifest-filter half
 // of the pair-matching rule: on an OCC retry the fresh parent may carry a
 // peer's replacement DV for the data file whose DV this producer removes. The
 // replacement must be inherited untouched and not tombstoned — ref-only
 // matching would expunge it and resurrect the rows the peer deleted.
-func TestExistingManifests_SupersededDVSurvivesRetry(t *testing.T) {
+func TestParentDependentManifests_SupersededDVSurvivesRetry(t *testing.T) {
 	spec := iceberg.NewPartitionSpec()
 	txn, wfs := createTestTransactionWithMemIO(t, spec)
 	sp := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
@@ -1801,20 +2353,17 @@ func TestExistingManifests_SupersededDVSurvivesRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, parentManifests, 1)
 
-	got, err := sp.existingManifests(parent)
+	got, err := sp.parentDependentManifests(context.Background(), parent)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "the peer's deletes manifest must be inherited")
 	require.Equal(t, parentManifests[0].FilePath(), got[0].FilePath(),
 		"nothing matched, so the manifest is passed through untouched")
-
-	tombstones, err := sp.deletedEntries(context.Background(), parent)
-	require.NoError(t, err)
-	require.Empty(t, tombstones, "no DELETE tombstone for the peer's replacement DV")
 }
 
-// TestExistingManifests_ExactDVStillExpunged is the companion guard: the exact
-// captured DV is still filtered from the inherited manifests and tombstoned.
-func TestExistingManifests_ExactDVStillExpunged(t *testing.T) {
+// TestParentDependentManifests_ExactDVStillExpunged is the companion guard:
+// the exact captured DV is still filtered from the inherited manifests and
+// tombstoned.
+func TestParentDependentManifests_ExactDVStillExpunged(t *testing.T) {
 	spec := iceberg.NewPartitionSpec()
 	txn, wfs := createTestTransactionWithMemIO(t, spec)
 	sp := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
@@ -1824,15 +2373,121 @@ func TestExistingManifests_ExactDVStillExpunged(t *testing.T) {
 	sp.removeDeletionVector(staleDV)
 
 	parent := writeParentSnapshotWithDeletesManifest(t, wfs, spec, 94, "expunged", staleDV)
-
-	got, err := sp.existingManifests(parent)
+	parentManifests, err := parent.Manifests(wfs)
 	require.NoError(t, err)
-	require.Empty(t, got, "a manifest whose only entry is the removed DV is dropped")
+	require.Len(t, parentManifests, 1)
 
-	tombstones, err := sp.deletedEntries(context.Background(), parent)
+	got, err := sp.parentDependentManifests(context.Background(), parent)
 	require.NoError(t, err)
+	require.Len(t, got, 1, "the removed-only source manifest is replaced by a tombstone manifest")
+	require.NotEqual(t, parentManifests[0].FilePath(), got[0].FilePath())
+
+	var tombstones []iceberg.ManifestEntry
+	for entry, err := range got[0].Entries(wfs, false) {
+		require.NoError(t, err)
+		tombstones = append(tombstones, entry)
+	}
 	require.Len(t, tombstones, 1)
+	require.Equal(t, iceberg.EntryStatusDELETED, tombstones[0].Status())
 	require.Equal(t, staleDV.FilePath(), tombstones[0].DataFile().FilePath())
+}
+
+// TestOverwriteParentDependentManifestsUsesProductionPath verifies the
+// overwrite producer's actual parent-dependent implementation. It keeps one
+// entry in each manifest, writes tombstones before the rewritten manifests,
+// and preserves the source entry sequence numbers in those tombstones.
+func TestOverwriteParentDependentManifestsUsesProductionPath(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	schema := simpleSchema()
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+	sp := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
+
+	parentSnapshotID := int64(100)
+	parentSequenceNumber := int64(20)
+	dataSequenceNumber := int64(11)
+	deleteSequenceNumber := int64(12)
+	deletedData := newTestDataFile(t, spec, "mem://default/table-location/data/deleted.parquet", nil)
+	keptData := newTestDataFile(t, spec, "mem://default/table-location/data/kept.parquet", nil)
+	removedDelete := newTestPosDeleteFileForSpec(t, spec,
+		"mem://default/table-location/data/removed-delete.parquet", nil, deletedData.FilePath())
+	keptDelete := newTestPosDeleteFileForSpec(t, spec,
+		"mem://default/table-location/data/kept-delete.parquet", nil, keptData.FilePath())
+	sp.deleteDataFile(deletedData)
+	sp.removeDeleteFile(removedDelete)
+
+	dataManifest := writeTestManifestWithContent(t, wfs, spec, schema, parentSnapshotID,
+		"mem://default/table-location/metadata/data-source.avro", iceberg.ManifestContentData,
+		[]iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &parentSnapshotID, &dataSequenceNumber, nil, deletedData),
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &parentSnapshotID, &dataSequenceNumber, nil, keptData),
+		})
+	deleteManifest := writeTestManifestWithContent(t, wfs, spec, schema, parentSnapshotID,
+		"mem://default/table-location/metadata/delete-source.avro", iceberg.ManifestContentDeletes,
+		[]iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &parentSnapshotID, &deleteSequenceNumber, nil, removedDelete),
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, &parentSnapshotID, &deleteSequenceNumber, nil, keptDelete),
+		})
+
+	manifestListPath := "mem://default/table-location/metadata/snap-parent.avro"
+	var listBuf bytes.Buffer
+	err := iceberg.WriteManifestList(2, &listBuf, parentSnapshotID, nil, &parentSequenceNumber, 0,
+		[]iceberg.ManifestFile{dataManifest, deleteManifest})
+	require.NoError(t, err)
+	require.NoError(t, wfs.WriteFile(manifestListPath, listBuf.Bytes()))
+
+	parent := &Snapshot{
+		SnapshotID:     parentSnapshotID,
+		SequenceNumber: parentSequenceNumber,
+		ManifestList:   manifestListPath,
+	}
+	got, err := sp.parentDependentManifests(context.Background(), parent)
+	require.NoError(t, err)
+	require.Len(t, got, 4)
+	require.Equal(t, []iceberg.ManifestContent{
+		iceberg.ManifestContentData,
+		iceberg.ManifestContentDeletes,
+		iceberg.ManifestContentData,
+		iceberg.ManifestContentDeletes,
+	}, []iceberg.ManifestContent{
+		got[0].ManifestContent(), got[1].ManifestContent(),
+		got[2].ManifestContent(), got[3].ManifestContent(),
+	})
+	require.NotEqual(t, dataManifest.FilePath(), got[2].FilePath())
+	require.NotEqual(t, deleteManifest.FilePath(), got[3].FilePath())
+
+	readEntries := func(manifest iceberg.ManifestFile) []iceberg.ManifestEntry {
+		entries := make([]iceberg.ManifestEntry, 0, 2)
+		for entry, err := range manifest.Entries(wfs, false) {
+			require.NoError(t, err)
+			entries = append(entries, entry)
+		}
+
+		return entries
+	}
+
+	dataTombstone := readEntries(got[0])
+	require.Len(t, dataTombstone, 1)
+	require.Equal(t, iceberg.EntryStatusDELETED, dataTombstone[0].Status())
+	require.Equal(t, sp.snapshotID, dataTombstone[0].SnapshotID())
+	require.Equal(t, dataSequenceNumber, dataTombstone[0].SequenceNum())
+	require.Equal(t, deletedData.FilePath(), dataTombstone[0].DataFile().FilePath())
+
+	deleteTombstone := readEntries(got[1])
+	require.Len(t, deleteTombstone, 1)
+	require.Equal(t, iceberg.EntryStatusDELETED, deleteTombstone[0].Status())
+	require.Equal(t, sp.snapshotID, deleteTombstone[0].SnapshotID())
+	require.Equal(t, deleteSequenceNumber, deleteTombstone[0].SequenceNum())
+	require.Equal(t, removedDelete.FilePath(), deleteTombstone[0].DataFile().FilePath())
+
+	keptDataEntries := readEntries(got[2])
+	require.Len(t, keptDataEntries, 1)
+	require.Equal(t, iceberg.EntryStatusEXISTING, keptDataEntries[0].Status())
+	require.Equal(t, keptData.FilePath(), keptDataEntries[0].DataFile().FilePath())
+
+	keptDeleteEntries := readEntries(got[3])
+	require.Len(t, keptDeleteEntries, 1)
+	require.Equal(t, iceberg.EntryStatusEXISTING, keptDeleteEntries[0].Status())
+	require.Equal(t, keptDelete.FilePath(), keptDeleteEntries[0].DataFile().FilePath())
 }
 
 // writeParentSnapshotWithDeletesManifest writes a v3 deletes manifest holding
@@ -1926,4 +2581,191 @@ func TestAddDataFilesV2SucceedsWithoutFirstRowID(t *testing.T) {
 
 	err := txn.AddDataFiles(context.Background(), []iceberg.DataFile{df}, nil)
 	require.NoError(t, err)
+}
+
+func unregisteredSpec() iceberg.PartitionSpec {
+	return iceberg.NewPartitionSpecID(99, iceberg.PartitionField{
+		SourceIDs: []int{1}, FieldID: 1000, Name: "id_identity", Transform: iceberg.IdentityTransform{},
+	})
+}
+
+func TestSnapshotProducerSpecFailsClosed(t *testing.T) {
+	registered := partitionedSpec()
+	txn, wfs := createTestTransactionWithMemIO(t, registered)
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+
+	got, err := sp.spec(registered.ID())
+	require.NoError(t, err)
+	assert.True(t, got.Equals(registered), "registered id must resolve to the table's spec")
+
+	_, err = sp.spec(99)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+}
+
+func TestWriteAddedDeleteManifestRejectsUnregisteredSpec(t *testing.T) {
+	spec := partitionedSpec()
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+
+	posDel := newTestPosDeleteFileForSpec(t, unregisteredSpec(),
+		"mem://default/table-location/data/pos-del.parquet", map[int]any{1000: int32(7)},
+		"mem://default/table-location/data/data.parquet")
+
+	_, err := sp.writeAddedDeleteManifest(99, []deleteFileAddition{{file: posDel}})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+}
+
+func TestCreateManifestRejectsUnregisteredSpec(t *testing.T) {
+	registered := partitionedSpec()
+	txn, wfs := createTestTransactionWithMemIO(t, registered)
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+	mgr := manifestMergeManager{snap: sp}
+
+	orphan := writeTestManifestFile(t, wfs, unregisteredSpec(), simpleSchema(), sp.snapshotID, 1)
+	require.Equal(t, int32(99), orphan.PartitionSpecID())
+
+	_, err := mgr.createManifest(99, []iceberg.ManifestFile{orphan})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+
+	merged, err := mgr.createManifest(registered.ID(),
+		[]iceberg.ManifestFile{writeTestManifestFile(t, wfs, registered, simpleSchema(), sp.snapshotID, 2)})
+	require.NoError(t, err, "a registered spec id must still merge")
+	assert.Equal(t, int32(registered.ID()), merged.PartitionSpecID())
+}
+
+func TestParentDependentManifestsRejectsUnregisteredSpec(t *testing.T) {
+	txn, wfs := createTestTransactionWithMemIO(t, partitionedSpec())
+	sp := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
+
+	staleDV := newTestDeletionVectorForRef(t, unregisteredSpec(),
+		"mem://default/table-location/data/dv-old.puffin",
+		"mem://default/table-location/data/d.parquet")
+	sp.removeDeletionVector(staleDV)
+
+	parent := writeParentSnapshotWithDeletesManifest(t, wfs, unregisteredSpec(), 95, "unregistered", staleDV)
+
+	_, err := sp.parentDependentManifests(context.Background(), parent)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+}
+
+func TestParentDependentManifestsCleansOrphanOnWriterConstructionError(t *testing.T) {
+	spec := iceberg.NewPartitionSpec()
+	txn, wfs := createTestTransactionWithMemIO(t, spec)
+	sp := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
+
+	dataPath := "mem://default/table-location/data/d.parquet"
+	staleDV := newTestDeletionVectorForRef(t, spec,
+		"mem://default/table-location/data/dv-old.puffin", dataPath)
+	sp.removeDeletionVector(staleDV)
+	parent := writeParentSnapshotWithDeletesManifest(t, wfs, spec, 96, "writer-error", staleDV)
+
+	sp.txn.meta.formatVersion = 4
+	before := metadataFiles(t, wfs)
+	_, err := sp.parentDependentManifests(context.Background(), parent)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported manifest version")
+	assert.Equal(t, before, metadataFiles(t, wfs),
+		"writer construction failure must not leave an orphan")
+}
+
+func TestAccumulateSummaryDeltaRejectsUnregisteredSpec(t *testing.T) {
+	registered := partitionedSpec()
+	txn, wfs := createTestTransactionWithMemIO(t, registered)
+
+	sp := newFastAppendFilesProducer(OpAppend, txn, wfs, nil, nil)
+	sp.appendDataFile(newTestDataFile(t, registered,
+		"mem://default/table-location/data/ok.parquet", map[int]any{1000: int32(7)}))
+	_, err := sp.accumulateSummaryDelta(nil)
+	require.NoError(t, err, "a registered spec must still be summarized")
+
+	sp.appendDataFile(newTestDataFile(t, unregisteredSpec(),
+		"mem://default/table-location/data/orphan.parquet", map[int]any{1000: int32(7)}))
+	_, err = sp.accumulateSummaryDelta(nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+	assert.ErrorContains(t, err, "99")
+}
+
+func TestBuildManifestsRejectsUnregisteredSpecBeforeWriting(t *testing.T) {
+	registered := partitionedSpec()
+	partition := map[int]any{1000: int32(7)}
+	dataPath := "mem://default/table-location/data/d.parquet"
+
+	setup := func(t *testing.T, tag string) (*snapshotProducer, iceio.WriteFileIO, *Snapshot) {
+		t.Helper()
+
+		txn, wfs := createTestTransactionWithMemIO(t, registered)
+		sp := newOverwriteFilesProducer(OpOverwrite, txn, wfs, nil, nil)
+		validDV := newTestDeletionVectorForRef(t, registered,
+			"mem://default/table-location/data/dv-valid.puffin", dataPath)
+		sp.removeDeletionVector(validDV)
+
+		return sp, wfs, writeParentSnapshotWithDeletesManifest(t, wfs, registered, 97, tag, validDV)
+	}
+
+	t.Run("unregistered added file", func(t *testing.T) {
+		sp, wfs, parent := setup(t, "added")
+		sp.appendDataFile(newTestDataFile(t, unregisteredSpec(),
+			"mem://default/table-location/data/orphan.parquet", partition))
+
+		before := metadataFiles(t, wfs)
+		_, _, err := sp.buildManifests(context.Background(), parent)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+		assert.Equal(t, before, metadataFiles(t, wfs),
+			"the valid deletion must not be written before the added spec is rejected")
+	})
+
+	t.Run("unregistered removed file", func(t *testing.T) {
+		sp, wfs, parent := setup(t, "removed")
+		sp.removeDeleteFile(newTestPosDeleteFileForSpec(t, unregisteredSpec(),
+			"mem://default/table-location/data/orphan-del.parquet", partition, dataPath))
+
+		before := metadataFiles(t, wfs)
+		_, _, err := sp.buildManifests(context.Background(), parent)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrPartitionSpecNotFound)
+		assert.Equal(t, before, metadataFiles(t, wfs))
+	})
+
+	t.Run("all specs registered", func(t *testing.T) {
+		sp, wfs, parent := setup(t, "registered")
+		sp.appendDataFile(newTestDataFile(t, registered,
+			"mem://default/table-location/data/added.parquet", partition))
+
+		before := metadataFiles(t, wfs)
+		_, _, err := sp.buildManifests(context.Background(), parent)
+		require.NoError(t, err)
+		assert.Greater(t, len(metadataFiles(t, wfs)), len(before),
+			"the same probe must observe the manifests a successful build writes")
+	})
+}
+
+func metadataFiles(t *testing.T, wfs iceio.WriteFileIO) []string {
+	t.Helper()
+
+	listable, ok := wfs.(iceio.ListableIO)
+	require.True(t, ok, "test IO must support listing")
+
+	var paths []string
+	require.NoError(t, listable.WalkDir("mem://default/table-location/metadata",
+		func(path string, d fs.DirEntry, err error) error {
+			require.NoError(t, err)
+			if !d.IsDir() {
+				paths = append(paths, path)
+			}
+
+			return nil
+		}))
+	slices.Sort(paths)
+
+	return paths
 }

@@ -18,7 +18,7 @@
 package udf
 
 import (
-	"github.com/goccy/go-json"
+	"encoding/json"
 	"testing"
 
 	"github.com/DataDog/iceberg-go"

@@ -24,7 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azkeys"
+	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 	"github.com/DataDog/iceberg-go/go-cloud/internal/testing/setup"
 	"github.com/DataDog/iceberg-go/go-cloud/internal/useragent"
 	"github.com/DataDog/iceberg-go/go-cloud/secrets"
@@ -155,6 +155,9 @@ func (v verifyAs) ErrorCheck(k *secrets.Keeper, err error) error {
 	var e *azcore.ResponseError
 	if !k.ErrorAs(err, &e) {
 		return errors.New("Keeper.ErrorAs failed")
+	}
+	if !errors.As(err, &e) {
+		return errors.New("errors.As failed")
 	}
 	return nil
 }

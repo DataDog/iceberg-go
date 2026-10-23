@@ -20,12 +20,13 @@ package table
 import (
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"iter"
 	"maps"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/internal"
@@ -257,15 +258,85 @@ func (s *Summary) MarshalJSON() ([]byte, error) {
 }
 
 type Snapshot struct {
-	SnapshotID       int64    `json:"snapshot-id"`
-	ParentSnapshotID *int64   `json:"parent-snapshot-id,omitempty"`
-	SequenceNumber   int64    `json:"sequence-number"`
-	TimestampMs      int64    `json:"timestamp-ms"`
-	ManifestList     string   `json:"manifest-list,omitempty"`
-	Summary          *Summary `json:"summary,omitempty"`
-	SchemaID         *int     `json:"schema-id,omitempty"`
-	FirstRowID       *int64   `json:"first-row-id,omitempty"` // V3: Starting row ID for this snapshot
-	AddedRows        *int64   `json:"added-rows,omitempty"`   // V3: Number of rows added by this snapshot
+	SnapshotID        int64    `json:"snapshot-id"`
+	ParentSnapshotID  *int64   `json:"parent-snapshot-id,omitempty"`
+	SequenceNumber    int64    `json:"sequence-number"`
+	TimestampMs       int64    `json:"timestamp-ms"`
+	ManifestList      string   `json:"manifest-list,omitempty"`
+	ManifestLocations []string `json:"manifests,omitempty"` // V1: Embedded manifest locations
+	Summary           *Summary `json:"summary,omitempty"`
+	SchemaID          *int     `json:"schema-id,omitempty"`
+	FirstRowID        *int64   `json:"first-row-id,omitempty"` // V3: Starting row ID for this snapshot
+	AddedRows         *int64   `json:"added-rows,omitempty"`   // V3: Number of rows added by this snapshot
+}
+
+func (s *Snapshot) UnmarshalJSON(data []byte) error {
+	type Alias Snapshot
+	var next Alias
+	// snapshot-id and timestamp-ms are required by the spec for every format
+	// version. Decode them through pointers so an absent or null field stays
+	// distinguishable from an explicit zero, which would otherwise be accepted
+	// as a valid identity or as the Unix epoch.
+	aux := struct {
+		SnapshotID  *int64 `json:"snapshot-id"`
+		TimestampMs *int64 `json:"timestamp-ms"`
+		*Alias
+	}{Alias: &next}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.SnapshotID == nil {
+		return fmt.Errorf("%w: snapshot-id is absent or null", ErrInvalidMetadata)
+	}
+	if aux.TimestampMs == nil {
+		return fmt.Errorf("%w: timestamp-ms is absent or null", ErrInvalidMetadata)
+	}
+	// The pointer fields shadow Alias, so json.Unmarshal does not populate next.
+	next.SnapshotID, next.TimestampMs = *aux.SnapshotID, *aux.TimestampMs
+
+	if next.ManifestList != "" {
+		next.ManifestLocations = nil
+	}
+
+	*s = Snapshot(next)
+
+	return nil
+}
+
+func (s Snapshot) MarshalJSON() ([]byte, error) {
+	type Alias Snapshot
+	if s.ManifestList != "" {
+		// The manifest list is authoritative when both legacy and current
+		// representations are present. Do not write the V1 fallback alongside it.
+		s.ManifestLocations = nil
+	}
+
+	data, err := json.Marshal((*Alias)(&s))
+	if err != nil {
+		return nil, err
+	}
+	if s.ManifestLocations == nil {
+		return data, nil
+	}
+
+	// A non-nil slice represents the V1 embedded-manifest form, including an
+	// explicitly empty manifests array. Match Java by omitting the default
+	// sequence number while preserving any positive value accepted on read.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	locations, err := json.Marshal(s.ManifestLocations)
+	if err != nil {
+		return nil, err
+	}
+	fields["manifests"] = locations
+	if s.SequenceNumber <= 0 {
+		delete(fields, "sequence-number")
+	}
+
+	return json.Marshal(fields)
 }
 
 func (s Snapshot) String() string {
@@ -286,6 +357,9 @@ func (s Snapshot) String() string {
 }
 
 func (s Snapshot) Equals(other Snapshot) bool {
+	manifestLocationsEqual := (s.ManifestLocations == nil) == (other.ManifestLocations == nil) &&
+		slices.Equal(s.ManifestLocations, other.ManifestLocations)
+
 	switch {
 	case s.ParentSnapshotID == nil && other.ParentSnapshotID != nil:
 		fallthrough
@@ -313,6 +387,7 @@ func (s Snapshot) Equals(other Snapshot) bool {
 		s.SequenceNumber == other.SequenceNumber &&
 		s.TimestampMs == other.TimestampMs &&
 		s.ManifestList == other.ManifestList &&
+		manifestLocationsEqual &&
 		s.Summary.Equals(other.Summary)
 }
 
@@ -340,8 +415,56 @@ func (s Snapshot) Manifests(fio iceio.IO) (_ []iceberg.ManifestFile, err error) 
 
 		return iceberg.ReadManifestList(f)
 	}
+	if s.ManifestLocations != nil {
+		manifests := make([]iceberg.ManifestFile, len(s.ManifestLocations))
+		for i, path := range s.ManifestLocations {
+			length, err := embeddedManifestLength(fio, path)
+			if err != nil {
+				return nil, err
+			}
+
+			manifests[i] = iceberg.NewManifestFile(1, path, length, 0, s.SnapshotID).
+				AddedFiles(-1).
+				ExistingFiles(-1).
+				DeletedFiles(-1).
+				AddedRows(-1).
+				ExistingRows(-1).
+				DeletedRows(-1).
+				Build()
+		}
+
+		return manifests, nil
+	}
 
 	return nil, nil
+}
+
+func embeddedManifestLength(fio iceio.IO, path string) (_ int64, err error) {
+	if fio == nil {
+		return 0, fmt.Errorf("cannot stat embedded manifest %q without IO", path)
+	}
+
+	if statIO, ok := fio.(iceio.StatIO); ok {
+		info, err := statIO.Stat(path)
+		if err != nil {
+			return 0, fmt.Errorf("could not stat embedded manifest %q: %w", path, err)
+		}
+
+		return info.Size(), nil
+	}
+
+	f, err := fio.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("could not open embedded manifest %q: %w", path, err)
+	}
+	defer internal.CheckedClose(f, &err)
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("could not stat embedded manifest %q: %w", path, err)
+	}
+
+	return info.Size(), nil
 }
 
 func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryContent]) iter.Seq2[iceberg.DataFile, error] {
@@ -386,8 +509,9 @@ func (s Snapshot) dataFiles(fio iceio.IO, fileFilter set[iceberg.ManifestEntryCo
 // matters.
 //
 // manifestContent < 0 yields entries across both data and delete
-// manifests.
-func (s Snapshot) entries(fio iceio.IO, manifestContent iceberg.ManifestContent) iter.Seq2[iceberg.ManifestEntry, error] {
+// manifests. Set discardDeleted to skip DELETED entries: they are files
+// already removed from the table, not files still in it.
+func (s Snapshot) entries(fio iceio.IO, manifestContent iceberg.ManifestContent, discardDeleted bool) iter.Seq2[iceberg.ManifestEntry, error] {
 	return func(yield func(iceberg.ManifestEntry, error) bool) {
 		manifests, err := s.Manifests(fio)
 		if err != nil {
@@ -401,7 +525,7 @@ func (s Snapshot) entries(fio iceio.IO, manifestContent iceberg.ManifestContent)
 				continue
 			}
 
-			for entry, err := range m.Entries(fio, false) {
+			for entry, err := range m.Entries(fio, discardDeleted) {
 				if err != nil {
 					yield(nil, err)
 
@@ -485,9 +609,10 @@ func (s *SnapshotSummaryCollector) addFile(df iceberg.DataFile, sc *iceberg.Sche
 		return err
 	}
 
-	if len(df.Partition()) > 0 {
+	partition := dataFilePartition(df)
+	if len(partition) > 0 {
 		partitionPath := spec.PartitionToPath(
-			GetPartitionRecord(df, spec.PartitionType(sc)), sc)
+			newPartitionRecord(partition, spec.PartitionType(sc)), sc)
 
 		return s.updatePartitionMetrics(partitionPath, df, true)
 	}
@@ -500,9 +625,10 @@ func (s *SnapshotSummaryCollector) removeFile(df iceberg.DataFile, sc *iceberg.S
 		return err
 	}
 
-	if len(df.Partition()) > 0 {
+	partition := dataFilePartition(df)
+	if len(partition) > 0 {
 		partitionPath := spec.PartitionToPath(
-			GetPartitionRecord(df, spec.PartitionType(sc)), sc)
+			newPartitionRecord(partition, spec.PartitionType(sc)), sc)
 
 		return s.updatePartitionMetrics(partitionPath, df, false)
 	}
@@ -512,14 +638,13 @@ func (s *SnapshotSummaryCollector) removeFile(df iceberg.DataFile, sc *iceberg.S
 
 func (s *SnapshotSummaryCollector) partitionSummary(metrics *updateMetrics) string {
 	props := metrics.toProps()
+	parts := make([]string, 0, len(props))
+	for k, v := range props {
+		parts = append(parts, k+"="+v)
+	}
+	slices.Sort(parts)
 
-	return strings.Join(slices.Sorted(func(yield func(s string) bool) {
-		for k, v := range props {
-			if !yield(fmt.Sprintf("%s=%s", k, v)) {
-				return
-			}
-		}
-	}), ",")
+	return strings.Join(parts, ",")
 }
 
 func (s *SnapshotSummaryCollector) build() iceberg.Properties {

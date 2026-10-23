@@ -21,7 +21,11 @@ linters:
   enable:
     - errcheck
     - govet
+    - intrange
+    - copyloopvar
+    - usestdlibvars
     - misspell
+    - modernize
     - nlreturn
     - perfsprint
     - staticcheck
@@ -47,6 +51,7 @@ linters:
           - errcheck
         path: _test\.go$
     paths:
+      - ^go-cloud/
       - third_party$
       - builtin$
       - examples$
@@ -64,6 +69,7 @@ formatters:
   exclusions:
     generated: lax
     paths:
+      - ^go-cloud/
       - third_party$
       - builtin$
       - examples$
