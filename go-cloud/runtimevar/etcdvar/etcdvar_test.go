@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
 	"github.com/DataDog/iceberg-go/go-cloud/internal/testing/setup"
 	"github.com/DataDog/iceberg-go/go-cloud/runtimevar"
 	"github.com/DataDog/iceberg-go/go-cloud/runtimevar/driver"
@@ -98,6 +98,9 @@ func (verifyAs) ErrorCheck(v *runtimevar.Variable, err error) error {
 	// Try with a real etcd error.
 	if !v.ErrorAs(rpctypes.ErrUnhealthy, &to) {
 		return errors.New("ErrorAs expected to succeed with real etcd error")
+	}
+	if !errors.As(rpctypes.ErrUnhealthy, &to) {
+		return errors.New("errors.As succeed with real etcd error")
 	}
 	return nil
 }

@@ -25,7 +25,6 @@ import (
 	"log"
 	"maps"
 	"strings"
-	_ "unsafe"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
@@ -33,6 +32,7 @@ import (
 	"github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/metrics"
 	"github.com/DataDog/iceberg-go/table"
+	"github.com/DataDog/iceberg-go/table/maintenance"
 	"github.com/DataDog/iceberg-go/view"
 	"github.com/beltran/gohive/hive_metastore"
 )
@@ -382,9 +382,7 @@ func (c *Catalog) CreateView(ctx context.Context, identifier table.Identifier, v
 
 	viewProps := make(map[string]string)
 	if cfg.Properties != nil {
-		for k, v := range cfg.Properties {
-			viewProps[k] = v
-		}
+		maps.Copy(viewProps, cfg.Properties)
 	}
 
 	hiveTbl := constructHiveViewTable(database, viewName, loc, createdView.MetadataLocation(), freshSchema, viewSQL, viewProps)
@@ -469,7 +467,7 @@ func (c *Catalog) PurgeTable(ctx context.Context, identifier table.Identifier) e
 	}
 
 	// Physically delete all table files on storage best-effort
-	if purgeErr := tbl.PurgeFiles(ctx); purgeErr != nil {
+	if purgeErr := maintenance.PurgeFiles(ctx, tbl); purgeErr != nil {
 		log.Printf("WARNING: dropped table %s but failed to purge files: %v", identifier, purgeErr)
 	}
 
@@ -539,6 +537,16 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (_
 	if lockedMetadataLocation != sourceMetadataLocation {
 		return nil, fmt.Errorf("%w: source table %s.%s metadata location changed from %s to %s",
 			table.ErrCommitFailed, fromDB, fromTable, sourceMetadataLocation, lockedMetadataLocation)
+	}
+
+	// Use a raw GetTable instead of CheckTableExists so that non-Iceberg
+	// Hive tables at the destination are also detected as conflicts.
+	_, err = c.client.GetTable(ctx, toDB, toTable)
+	if err == nil {
+		return nil, fmt.Errorf("%w: %s.%s", catalog.ErrTableAlreadyExists, toDB, toTable)
+	}
+	if !isNoSuchObjectError(err) {
+		return nil, fmt.Errorf("failed to check destination table %s.%s: %w", toDB, toTable, err)
 	}
 
 	hiveTbl.TableName = toTable
@@ -936,9 +944,6 @@ func (c *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.I
 	return props, nil
 }
 
-//go:linkname getUpdatedPropsAndUpdateSummary github.com/DataDog/iceberg-go/catalog.getUpdatedPropsAndUpdateSummary
-func getUpdatedPropsAndUpdateSummary(currentProps iceberg.Properties, removals []string, updates iceberg.Properties) (iceberg.Properties, catalog.PropertiesUpdateSummary, error)
-
 // UpdateNamespaceProperties updates the properties for a namespace.
 func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table.Identifier,
 	removals []string, updates iceberg.Properties,
@@ -948,7 +953,7 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 		return catalog.PropertiesUpdateSummary{}, err
 	}
 
-	updatedProperties, propertiesUpdateSummary, err := getUpdatedPropsAndUpdateSummary(currentProps, removals, updates)
+	updatedProperties, propertiesUpdateSummary, err := internal.GetUpdatedPropsAndUpdateSummary(currentProps, removals, updates)
 	if err != nil {
 		return catalog.PropertiesUpdateSummary{}, err
 	}
@@ -1038,8 +1043,7 @@ func isNoSuchObjectError(err error) bool {
 		return false
 	}
 
-	var noSuchObjectErr *hive_metastore.NoSuchObjectException
-	if errors.As(err, &noSuchObjectErr) {
+	if _, ok := errors.AsType[*hive_metastore.NoSuchObjectException](err); ok {
 		return true
 	}
 

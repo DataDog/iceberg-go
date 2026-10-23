@@ -16,15 +16,16 @@ package docstore_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"time"
 
 	firestore "cloud.google.com/go/firestore/apiv1"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/smithy-go"
 	"github.com/DataDog/iceberg-go/go-cloud/docstore"
-	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb"
+	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb/v2"
 	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/gcpfirestore"
 	"github.com/DataDog/iceberg-go/go-cloud/docstore/memdocstore"
 	"github.com/DataDog/iceberg-go/go-cloud/gcerrors"
@@ -33,7 +34,7 @@ import (
 type Player struct {
 	Name             string
 	Score            int
-	DocstoreRevision interface{}
+	DocstoreRevision any
 }
 
 func ExampleCollection_Actions_bulkWrite() {
@@ -142,7 +143,7 @@ func ExampleCollection_As() {
 func ExampleCollection_ErrorAs() {
 	// This example is specific to the awsdynamodb implementation.
 	// You will need to blank-import the package for this to work:
-	//   import _ "gocloud.dev/docstore/awsdynamodb"
+	//   import _ "gocloud.dev/docstore/awsdynamodb/v2"
 
 	// The types exposed for As by mongodocstore are documented in
 	// https://godoc.org/gocloud.dev/docstore/mongodocstore#hdr-As
@@ -155,14 +156,16 @@ func ExampleCollection_ErrorAs() {
 	}
 	defer coll.Close()
 
-	doc := map[string]interface{}{"_id": "a"}
+	doc := map[string]any{"_id": "a"}
 	if err := coll.Create(ctx, doc); err != nil {
-		var aerr awserr.Error
+		var aerr smithy.APIError
 		if coll.ErrorAs(err, &aerr) {
 			fmt.Println("got", aerr)
 		} else {
 			fmt.Println("could not convert error")
 		}
+		// Alternatively, using errors.As:
+		_ = errors.As(err, &aerr)
 	}
 }
 

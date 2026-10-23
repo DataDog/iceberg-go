@@ -18,8 +18,9 @@
 package table_test
 
 import (
-	"github.com/goccy/go-json"
 	"testing"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/table"

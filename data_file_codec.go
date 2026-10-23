@@ -20,6 +20,8 @@ package iceberg
 import (
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 
 	"github.com/DataDog/iceberg-go/internal"
 	"github.com/DataDog/iceberg-go/internal/datafileavro"
@@ -61,6 +63,8 @@ func init() {
 // The encoded bytes are the same bytes a manifest carries for this
 // data file. Implementations must produce output that the iceberg
 // package's manifest-entry Avro decoder accepts.
+// The built-in DataFile implementation rejects projected or stat-stripped files
+// with ErrInvalidArgument because omitted metadata cannot be recovered.
 type AvroEntryMarshaler interface {
 	MarshalAvroEntry(spec PartitionSpec, schema *Schema, version int) ([]byte, error)
 }
@@ -99,6 +103,9 @@ type AvroEntryMarshaler interface {
 // carry the field on the wire still decode through the matching
 // reader. New DataFiles should not set distinct counts.
 func (d *dataFile) MarshalAvroEntry(spec PartitionSpec, schema *Schema, version int) ([]byte, error) {
+	if err := d.validateForWrite(); err != nil {
+		return nil, err
+	}
 	if version < 1 || version > 3 {
 		return nil, fmt.Errorf("iceberg: MarshalAvroEntry: unsupported format version %d", version)
 	}
@@ -107,7 +114,8 @@ func (d *dataFile) MarshalAvroEntry(spec PartitionSpec, schema *Schema, version 
 		return nil, err
 	}
 	clone := cloneDataFileAvroFields(d)
-	partitionData, err := avroEncodePartitionData(d.Partition(), maps)
+	partitionData, err := avroEncodePartitionData(
+		d.DataFilePartitionRef(internal.DataFileRef{}), maps)
 	if err != nil {
 		return nil, err
 	}
@@ -174,16 +182,29 @@ func newDecodeEntry(version int) (any, *dataFile) {
 	return &manifestEntry{Data: df}, df
 }
 
+var dataFileAvroFieldIndexes = avroFieldIndexes(reflect.TypeFor[dataFile]())
+
+func avroFieldIndexes(t reflect.Type) []int {
+	indexes := make([]int, 0, t.NumField())
+	for i := range t.NumField() {
+		if _, hasAvroTag := t.Field(i).Tag.Lookup("avro"); hasAvroTag {
+			indexes = append(indexes, i)
+		}
+	}
+
+	return indexes
+}
+
 // cloneDataFileAvroFields returns a fresh *dataFile populated with src's
 // avro-tagged fields. Internal state (sync.Once, lazy-init caches,
 // specID, the field-id lookup maps) is intentionally left at zero
 // values because the avro encoder reads only the avro-tagged fields.
 //
-// Using reflection over the tag set means a new avro-tagged field
-// upstream is auto-copied without an update here — the dataFile struct
-// remains the single source of truth for the wire shape. It also
-// sidesteps the go-vet copies-lock warning that would fire on a
-// struct-literal copy of *dataFile (it embeds sync.Once).
+// The avro-tagged field indexes are discovered once when the package is
+// initialized. This keeps dataFile as the single source of truth for the
+// wire shape while avoiding a reflect.Type and StructTag lookup for every
+// encoded manifest entry. It also sidesteps the go-vet copies-lock warning
+// that would fire on a struct-literal copy of *dataFile (it embeds sync.Once).
 //
 // Note: this is a shallow copy. Pointer-typed avro fields (ColSizes,
 // LowerBounds, etc.) share their backing storage with the source.
@@ -195,11 +216,8 @@ func cloneDataFileAvroFields(src *dataFile) *dataFile {
 	out := &dataFile{}
 	srcVal := reflect.ValueOf(src).Elem()
 	outVal := reflect.ValueOf(out).Elem()
-	t := srcVal.Type()
-	for i := 0; i < t.NumField(); i++ {
-		if _, hasAvroTag := t.Field(i).Tag.Lookup("avro"); hasAvroTag {
-			outVal.Field(i).Set(srcVal.Field(i))
-		}
+	for _, i := range dataFileAvroFieldIndexes {
+		outVal.Field(i).Set(srcVal.Field(i))
 	}
 
 	return out
@@ -210,11 +228,7 @@ func cloneDataFileAvroFields(src *dataFile) *dataFile {
 // avro-friendly map the manifest-entry schema expects. Idempotent:
 // values already in primitive form pass through unchanged.
 func avroEncodePartitionData(idKeyed map[int]any, fields dataFileFieldMaps) (map[string]any, error) {
-	converted, err := avroPartitionData(idKeyed, fields.idToType, fields.idToFixedSize)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]any, len(converted))
+	out := make(map[string]any, len(fields.nameToID))
 	for name, id := range fields.nameToID {
 		if _, unknown := fields.unknownFieldIDs[id]; unknown {
 			// UnknownType has no value representation and is encoded as Avro
@@ -223,7 +237,17 @@ func avroEncodePartitionData(idKeyed map[int]any, fields dataFileFieldMaps) (map
 
 			continue
 		}
-		if v, ok := converted[id]; ok {
+		v, ok := idKeyed[id]
+		if !ok {
+			continue
+		}
+		if logical, ok := fields.idToType[id]; ok {
+			converted, err := convertLogicalTypeValue(v, logical, fields.idToFixedSize[id])
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert partition field %d: %w", id, err)
+			}
+			out[name] = converted
+		} else {
 			out[name] = v
 		}
 	}
@@ -239,13 +263,9 @@ type dataFileFieldMaps struct {
 	unknownFieldIDs  map[int]struct{}
 }
 
-// dataFileSchemaCacheKey identifies a cached avro schema by the
-// structural fingerprint of the partition Avro shape and the format
-// version. The fingerprint is taken from the avro schema produced by
-// [partitionTypeToAvroSchema] rather than [StructType.String]: the
-// avro shape ignores doc strings and other metadata that don't change
-// the wire format, so structurally identical specs that differ only
-// in documentation share a single cache entry.
+// dataFileSchemaCacheKey identifies a cached Avro schema by the ordered
+// partition field IDs, names, result types, and format version. These determine
+// the partition Avro shape without including docs or table-local schema/spec IDs.
 type dataFileSchemaCacheKey struct {
 	partAvroFingerprint string
 	version             int
@@ -289,14 +309,17 @@ func SetSchemaCacheSize(size int) error {
 // The cache key fingerprints the partition Avro shape, so specs that
 // differ only in field documentation share a single entry.
 func manifestEntrySchemaFor(spec PartitionSpec, schema *Schema, version int) (*avro.Schema, dataFileFieldMaps, error) {
-	partType := spec.PartitionType(schema)
-	partSchema, err := partitionTypeToAvroSchema(partType)
+	fingerprint, err := partitionSchemaFingerprint(spec, schema)
 	if err != nil {
 		return nil, dataFileFieldMaps{}, err
 	}
-	key := dataFileSchemaCacheKey{partAvroFingerprint: partSchema.String(), version: version}
+	key := dataFileSchemaCacheKey{partAvroFingerprint: fingerprint, version: version}
 	if cached, ok := dataFileSchemaCache.Get(key); ok {
 		return cached.schema, cached.maps, nil
+	}
+	partSchema, err := partitionTypeToAvroSchema(spec.PartitionType(schema))
+	if err != nil {
+		return nil, dataFileFieldMaps{}, err
 	}
 	fullSchema, err := internal.NewManifestEntrySchema(partSchema, version)
 	if err != nil {
@@ -310,4 +333,87 @@ func manifestEntrySchemaFor(spec PartitionSpec, schema *Schema, version int) (*a
 	dataFileSchemaCache.Add(key, entry)
 
 	return entry.schema, entry.maps, nil
+}
+
+func partitionSchemaFingerprint(spec PartitionSpec, schema *Schema) (string, error) {
+	var key strings.Builder
+	for _, field := range spec.fields {
+		sourceType := Type(UnknownType{})
+		// ResultType only inspects the source type here; borrow it to avoid
+		// cloning nested source types on every schema-cache hit.
+		if sourceField, ok := schema.FindFieldByIDRef(field.SourceID(), internal.SchemaRef{}); ok {
+			sourceType = sourceField.Type
+		}
+		resultType := field.Transform.ResultType(sourceType)
+		// Reserve room for the ID, name length, type tag, and typical parameters.
+		key.Grow(len(field.Name) + 32)
+
+		// Length prefixes keep names unambiguous. The compact type tag also
+		// includes fixed lengths and decimal precision/scale without formatting
+		// a temporary type string on every cache hit.
+		writePartitionFingerprintInt(&key, field.FieldID)
+		writePartitionFingerprintInt(&key, len(field.Name))
+		key.WriteString(field.Name)
+		if err := writePartitionTypeFingerprint(&key, resultType); err != nil {
+			return "", err
+		}
+	}
+
+	return key.String(), nil
+}
+
+// Keep the supported types and parameters in sync with partitionTypeToAvroSchema.
+// TestPartitionTypeFingerprintMatchesAvroConversion checks both paths together.
+func writePartitionTypeFingerprint(key *strings.Builder, typ Type) error {
+	// These tags are internal to the cache key. Parameterized types append their
+	// parameters so equal Avro partition shapes still produce equal keys.
+	switch t := typ.(type) {
+	case Int32Type:
+		key.WriteByte('i')
+	case Int64Type:
+		key.WriteByte('j')
+	case Float32Type:
+		key.WriteByte('k')
+	case Float64Type:
+		key.WriteByte('d')
+	case StringType:
+		key.WriteByte('S')
+	case DateType:
+		key.WriteByte('D')
+	case TimeType:
+		key.WriteByte('T')
+	case TimestampType:
+		key.WriteByte('t')
+	case TimestampTzType:
+		key.WriteByte('z')
+	case TimestampNsType:
+		key.WriteByte('n')
+	case TimestampTzNsType:
+		key.WriteByte('N')
+	case UUIDType:
+		key.WriteByte('u')
+	case BooleanType:
+		key.WriteByte('b')
+	case BinaryType:
+		key.WriteByte('B')
+	case FixedType:
+		key.WriteByte('f')
+		writePartitionFingerprintInt(key, t.Len())
+	case DecimalType:
+		key.WriteByte('q')
+		writePartitionFingerprintInt(key, t.Precision())
+		writePartitionFingerprintInt(key, t.Scale())
+	case UnknownType:
+		key.WriteByte('U')
+	default:
+		return fmt.Errorf("unsupported partition type: %s", typ.String())
+	}
+
+	return nil
+}
+
+func writePartitionFingerprintInt(key *strings.Builder, value int) {
+	var buf [20]byte
+	key.Write(strconv.AppendInt(buf[:0], int64(value), 10))
+	key.WriteByte(':')
 }

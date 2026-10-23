@@ -39,7 +39,7 @@ func mustSchema(n avro.SchemaNode) *avro.Schema {
 }
 
 func NullableSchema(schema *avro.Schema) *avro.Schema {
-	return mustSchema(NullableNode(schema.Root()))
+	return mustSchema(NullableNode(*schema.Root()))
 }
 
 var requiredLength = [...]int{
@@ -101,7 +101,11 @@ var (
 	TimeNode        = avro.SchemaNode{Type: atype.Long, LogicalType: atype.TimeMicros}
 	TimestampNode   = avro.SchemaNode{Type: atype.Long, LogicalType: atype.TimestampMicros, Props: map[string]any{"adjust-to-utc": false}}
 	TimestampTzNode = avro.SchemaNode{Type: atype.Long, LogicalType: atype.TimestampMicros, Props: map[string]any{"adjust-to-utc": true}}
-	UUIDNode        = avro.SchemaNode{Type: atype.Fixed, Name: "uuid_fixed", Size: 16, LogicalType: atype.UUID}
+
+	TimestampNsNode   = avro.SchemaNode{Type: atype.Long, LogicalType: atype.TimestampNanos, Props: map[string]any{"adjust-to-utc": false}}
+	TimestampTzNsNode = avro.SchemaNode{Type: atype.Long, LogicalType: atype.TimestampNanos, Props: map[string]any{"adjust-to-utc": true}}
+
+	UUIDNode = avro.SchemaNode{Type: atype.Fixed, Name: "uuid_fixed", Size: 16, LogicalType: atype.UUID}
 )
 
 // Compiled schemas for direct encoding/decoding use.
@@ -423,7 +427,7 @@ func newDataFileSchema(partitionType *avro.Schema, version int) (*avro.Schema, e
 	node := schema.Root()
 	node.Fields = append(slices.Clone(node.Fields), avro.SchemaField{
 		Name:  "partition",
-		Type:  partitionType.Root(),
+		Type:  *partitionType.Root(),
 		Props: map[string]any{"field-id": 102},
 	})
 
@@ -460,7 +464,7 @@ func NewManifestEntrySchema(partitionType *avro.Schema, version int) (*avro.Sche
 	node := schema.Root()
 	node.Fields = append(slices.Clone(node.Fields), avro.SchemaField{
 		Name:  "data_file",
-		Type:  dfschema.Root(),
+		Type:  *dfschema.Root(),
 		Props: map[string]any{"field-id": 2},
 	})
 

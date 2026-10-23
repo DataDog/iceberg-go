@@ -19,10 +19,11 @@ package table_test
 
 import (
 	"context"
-	"github.com/goccy/go-json"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	iceio "github.com/DataDog/iceberg-go/io"
@@ -135,13 +136,127 @@ func TestEqualityDeleteReadRoundTrip(t *testing.T) {
 	for rec, err := range itr {
 		require.NoError(t, err)
 		col := rec.Column(0).(*array.Int64)
-		for i := 0; i < col.Len(); i++ {
+		for i := range col.Len() {
 			ids = append(ids, col.Value(i))
 		}
 		rec.Release()
 	}
 
 	assert.Equal(t, []int64{1, 3, 5}, ids, "expected rows with id=2 and id=4 deleted")
+
+	scanData := func(tbl *table.Table) []string {
+		resultSchema, itr, err := tbl.Scan(table.WithSelectedFields("data")).ToArrowRecords(t.Context())
+		require.NoError(t, err)
+		require.Len(t, resultSchema.Fields(), 1)
+		assert.Equal(t, "data", resultSchema.Fields()[0].Name)
+
+		var data []string
+		for rec, err := range itr {
+			require.NoError(t, err)
+			require.EqualValues(t, 1, rec.NumCols())
+			col := rec.Column(0).(*array.String)
+			for i := range col.Len() {
+				data = append(data, col.Value(i))
+			}
+			rec.Release()
+		}
+
+		return data
+	}
+
+	assert.Equal(t, []string{"alpha", "gamma", "epsilon"}, scanData(tbl),
+		"expected equality deletes to apply when the equality field is not projected")
+
+	tx3 := tbl.NewTransaction()
+	require.NoError(t, tx3.UpdateSchema(true, false).DeleteColumn([]string{"id"}).Commit())
+	tbl, err = tx3.Commit(t.Context())
+	require.NoError(t, err)
+	_, currentHasEqualityField := tbl.Schema().FindFieldByID(1)
+	require.False(t, currentHasEqualityField)
+
+	assert.Equal(t, []string{"alpha", "gamma", "epsilon"}, scanData(tbl),
+		"expected equality deletes to apply when the equality field exists only in schema history")
+}
+
+func TestEqualityDeleteReadPrunesNonOverlappingDeleteFiles(t *testing.T) {
+	ctx := t.Context()
+	tbl := newEqDeleteReadTestTable(t)
+	arrowSc, err := table.SchemaToArrowSchema(tbl.Metadata().CurrentSchema(), nil, false, false)
+	require.NoError(t, err)
+
+	dataPaths := []string{
+		tbl.Location() + "/data/data-001.parquet",
+		tbl.Location() + "/data/data-002.parquet",
+	}
+	writeParquetFile(t, dataPaths[0], arrowSc, `[
+		{"id": 1, "data": "one"},
+		{"id": 2, "data": "two"}
+	]`)
+	writeParquetFile(t, dataPaths[1], arrowSc, `[
+		{"id": 3, "data": "three"},
+		{"id": 4, "data": "four"}
+	]`)
+
+	tx := tbl.NewTransaction()
+	require.NoError(t, tx.AddFiles(ctx, dataPaths, nil, false))
+	tbl, err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	deleteSchema, err := table.SchemaToArrowSchema(
+		iceberg.NewSchema(0,
+			iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		), nil, true, false)
+	require.NoError(t, err)
+	deleteTwoRecords, releaseTwo := makeEqDeleteRecords(t, deleteSchema, `[{"id": 2}]`)
+	defer releaseTwo()
+	deleteThreeRecords, releaseThree := makeEqDeleteRecords(t, deleteSchema, `[{"id": 3}]`)
+	defer releaseThree()
+
+	tx = tbl.NewTransaction()
+	deleteTwoFiles, err := tx.WriteEqualityDeletes(ctx, []int{1}, deleteTwoRecords)
+	require.NoError(t, err)
+	deleteThreeFiles, err := tx.WriteEqualityDeletes(ctx, []int{1}, deleteThreeRecords)
+	require.NoError(t, err)
+	require.Len(t, deleteTwoFiles, 1)
+	require.Len(t, deleteThreeFiles, 1)
+	require.NotEqual(t, deleteTwoFiles[0].FilePath(), deleteThreeFiles[0].FilePath())
+
+	rowDelta := tx.NewRowDelta(nil)
+	rowDelta.AddDeletes(deleteTwoFiles...)
+	rowDelta.AddDeletes(deleteThreeFiles...)
+	require.NoError(t, rowDelta.Commit(ctx))
+	tbl, err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	scan := tbl.Scan(table.WithMaxConcurrency(4), table.WithSelectedFields("id"))
+	tasks, err := scan.PlanFiles(ctx)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	for _, task := range tasks {
+		require.Len(t, task.EqualityDeleteFiles, 1)
+		switch {
+		case strings.HasSuffix(task.File.FilePath(), "/data-001.parquet"):
+			assert.Equal(t, deleteTwoFiles[0].FilePath(), task.EqualityDeleteFiles[0].FilePath())
+		case strings.HasSuffix(task.File.FilePath(), "/data-002.parquet"):
+			assert.Equal(t, deleteThreeFiles[0].FilePath(), task.EqualityDeleteFiles[0].FilePath())
+		default:
+			t.Errorf("unexpected data file %s", task.File.FilePath())
+		}
+	}
+
+	_, records, err := scan.ReadTasks(ctx, tasks)
+	require.NoError(t, err)
+	var ids []int64
+	for record, err := range records {
+		require.NoError(t, err)
+		column := record.Column(0).(*array.Int64)
+		for i := range column.Len() {
+			ids = append(ids, column.Value(i))
+		}
+		record.Release()
+	}
+
+	assert.ElementsMatch(t, []int64{1, 4}, ids)
 }
 
 func TestEqualityDeleteReadResolvesRenamedDataColumnByFieldID(t *testing.T) {
@@ -193,7 +308,7 @@ func TestEqualityDeleteReadResolvesRenamedDataColumnByFieldID(t *testing.T) {
 	for record, err := range records {
 		require.NoError(t, err)
 		column := record.Column(0).(*array.Int64)
-		for i := 0; i < column.Len(); i++ {
+		for i := range column.Len() {
 			ids = append(ids, column.Value(i))
 		}
 		record.Release()
@@ -258,7 +373,7 @@ func TestEqualityDeleteReadResolvesRenamedDataColumnByNameMapping(t *testing.T) 
 	for record, err := range records {
 		require.NoError(t, err)
 		column := record.Column(0).(*array.Int64)
-		for i := 0; i < column.Len(); i++ {
+		for i := range column.Len() {
 			ids = append(ids, column.Value(i))
 		}
 		record.Release()
@@ -317,7 +432,7 @@ func TestEqualityDeleteReadResolvesLiteralDottedColumnName(t *testing.T) {
 	for record, err := range records {
 		require.NoError(t, err)
 		column := record.Column(0).(*array.Int64)
-		for i := 0; i < column.Len(); i++ {
+		for i := range column.Len() {
 			ids = append(ids, column.Value(i))
 		}
 		record.Release()
@@ -372,8 +487,21 @@ func TestEqualityDeleteReadRejectsAmbiguousColumns(t *testing.T) {
 	tbl, err = tx.Commit(t.Context())
 	require.NoError(t, err)
 
-	_, _, err = tbl.Scan().ToArrowRecords(t.Context())
-	require.ErrorIs(t, err, table.ErrAmbiguousEqualityColumn)
+	_, records, err := tbl.Scan().ToArrowRecords(t.Context())
+	require.NoError(t, err)
+
+	var scanErr error
+	for record, err := range records {
+		if record != nil {
+			record.Release()
+		}
+		if err != nil {
+			scanErr = err
+
+			break
+		}
+	}
+	require.ErrorIs(t, scanErr, table.ErrAmbiguousEqualityColumn)
 }
 
 func TestEqualityDeleteMatchingAcrossPartitionSpecEvolution(t *testing.T) {
@@ -466,7 +594,7 @@ func TestEqualityDeleteMatchingAcrossPartitionSpecEvolution(t *testing.T) {
 	for record, err := range itr {
 		require.NoError(t, err)
 		col := record.Column(0).(*array.Int64)
-		for i := 0; i < col.Len(); i++ {
+		for i := range col.Len() {
 			ids = append(ids, col.Value(i))
 		}
 		record.Release()
@@ -538,7 +666,7 @@ func TestEqualityDeleteDoesNotAffectSameSnapshot(t *testing.T) {
 	for rec, err := range itr {
 		require.NoError(t, err)
 		col := rec.Column(0).(*array.Int64)
-		for i := 0; i < col.Len(); i++ {
+		for i := range col.Len() {
 			ids = append(ids, col.Value(i))
 		}
 		rec.Release()
@@ -626,7 +754,7 @@ func TestEqualityDeleteMultiColumnKey(t *testing.T) {
 		require.NoError(t, err)
 		idCol := rec.Column(0).(*array.Int64)
 		nameCol := rec.Column(1).(*array.String)
-		for i := 0; i < int(rec.NumRows()); i++ {
+		for i := range int(rec.NumRows()) {
 			rows = append(rows, row{id: idCol.Value(i), name: nameCol.Value(i)})
 		}
 		rec.Release()
@@ -684,11 +812,11 @@ func TestEqualityDeleteNullableFastPathKeys(t *testing.T) {
 			keyType: iceberg.PrimitiveTypes.Timestamp,
 			dataJSON: `[
 				{"row_id": 1, "key": null},
-				{"row_id": 2, "key": "1970-01-01T00:00:00.000000Z"},
-				{"row_id": 3, "key": "2024-01-02T03:04:05.000000Z"}
+				{"row_id": 2, "key": "1970-01-01T00:00:00.000000"},
+				{"row_id": 3, "key": "2024-01-02T03:04:05.000000"}
 			]`,
 			nullDeleteJSON: `[{"key": null}]`,
-			zeroDeleteJSON: `[{"key": "1970-01-01T00:00:00.000000Z"}]`,
+			zeroDeleteJSON: `[{"key": "1970-01-01T00:00:00.000000"}]`,
 		},
 	}
 
@@ -753,7 +881,7 @@ func TestEqualityDeleteNullableCompositeFastPathKey(t *testing.T) {
 			name: "partially null key",
 			dataJSON: `[
 				{"row_id": 1, "id": 7, "deleted_at": null},
-				{"row_id": 2, "id": 7, "deleted_at": "1970-01-01T00:00:00.000000Z"},
+				{"row_id": 2, "id": 7, "deleted_at": "1970-01-01T00:00:00.000000"},
 				{"row_id": 3, "id": 8, "deleted_at": null},
 				{"row_id": 4, "id": null, "deleted_at": null}
 			]`,
@@ -764,7 +892,7 @@ func TestEqualityDeleteNullableCompositeFastPathKey(t *testing.T) {
 			name: "all-null key",
 			dataJSON: `[
 				{"row_id": 1, "id": null, "deleted_at": null},
-				{"row_id": 2, "id": null, "deleted_at": "1970-01-01T00:00:00.000000Z"},
+				{"row_id": 2, "id": null, "deleted_at": "1970-01-01T00:00:00.000000"},
 				{"row_id": 3, "id": 7, "deleted_at": null}
 			]`,
 			deleteJSON: `[{"id": null, "deleted_at": null}]`,

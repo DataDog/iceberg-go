@@ -19,9 +19,10 @@ package main
 
 import (
 	"context"
-	"github.com/goccy/go-json"
 	"os"
 	"strconv"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go/catalog"
 	"github.com/DataDog/iceberg-go/table"

@@ -36,7 +36,7 @@ All V1 features are supported. V1 is the format-version baseline.
 | Sequence numbers | Supported |
 | Manifest entry status (added / existing / deleted) | Supported |
 | Positional deletes | Supported (read + write) |
-| Equality deletes | Supported (read + write). Write via `Transaction.WriteEqualityDeletes`; row-level commits via `Transaction.NewRowDelta` |
+| Equality deletes | Supported (read + write). Write via `Transaction.WriteEqualityDeletes`; row-level commits via `Transaction.NewRowDelta`; delete-only CDC via `Transaction.CommitEqualityDeletes` |
 | Partition spec evolution | Supported |
 | Sort order enforcement on write | Supported (PR [#1157](https://github.com/apache/iceberg-go/pull/1157), closes [#833](https://github.com/apache/iceberg-go/issues/833)) |
 | `ReplaceDataFiles` using `OpReplace` | Pending ([#841](https://github.com/apache/iceberg-go/issues/841)) |
@@ -48,15 +48,20 @@ All V1 features are supported. V1 is the format-version baseline.
 | Nanosecond timestamps (`timestamp_ns`, `timestamptz_ns`) | Supported |
 | Default values (`initial-default`, `write-default`) | Supported |
 | Row lineage (`_row_id`, `_last_updated_sequence_number`) | Supported |
-| Encryption keys in metadata | Supported |
+| Encryption keys in metadata | Supported (metadata-level storage + `EncryptionManager` interface; file-level envelope encryption not yet implemented [PR #1620 in review](https://github.com/apache/iceberg-go/pull/1620)) |
 | Variant type, non-shredded | Supported (PR [#932](https://github.com/apache/iceberg-go/pull/932); umbrella [#929](https://github.com/apache/iceberg-go/issues/929)) |
-| Variant type, shredded reader / writer | In progress ([#986](https://github.com/apache/iceberg-go/issues/986), [#987](https://github.com/apache/iceberg-go/issues/987)) |
+| Variant type, shredded reader / writer | Supported (reader [#1238](https://github.com/apache/iceberg-go/pull/1238), writer [#1351](https://github.com/apache/iceberg-go/pull/1351)) |
+| Variant predicate pushdown / field extract | Supported (PR [#1607](https://github.com/apache/iceberg-go/pull/1607)) |
 | Deletion vectors, read | Supported |
 | Deletion vectors, write (unpartitioned) | Supported |
-| Deletion vectors, write (partitioned) | In progress ([#1135](https://github.com/apache/iceberg-go/issues/1135), PR [#1151](https://github.com/apache/iceberg-go/pull/1151)) |
+| Deletion vectors, write (partitioned) | Supported (PR [#1151](https://github.com/apache/iceberg-go/pull/1151)) |
 | Geometry / Geography types (schema) | Supported |
-| Geometry / Geography (transforms, statistics, pruning) | In progress (umbrella [#989](https://github.com/apache/iceberg-go/issues/989)) |
+| Geometry: statistics and pruning | Supported |
+| Geography: read, write, and schema | Supported (bounds/pruning intentionally omitted for geodesic safety) |
+| Geometry / Geography: nested-geo bounds | Deferred |
 | Multi-argument transforms | Infrastructure present; no concrete implementations exercised yet |
+| Statistics files (read / round-trip) | Supported |
+| NDV (Theta-sketch) statistics computation | Roadmap ([#1929](https://github.com/apache/iceberg-go/issues/1929)) |
 
 ## FileSystem support
 
@@ -67,7 +72,7 @@ All V1 features are supported. V1 is the format-version baseline.
 | Azure Blob Storage   |    X      |
 | Local Filesystem     |    X      |
 
-S3, GCS, and Azure require a blank import: `_ "github.com/apache/iceberg-go/io/gocloud"`. See [Configuration](./configuration.md).
+S3, GCS, and Azure each require a blank import of their backend package, for example `_ "github.com/apache/iceberg-go/io/gocloud/s3"`. See [Configuration](./configuration.md).
 
 ## Metadata operations
 
@@ -124,9 +129,23 @@ As long as the FileSystem is supported and the Catalog supports altering the tab
 | Append Stream        |     X     |
 | Append Data Files    |     X     |
 | Rewrite Files        |     X     |
-| Rewrite manifests    |           |
+| Rewrite manifests    |     X     |
 | Overwrite Files      |     X     |
 | Copy-On-Write Delete |     X     |
 | Write Pos Delete     |     X     |
 | Write Eq Delete      |     X     |
 | Row Delta            |     X     |
+
+## Metrics reporting
+
+Iceberg's Metrics Reporting API is supported. Reporting is opt-in (default no-op). See [Metrics Reporting](./metrics-reporting.md).
+
+| Feature | Status |
+|---|---|
+| `ScanReport` (scan-planning metrics) | Supported |
+| `CommitReport` (commit metrics) | Supported |
+| Built-in reporters (nop, logging, in-memory, combine) | Supported |
+| Reporter selection via `metrics-reporter-impl` + registry | Supported |
+| REST `/metrics` reporter (opt-in POST to catalog) | Supported |
+| OpenTelemetry reporter (`metrics/otel`) | Supported (experimental; tracks Java [apache/iceberg#16250](https://github.com/apache/iceberg/pull/16250)) |
+| `ScanReport.filter` as structured Expression JSON | Supported (sanitized; falls back to always-true) |

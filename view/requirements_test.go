@@ -19,8 +19,9 @@ package view_test
 
 import (
 	"fmt"
-	"github.com/goccy/go-json"
 	"testing"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go/table"
 	"github.com/DataDog/iceberg-go/view"

@@ -104,13 +104,23 @@ type Table struct {
 	metadataLocation string
 	cat              CatalogIO
 	fsF              FSysF
+	manifestCache    *snapshotManifestCache
 	planner          ScanPlanner
-	reporter         metrics.Reporter
+	// scanPlanningIOProps are the table-scoped FileIO properties supplied by a
+	// catalog load response. They are separate from metadata properties because
+	// REST catalogs can return FileIO configuration in the response's config
+	// block.
+	scanPlanningIOProps iceberg.Properties
+	savedConfig         iceberg.Properties
+	reporter            metrics.Reporter
 	// reporterSet records whether a caller injected a reporter via
 	// WithMetricsReporter. It distinguishes an explicit reporter (including an
 	// explicit NopReporter opt-out) from the construction-time default, so
 	// Refresh knows whether it may overwrite reporter with the catalog default.
 	reporterSet bool
+	// labels is transient catalog enrichment from the load response; nil when
+	// the catalog returned none. It is excluded from Equals.
+	labels *iceberg.Labels
 }
 
 func (t Table) Equals(other Table) bool {
@@ -127,6 +137,13 @@ func (t Table) Schema() *iceberg.Schema                      { return t.metadata
 func (t Table) Spec() iceberg.PartitionSpec                  { return t.metadata.PartitionSpec() }
 func (t Table) SortOrder() SortOrder                         { return t.metadata.SortOrder() }
 func (t Table) Properties() iceberg.Properties               { return t.metadata.Properties() }
+func (t Table) SavedConfig() iceberg.Properties              { return maps.Clone(t.savedConfig) }
+
+// Labels returns the catalog-provided labels from the load response, or nil if
+// the catalog returned none. Labels are transient enrichment, not table state.
+// The returned pointer aliases the table's labels and must be treated as
+// read-only; mutating it affects the shared table value.
+func (t Table) Labels() *iceberg.Labels { return t.labels }
 
 // MetricsReporter returns the table's metrics reporter, never nil.
 func (t Table) MetricsReporter() metrics.Reporter {
@@ -230,7 +247,11 @@ func (t *Table) Refresh(ctx context.Context) error {
 	t.metadata = fresh.metadata
 	t.fsF = fresh.fsF
 	t.metadataLocation = fresh.metadataLocation
+	t.manifestCache = newSnapshotManifestCacheForMetadata(fresh.metadata)
 	t.planner = fresh.planner
+	t.scanPlanningIOProps = maps.Clone(fresh.scanPlanningIOProps)
+	t.labels = fresh.labels
+	t.savedConfig = maps.Clone(fresh.savedConfig)
 	// Only inherit the catalog-derived reporter when the caller hasn't set one
 	// of their own. Refresh runs inside commit retry loops, so unconditionally
 	// copying fresh.reporter would silently revert a WithMetricsReporter-injected
@@ -351,14 +372,23 @@ func (t Table) Delete(ctx context.Context, filter iceberg.BooleanExpression, sna
 	return txn.Commit(ctx)
 }
 
-func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile, error] {
-	fs, err := t.fsF(ctx)
-	if err != nil {
-		return func(yield func(iceberg.ManifestFile, error) bool) {
-			yield(nil, err)
-		}
-	}
+func (t Table) manifestSet(ctx context.Context, snapshot Snapshot) (snapshotManifestSet, error) {
+	return t.manifestSetWithFSF(ctx, snapshot, t.fsF)
+}
 
+func (t Table) manifestSetWithFSF(
+	ctx context.Context,
+	snapshot Snapshot,
+	fsF FSysF,
+) (snapshotManifestSet, error) {
+	return t.manifestCache.get(ctx, snapshot, func(loadCtx context.Context) (snapshotManifestSet, error) {
+		return readSnapshotManifestSet(loadCtx, snapshot, fsF)
+	})
+}
+
+// AllManifests returns the manifests referenced by the table's snapshots.
+// Tables without snapshots return an empty sequence without resolving file IO.
+func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile, error] {
 	type list = tblutils.Enumerated[[]iceberg.ManifestFile]
 	snapshots := t.metadata.Snapshots()
 	n := len(snapshots)
@@ -370,6 +400,7 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 	ch := make(chan list, allManifestsWorkerCount(n))
 	workers := allManifestsWorkerCount(n)
 	g, groupCtx := errgroup.WithContext(workCtx)
+	manifestFS := sharedSnapshotManifestFSF(t.fsF)
 
 	for range workers {
 		g.Go(func() error {
@@ -382,10 +413,11 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 						return nil
 					}
 
-					manifests, err := snapshots[i].Manifests(fs)
+					manifestSet, err := t.manifestSetWithFSF(groupCtx, snapshots[i], manifestFS)
 					if err != nil {
 						return err
 					}
+					manifests := manifestSet.borrowAllManifests()
 
 					select {
 					case ch <- list{Index: i, Value: manifests, Last: i == n-1}:
@@ -449,29 +481,42 @@ func (t Table) AllManifests(ctx context.Context) iter.Seq2[iceberg.ManifestFile,
 			}()
 		}()
 
-		for {
-			select {
-			case err, ok := <-errch:
-				if !ok {
-					errch = nil
+		yieldAllManifests(results, errch, yield)
+	}
+}
 
-					continue
-				}
-				if err != nil {
-					yield(nil, err)
+func yieldAllManifests(
+	results <-chan tblutils.Enumerated[[]iceberg.ManifestFile],
+	errch <-chan error,
+	yield func(iceberg.ManifestFile, error) bool,
+) {
+	for results != nil || errch != nil {
+		select {
+		case err, ok := <-errch:
+			if !ok {
+				errch = nil
 
+				continue
+			}
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+		case next, ok := <-results:
+			if !ok {
+				results = nil
+
+				continue
+			}
+			for _, mf := range next.Value {
+				if !yield(mf, nil) {
 					return
 				}
-			case next, ok := <-results:
-				for _, mf := range next.Value {
-					if !yield(mf, nil) {
-						return
-					}
-				}
+			}
 
-				if next.Last || !ok {
-					return
-				}
+			if next.Last {
+				return
 			}
 		}
 	}
@@ -785,7 +830,17 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		}
 	}
 
-	return New(t.identifier, newMeta, newLoc, t.fsF, t.cat, withReporterState(t.reporter, t.reporterSet)), nil
+	return New(
+		t.identifier,
+		newMeta,
+		newLoc,
+		t.fsF,
+		t.cat,
+		withReporterState(t.reporter, t.reporterSet),
+		WithScanPlanningIOProperties(t.scanPlanningIOProps),
+		WithLabels(t.labels),
+		WithSavedConfig(t.savedConfig),
+	), nil
 }
 
 // rewriteRefSnapshotRequirements returns a copy of reqs with every
@@ -872,6 +927,45 @@ func validateBranchRequirement(reqs []Requirement, branch string, meta Metadata)
 	return nil
 }
 
+// latestSnapshotForBranch returns the head a write targeting branch is parented
+// on: a branch that does not exist yet resolves to nil here and falls back to
+// main's head so the first write to a new branch forks from main. It is the
+// Metadata-side twin of currentSnapshotForRef, which the retry path cannot use
+// because it has no builder; the two must resolve a ref identically, or a
+// retried snapshot is reparented somewhere its first attempt never pointed.
+func latestSnapshotForBranch(meta Metadata, branch string) *Snapshot {
+	if branch == "" || branch == MainBranch {
+		return meta.CurrentSnapshot()
+	}
+
+	if s := meta.SnapshotByName(branch); s != nil {
+		return s
+	}
+
+	return meta.CurrentSnapshot()
+}
+
+// stagedSnapshotStillValid reports whether a snapshot built on an earlier
+// attempt would still be accepted by AddSnapshot against fresh. Both values it
+// checks are table-wide, so a peer committing on ANOTHER branch invalidates them
+// without moving this branch's head — the case the caller's parent check misses,
+// and one AddSnapshot rejects terminally rather than retryably.
+func stagedSnapshotStillValid(snap *Snapshot, fresh Metadata) bool {
+	if snap == nil || fresh == nil {
+		return true
+	}
+
+	if fresh.Version() >= 2 && snap.SequenceNumber <= fresh.LastSequenceNumber() {
+		return false
+	}
+
+	if fresh.Version() >= 3 && (snap.FirstRowID == nil || *snap.FirstRowID < fresh.NextRowID()) {
+		return false
+	}
+
+	return true
+}
+
 // rebuildSnapshotUpdates returns a new slice of updates where any
 // addSnapshotUpdate that carries a rebuildManifestList closure has its
 // snapshot regenerated to inherit all data files committed to the branch
@@ -888,26 +982,43 @@ func validateBranchRequirement(reqs []Requirement, branch string, meta Metadata)
 // list is rewritten to include the fresh parent's manifests so that the
 // rebuilt snapshot contains every committed file.
 func rebuildSnapshotUpdates(ctx context.Context, updates []Update, freshMeta Metadata, branch string, fs icebergio.WriteFileIO, attempt int) (rebuilt []Update, orphanedPaths []string, err error) {
-	// Determine the fresh branch head to use as the rebuilt snapshot's parent.
+	// Must mirror createSnapshotProducer's attempt-0 fallback, or a retried new
+	// branch rebuilds with a nil parent and silently drops main's data.
 	var freshHead *Snapshot
-	if branch != "" && freshMeta != nil {
-		freshHead = freshMeta.SnapshotByName(branch)
-	} else if freshMeta != nil {
-		freshHead = freshMeta.CurrentSnapshot()
+	if freshMeta != nil {
+		freshHead = latestSnapshotForBranch(freshMeta, branch)
 	}
 
 	result := make([]Update, len(updates))
 	copy(result, updates)
 
+	// A single transaction can stage several snapshots on the same branch (an
+	// append followed by a delete, say). They were chained at build time so
+	// snapshot[n].parent == snapshot[n-1]; on retry they must be replayed as a
+	// chain, each rebuilt snapshot becoming the parent of the next. Feeding
+	// every staged snapshot the same fresh branch head would turn the chain
+	// into siblings — the branch ref advances only to the last one, silently
+	// dropping the earlier snapshots' data. chainRebuilt forces every snapshot
+	// after the first rebuild to rebuild too: its recorded parent is an earlier
+	// staged snapshot that has itself just been reparented onto the fresh head.
+	chainRebuilt := false
 	for i, u := range result {
 		su, ok := u.(*addSnapshotUpdate)
 		if !ok || su.rebuildManifestList == nil {
 			continue
 		}
 
-		// Skip if the parent has not changed — saves an unnecessary S3 write.
-		if freshHead != nil && su.Snapshot.ParentSnapshotID != nil &&
-			*su.Snapshot.ParentSnapshotID == freshHead.SnapshotID {
+		// Skip only when nothing upstream changed: the running head still
+		// matches this snapshot's recorded parent, no earlier snapshot in this
+		// chain was rebuilt, and the table-wide values the rebuild recomputes
+		// are still acceptable. Saves an unnecessary S3 write.
+		if !chainRebuilt && freshHead != nil && su.Snapshot.ParentSnapshotID != nil &&
+			*su.Snapshot.ParentSnapshotID == freshHead.SnapshotID &&
+			stagedSnapshotStillValid(su.Snapshot, freshMeta) {
+			// Already parented on the running head; it becomes the parent of
+			// the next staged snapshot in the chain.
+			freshHead = su.Snapshot
+
 			continue
 		}
 
@@ -928,6 +1039,10 @@ func rebuildSnapshotUpdates(ctx context.Context, updates []Update, freshMeta Met
 
 		// The old manifest list is now an orphaned object in object storage.
 		orphanedPaths = append(orphanedPaths, oldManifestList)
+
+		// Chain the next staged snapshot onto the one just rebuilt.
+		freshHead = newSnap
+		chainRebuilt = true
 	}
 
 	return result, orphanedPaths, nil
@@ -1032,10 +1147,7 @@ func backoffDuration(attempt uint, minMs, maxMs uint64) time.Duration {
 	if minMs > maxRetryDurationMs>>attempt {
 		ceiling = maxMs
 	} else {
-		ceiling = minMs << attempt
-		if ceiling > maxMs {
-			ceiling = maxMs
-		}
+		ceiling = min(minMs<<attempt, maxMs)
 	}
 
 	// Jitter in [minMs, ceiling]: keeps a non-zero floor so concurrent
@@ -1129,6 +1241,9 @@ func WithSnapshotID(n int64) ScanOption {
 			return
 		}
 		scan.snapshotID = &n
+		scan.asOfTimestamp = nil
+		useSnapshotSchema := true
+		scan.useSnapshotSchema = &useSnapshotSchema
 	}
 }
 
@@ -1141,6 +1256,9 @@ func WithSnapshotAsOf(timeStampMs int64) ScanOption {
 			return
 		}
 		scan.asOfTimestamp = &timeStampMs
+		scan.snapshotID = nil
+		useSnapshotSchema := true
+		scan.useSnapshotSchema = &useSnapshotSchema
 	}
 }
 
@@ -1161,7 +1279,9 @@ func WithLimit(n int64) ScanOption {
 }
 
 // WithMaxConcurrency sets the maximum concurrency for table scan and plan
-// operations. When unset it defaults to runtime.GOMAXPROCS.
+// operations. When unset it defaults to runtime.GOMAXPROCS. Above one, a
+// scan holds the decoded batches of up to n tasks at once while it returns
+// them in task order; [Scan.ReadTasks] states the bound.
 func WithMaxConcurrency(n int) ScanOption {
 	if n <= 0 {
 		return noopOption
@@ -1214,13 +1334,33 @@ func WithRowLineage() ScanOption {
 	}
 }
 
+// WithArrowBatchSize caps the number of rows decoded per Arrow record
+// batch when reading data files, overriding the table's
+// read.parquet.batch-size property for this scan. Smaller batches bound
+// the memory a scan holds per decoded batch, which matters when the
+// consumer buffers batches (e.g. a compaction's read+write pipeline).
+// The cap is stored on the scan itself rather than in the options map,
+// so it applies regardless of ordering relative to [WithOptions]. A
+// non-positive value is ignored.
+func WithArrowBatchSize(n int) ScanOption {
+	if n <= 0 {
+		return noopOption
+	}
+
+	return func(scan *Scan) {
+		scan.arrowBatchSize = n
+	}
+}
+
 func (t Table) Scan(opts ...ScanOption) *Scan {
 	s := &Scan{
-		identifier:       slices.Clone(t.identifier),
-		metadata:         t.metadata,
-		metadataLocation: t.metadataLocation,
-		ioF:              t.fsF,
-		planner:          t.planner,
+		identifier:          slices.Clone(t.identifier),
+		metadata:            t.metadata,
+		metadataLocation:    t.metadataLocation,
+		ioF:                 t.fsF,
+		manifestCache:       t.manifestCache,
+		planner:             t.planner,
+		scanPlanningIOProps: maps.Clone(t.scanPlanningIOProps),
 		// TODO(#1178 Phase 6): resolve scan-planning-mode table properties here.
 		planningMode:   ScanPlanningLocal,
 		rowFilter:      iceberg.AlwaysTrue{},
@@ -1261,6 +1401,47 @@ func WithMetricsReporter(r metrics.Reporter) Option {
 	}
 }
 
+// WithScanPlanningIOProperties supplies the table-scoped FileIO properties
+// that a remote scan planner needs when it builds a plan-scoped FileIO. This
+// is intended for catalog implementations whose table-load response carries
+// FileIO configuration separately from table metadata properties.
+func WithScanPlanningIOProperties(props iceberg.Properties) Option {
+	if props == nil {
+		return noopTableOption
+	}
+
+	return func(t *Table) {
+		t.scanPlanningIOProps = maps.Clone(props)
+	}
+}
+
+// WithLabels attaches catalog-provided labels from a load response to the
+// table. A nil value is ignored, leaving the table's labels nil.
+func WithLabels(l *iceberg.Labels) Option {
+	if l == nil {
+		return noopTableOption
+	}
+
+	return func(t *Table) {
+		t.labels = l
+	}
+}
+
+// WithSavedConfig supplies a set of properties used to create a *Table
+// instance. This saved config is exposed through table.SavedConfig() and
+// can be used by callers to save properties along with a table instance, for
+// reuse later if the table instance were to be cloned in a new call to
+// table.New.
+func WithSavedConfig(config iceberg.Properties) Option {
+	if config == nil {
+		return noopTableOption
+	}
+
+	return func(t *Table) {
+		t.savedConfig = maps.Clone(config)
+	}
+}
+
 // withReporterState copies both the reporter and the reporterSet flag verbatim.
 // Unlike WithMetricsReporter it does not force reporterSet true, so a table
 // riding the catalog default (reporterSet == false) stays defaulted across a
@@ -1293,6 +1474,7 @@ func New(ident Identifier, meta Metadata, metadataLocation string, fsF FSysF, ca
 		metadata:         meta,
 		metadataLocation: metadataLocation,
 		fsF:              fsF,
+		manifestCache:    newSnapshotManifestCacheForMetadata(meta),
 		cat:              cat,
 		planner:          planner,
 		reporter:         metrics.NopReporter{},

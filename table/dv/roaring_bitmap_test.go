@@ -68,10 +68,58 @@ func TestDeserializeRoaringBitmapJava32BitValues(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, int64(10), bm.Cardinality())
-	for i := uint64(0); i < 10; i++ {
+	for i := range uint64(10) {
 		assert.True(t, bm.Contains(i), "expected position %d to be set", i)
 	}
 	assert.False(t, bm.Contains(10))
+}
+
+// Why: SerializeDV reserves the exact portable bitmap size before writing the
+// envelope, so the size helper must stay in sync with Serialize.
+// Condition: empty, sparse multi-bucket, and run-optimized bitmaps.
+// Assertion: the predicted size equals the bytes written for every shape.
+func TestRoaringPositionBitmapSerializedSize(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		positions []uint64
+		emptyKey  bool
+	}{
+		{name: "empty"},
+		{name: "sparse multi-bucket", positions: []uint64{1, 3, (uint64(1) << 32) | 7}},
+		{name: "run-optimized", positions: []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}},
+		{name: "empty bucket omitted", emptyKey: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bm := NewRoaringPositionBitmap()
+			for _, position := range tt.positions {
+				bm.Set(position)
+			}
+			if tt.emptyKey {
+				bm.bitmaps[7] = roaring.New()
+			}
+			bm.RunLengthEncode()
+
+			var buf bytes.Buffer
+			require.NoError(t, bm.Serialize(&buf))
+			assert.Equal(t, uint64(buf.Len()), bm.serializedSize())
+		})
+	}
+}
+
+// Why: metadata-table readers need deterministic expansion of deletion vectors.
+// Condition: positions span multiple high-bit buckets and were inserted out of order.
+// Assertion: Positions yields every value once in ascending order.
+func TestRoaringPositionBitmapPositions(t *testing.T) {
+	bm := NewRoaringPositionBitmap()
+	for _, position := range []uint64{(uint64(2) << 32) | 4, 9, 1, (uint64(1) << 32) | 3} {
+		bm.Set(position)
+	}
+
+	var actual []uint64
+	for position := range bm.Positions() {
+		actual = append(actual, position)
+	}
+	assert.Equal(t, []uint64{1, 9, (uint64(1) << 32) | 3, (uint64(2) << 32) | 4}, actual)
 }
 
 // Why: the deserializer must fail cleanly when the outer bitmap count cannot be read.
@@ -190,7 +238,7 @@ func TestKeepMaskBytes(t *testing.T) {
 		bm := NewRoaringPositionBitmap()
 		mask := bm.KeepMaskBytes(10)
 		require.Len(t, mask, 2) // ⌈10/8⌉ = 2
-		for i := int64(0); i < 10; i++ {
+		for i := range int64(10) {
 			assert.True(t, bitAt(mask, i), "bit %d should be kept", i)
 		}
 		// Bits 10..15 in the trailing byte must be cleared so callers
@@ -230,9 +278,20 @@ func TestKeepMaskBytes(t *testing.T) {
 
 		mask := bm.KeepMaskBytes(32)
 		require.Len(t, mask, 4)
-		for i := int64(0); i < 32; i++ {
+		for i := range int64(32) {
 			assert.True(t, bitAt(mask, i), "bit %d should be kept", i)
 		}
+	})
+
+	t.Run("sparse high position", func(t *testing.T) {
+		const length int64 = 1 << 20
+		bm := NewRoaringPositionBitmap()
+		bm.Set(uint64(length - 1))
+
+		mask := bm.KeepMaskBytes(length)
+		require.Len(t, mask, int(length/8))
+		assert.False(t, bitAt(mask, length-1))
+		assert.True(t, bitAt(mask, length-2))
 	})
 
 	t.Run("length not byte-aligned: trailing bits cleared", func(t *testing.T) {
@@ -261,7 +320,7 @@ func TestKeepMaskBytes(t *testing.T) {
 		mask := bm.KeepMaskBytes(64)
 		require.Len(t, mask, 8)
 		assert.False(t, bitAt(mask, 5))
-		for i := int64(0); i < 64; i++ {
+		for i := range int64(64) {
 			if i == 5 {
 				continue
 			}
@@ -492,7 +551,7 @@ func TestKeepMaskBytesAfterSetRange(t *testing.T) {
 
 	mask := bm.KeepMaskBytes(128)
 	require.Len(t, mask, 16)
-	for i := int64(0); i < 128; i++ {
+	for i := range int64(128) {
 		deleted := (i >= 10 && i < 70) || i == 100
 		assert.Equalf(t, !deleted, bitAt(mask, i), "position %d: deleted=%v", i, deleted)
 	}
@@ -509,7 +568,7 @@ func TestRoaringBitmapRunLengthEncode(t *testing.T) {
 	const positions = 100_000
 
 	bm := NewRoaringPositionBitmap()
-	for pos := uint64(0); pos < positions; pos++ {
+	for pos := range uint64(positions) {
 		bm.Set(pos)
 	}
 

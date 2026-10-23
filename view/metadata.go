@@ -20,7 +20,6 @@ package view
 import (
 	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"io"
 	"maps"
 	"slices"
@@ -28,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	iceinternal "github.com/DataDog/iceberg-go/internal"
@@ -304,7 +305,7 @@ func ParseMetadataBytes(b []byte) (Metadata, error) {
 // The extractKey function will be called on each item in the slice and assign the
 // item as a value for that key in the resultant map.
 func indexBy[T any, K comparable](s []T, extractKey func(T) K) map[K]T {
-	index := make(map[K]T)
+	index := make(map[K]T, len(s))
 	for _, v := range s {
 		index[extractKey(v)] = v
 	}
@@ -422,7 +423,7 @@ func cloneSchema(schema *iceberg.Schema) *iceberg.Schema {
 	return iceberg.NewSchemaWithIdentifiers(
 		schema.ID,
 		slices.Clone(schema.IdentifierFieldIDs),
-		cloneNestedFields(schema.Fields())...,
+		schema.Fields()...,
 	)
 }
 
@@ -437,67 +438,6 @@ func cloneSchemas(schemas []*iceberg.Schema) []*iceberg.Schema {
 	}
 
 	return clones
-}
-
-func cloneNestedFields(fields []iceberg.NestedField) []iceberg.NestedField {
-	clones := slices.Clone(fields)
-	for i := range clones {
-		clones[i].Type = cloneSchemaType(clones[i].Type)
-		clones[i].InitialDefault = cloneDefault(clones[i].InitialDefault)
-		clones[i].WriteDefault = cloneDefault(clones[i].WriteDefault)
-	}
-
-	return clones
-}
-
-func cloneSchemaType(typ iceberg.Type) iceberg.Type {
-	switch typ := typ.(type) {
-	case *iceberg.StructType:
-		return &iceberg.StructType{FieldList: cloneNestedFields(typ.FieldList)}
-	case *iceberg.ListType:
-		return &iceberg.ListType{
-			ElementID:       typ.ElementID,
-			Element:         cloneSchemaType(typ.Element),
-			ElementRequired: typ.ElementRequired,
-		}
-	case *iceberg.MapType:
-		return &iceberg.MapType{
-			KeyID:         typ.KeyID,
-			KeyType:       cloneSchemaType(typ.KeyType),
-			ValueID:       typ.ValueID,
-			ValueType:     cloneSchemaType(typ.ValueType),
-			ValueRequired: typ.ValueRequired,
-		}
-	default:
-		return typ
-	}
-}
-
-func cloneDefault(value any) any {
-	switch value := value.(type) {
-	case []byte:
-		return slices.Clone(value)
-	case iceberg.BinaryLiteral:
-		return iceberg.BinaryLiteral(slices.Clone([]byte(value)))
-	case iceberg.FixedLiteral:
-		return iceberg.FixedLiteral(slices.Clone([]byte(value)))
-	case []any:
-		clones := make([]any, len(value))
-		for i, item := range value {
-			clones[i] = cloneDefault(item)
-		}
-
-		return clones
-	case map[string]any:
-		clones := make(map[string]any, len(value))
-		for key, item := range value {
-			clones[key] = cloneDefault(item)
-		}
-
-		return clones
-	default:
-		return value
-	}
 }
 
 func (m *metadata) validate() error {

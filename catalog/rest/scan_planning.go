@@ -16,9 +16,8 @@
 // under the License.
 
 // This file contains the REST server-side scan planning client surface for
-// apache/iceberg-go#1178. Low-level client methods and endpoint capability
-// checks are implemented here; higher-level orchestration, scanner delegation,
-// expression wrappers, and scan-task content decoding land in follow-up phases.
+// apache/iceberg-go#1178. It includes the low-level endpoint methods and the
+// end-to-end planner implementation used by table.Scan.
 
 package rest
 
@@ -30,21 +29,30 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/DataDog/iceberg-go/catalog"
+	"github.com/DataDog/iceberg-go/internal/scanmetrics"
 	iceio "github.com/DataDog/iceberg-go/io"
 	"github.com/DataDog/iceberg-go/table"
 	"github.com/goccy/go-json"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
 // Compile-time proof that the REST catalog satisfies the table planner seam.
 var _ table.ScanPlanner = (*Catalog)(nil)
+
+// Compile-time proof that the REST catalog exposes the optional full-capability
+// extension used by table.Scan's auto planning mode.
+var _ table.FullRemoteScanPlanner = (*Catalog)(nil)
 
 // ErrPlanExpired is returned when polling a plan that the server no longer
 // knows about: a fetchPlanningResult 404 whose error.type is exactly
@@ -145,48 +153,37 @@ const headerIdempotencyKey = "Idempotency-Key"
 // --- Capability gating -------------------------------------------------------
 //
 // Capability is split into two predicates. SupportsPlanTableScan is the narrow
-// "server can plan inline" check (plan endpoint only). SupportsFullRemoteScanPlanning
-// is the endpoint-level "server advertises all four endpoints" check: an
-// end-to-end plan can come back `submitted` or with `plan-tasks` that need the
-// poll/cancel/fetch endpoints to finish, and auto mode has no second chance to
-// fall back to local once it commits to remote, so a plan-only server must not
-// count as end-to-end capable.
-//
-// SupportsRemoteScanPlanning is the table.ScanPlanner-facing predicate that
-// table.Scan's auto mode routes on. It is deliberately gated to false while
-// PlanFiles is an unimplemented stub: routing on endpoint capability alone would
-// send an auto-mode scan into PlanFiles and surface ErrNotImplemented instead of
-// falling back to local planning. It flips on with the PlanFiles phase.
+// "server can plan" check (plan endpoint only). SupportsFullRemoteScanPlanning
+// reports whether every continuation endpoint is also advertised. A plan-only
+// server can still complete a remote scan synchronously with inline file tasks,
+// so table.Scan routes on the narrow predicate and PlanFiles checks continuation
+// endpoints only when the response requires polling or task expansion. The
+// cancel endpoint is best-effort cleanup rather than an execution dependency.
 
-// SupportsPlanTableScan reports whether the server advertised the synchronous
-// plan endpoint.
+// SupportsPlanTableScan reports whether the server advertised the plan
+// submission endpoint.
 func (r *Catalog) SupportsPlanTableScan() bool {
 	return r.endpoints.contains(endpointPlanTableScan)
 }
 
-// SupportsFullRemoteScanPlanning reports whether the server advertised all four
-// scan-planning endpoints (plan, fetch-result, cancel, fetch-tasks), i.e. it can
-// drive the async/fanout path, not just sync inline planning.
+// SupportsFullRemoteScanPlanning reports whether the server advertised the
+// execution endpoints (plan, fetch-result, fetch-tasks), i.e. it can drive the
+// async/fanout path, not just sync inline planning. Cancellation is optional
+// cleanup and does not prevent a plan from producing tasks.
 func (r *Catalog) SupportsFullRemoteScanPlanning() bool {
 	return r.SupportsPlanTableScan() &&
 		r.endpoints.contains(endpointFetchPlanResult) &&
-		r.endpoints.contains(endpointCancelPlanning) &&
 		r.endpoints.contains(endpointFetchScanTasks)
 }
 
 // --- table.ScanPlanner implementation ---------------------------------------
 
-// SupportsRemoteScanPlanning reports whether this catalog can complete a remote
-// plan end-to-end. table.Scan's auto mode routes on it, calling PlanFiles when it
-// is true, so it must stay false until PlanFiles is implemented — otherwise an
-// auto-mode scan against a server advertising all four endpoints would fail with
-// ErrNotImplemented instead of falling back to local planning.
-//
-// TODO(#1178): return SupportsFullRemoteScanPlanning() once PlanFiles is wired
-// end-to-end. Until then, callers probing endpoint capability should use
-// SupportsFullRemoteScanPlanning / SupportsPlanTableScan directly.
+// SupportsRemoteScanPlanning reports whether this catalog can submit a remote
+// plan. Any continuation capability is validated against the response returned
+// by the server; SupportsFullRemoteScanPlanning reports whether auto mode can
+// safely use the complete continuation flow without a local fallback.
 func (r *Catalog) SupportsRemoteScanPlanning() bool {
-	return false
+	return r.SupportsPlanTableScan()
 }
 
 // PlanFiles plans a scan server-side and returns tasks (and, optionally, a
@@ -194,11 +191,10 @@ func (r *Catalog) SupportsRemoteScanPlanning() bool {
 // submitted plan to completion, and expands any plan-task handles into their
 // tasks before returning.
 //
-// Decoding the returned tasks into table.FileScanTask is the one piece still
-// stubbed: RESTFileScanTask/RESTDeleteFile are empty pending the scan-task
-// decoder phase, so a plan that yields any task surfaces ErrNotImplemented (see
-// remoteScanTasks). SupportsRemoteScanPlanning therefore stays false until that
-// lands, so auto-mode scans keep planning locally rather than routing here.
+// Each response is decoded as its own ScanTasks envelope before the results are
+// combined. Delete-file references are scoped to the envelope that returned
+// them, so flattening all responses first would attach deletes to the wrong
+// data files when the server uses plan-task fanout.
 func (r *Catalog) PlanFiles(ctx context.Context, req table.ScanPlanningRequest) (table.ScanPlanningResult, error) {
 	wire, err := planTableScanRequestFrom(req)
 	if err != nil {
@@ -208,6 +204,16 @@ func (r *Catalog) PlanFiles(ctx context.Context, req table.ScanPlanningRequest) 
 	resp, err := r.PlanTableScan(ctx, req.Identifier, wire)
 	if err != nil {
 		return table.ScanPlanningResult{}, err
+	}
+
+	planID := ""
+	if resp.PlanID != nil {
+		planID = *resp.PlanID
+	}
+	cleanup := func() {
+		if planID != "" {
+			r.abandonPlan(ctx, req.Identifier, planID, DefaultWaitForPlanOptions.CancelGracePeriod)
+		}
 	}
 
 	// Resolve to a completed plan: use an inline result as-is, or poll a
@@ -223,6 +229,20 @@ func (r *Catalog) PlanFiles(ctx context.Context, req table.ScanPlanningRequest) 
 	case PlanStatusSubmitted:
 		completed, err = r.WaitForPlan(ctx, req.Identifier, *resp.PlanID, WaitForPlanOptions{})
 		if err != nil {
+			// WaitForPlan already abandons plans when its retry budget or the
+			// caller's context is exhausted. Other terminal client/transport
+			// errors can leave a submitted plan active, so release it here.
+			if !errors.Is(err, context.Canceled) &&
+				!errors.Is(err, context.DeadlineExceeded) &&
+				!errors.Is(err, ErrPlanPollExhausted) &&
+				!errors.Is(err, ErrPlanFailed) &&
+				!errors.Is(err, ErrPlanCancelled) &&
+				!errors.Is(err, ErrPlanExpired) &&
+				!errors.Is(err, catalog.ErrNoSuchTable) &&
+				!errors.Is(err, catalog.ErrNoSuchNamespace) {
+				cleanup()
+			}
+
 			return table.ScanPlanningResult{}, err
 		}
 	default:
@@ -230,99 +250,238 @@ func (r *Catalog) PlanFiles(ctx context.Context, req table.ScanPlanningRequest) 
 			"%w: unexpected plan status %q from planTableScan", ErrRESTError, resp.Status)
 	}
 
-	files, deletes, err := r.collectScanTasks(ctx, req.Identifier, completed.ScanTasks)
+	envelopes, err := r.collectScanTasksWithConcurrency(
+		ctx, req.Identifier, completed.ScanTasks, req.MaxConcurrency)
 	if err != nil {
+		cleanup()
+
 		return table.ScanPlanningResult{}, err
 	}
 
-	tasks, err := remoteScanTasks(files, deletes)
+	tasks, err := remoteScanTasks(envelopes, req)
 	if err != nil {
+		cleanup()
+
 		return table.ScanPlanningResult{}, err
 	}
 
-	return table.ScanPlanningResult{
+	result := table.ScanPlanningResult{
 		Tasks: tasks,
-		IO:    planIOFromCredentials(completed.StorageCredentials, req.MetadataLocation, r.planIOBaseProps(req.Metadata)),
-	}, nil
+		IO:    planIOFromCredentials(completed.StorageCredentials, req.MetadataLocation, r.planIOBaseProps(req)),
+	}
+	if result.IO == nil {
+		// Without plan-scoped credentials, all task materialization is complete
+		// and the plan can be released before the caller reads the files.
+		cleanup()
+	} else {
+		// Keep the plan alive while the lazy plan-scoped IO may still be used.
+		// table.Scan closes this IO after its active readers release their lease.
+		result.IO = &planIOWithCleanup{io: result.IO, cleanup: cleanup}
+	}
+
+	return result, nil
 }
 
-// planIOBaseProps rebuilds the props the table's own FileIO was built with, so a
-// plan-scoped IO keeps settings like a custom S3 endpoint or region. loadTable's
-// config block never reaches the planner seam, so it isn't included.
-func (r *Catalog) planIOBaseProps(meta table.ScanPlanningMetadata) iceberg.Properties {
+// planIOBaseProps rebuilds the props the table's own FileIO was built with, so
+// a plan-scoped IO keeps settings like a custom S3 endpoint or region. The
+// table-scoped properties take precedence over catalog and metadata defaults;
+// this mirrors the merge order used by LoadTable.
+func (r *Catalog) planIOBaseProps(req table.ScanPlanningRequest) iceberg.Properties {
 	props := make(iceberg.Properties, len(r.props))
 	maps.Copy(props, r.props)
-	if meta != nil {
-		maps.Copy(props, meta.Properties())
+	if req.Metadata != nil {
+		maps.Copy(props, req.Metadata.Properties())
 	}
+	maps.Copy(props, req.FileIOProperties)
 
 	return props
 }
 
-// collectScanTasks expands plan-task handles into their tasks, walking the
-// fanout: a fetchScanTasks response can itself return more plan-tasks. It
-// accumulates the file-scan-tasks and delete-files reachable from the initial
-// set. A handle is fetched at most once; a server that re-issues one would
-// otherwise loop forever.
-func (r *Catalog) collectScanTasks(ctx context.Context, ident table.Identifier, tasks ScanTasks) ([]RESTFileScanTask, []RESTDeleteFile, error) {
-	files := append([]RESTFileScanTask(nil), tasks.FileScanTasks...)
-	deletes := append([]RESTDeleteFile(nil), tasks.DeleteFiles...)
+// collectScanTasksWithConcurrency expands plan-task handles into their task
+// envelopes, walking the fanout: a response can itself return more plan-tasks. Each
+// frontier is fetched concurrently, but its responses are appended in handle
+// order so completion timing cannot change the result order. A handle is
+// fetched at most once; a server that re-issues one would otherwise loop
+// forever. The envelope boundaries are retained because delete-file references
+// are local to each response.
+//
+// maxConcurrency bounds the number of concurrent fetches. A non-positive limit
+// uses runtime.GOMAXPROCS. On a fetch error, at most the configured number of
+// requests can already be in flight when cancellation reaches their contexts.
+func (r *Catalog) collectScanTasksWithConcurrency(
+	ctx context.Context,
+	ident table.Identifier,
+	tasks ScanTasks,
+	maxConcurrency int,
+) ([]ScanTasks, error) {
+	if maxConcurrency <= 0 {
+		maxConcurrency = runtime.GOMAXPROCS(0)
+	}
 
-	queue := append([]string(nil), tasks.PlanTasks...)
-	seen := make(map[string]bool, len(queue))
-	for len(queue) > 0 {
-		handle := queue[0]
-		queue = queue[1:]
-		if seen[handle] {
+	envelopes := []ScanTasks{tasks}
+
+	frontier := append([]string(nil), tasks.PlanTasks...)
+	seen := make(map[string]bool, len(frontier))
+	for len(frontier) > 0 {
+		handles := make([]string, 0, len(frontier))
+		for _, handle := range frontier {
+			if seen[handle] {
+				continue
+			}
+			seen[handle] = true
+			handles = append(handles, handle)
+		}
+		if len(handles) == 0 {
+			break
+		}
+
+		responses, err := r.fetchScanTaskFrontier(ctx, ident, handles, maxConcurrency)
+		if err != nil {
+			return nil, err
+		}
+
+		var nextFrontier []string
+		for _, response := range responses {
+			envelopes = append(envelopes, response.ScanTasks)
+			nextFrontier = append(nextFrontier, response.PlanTasks...)
+		}
+		frontier = nextFrontier
+	}
+
+	return envelopes, nil
+}
+
+// fetchScanTaskFrontier fetches one breadth-first frontier concurrently while
+// placing responses back into handle order. When a handle fails, unfinished
+// later handles are canceled, but earlier handles are allowed to finish so the
+// first error in the old serial handle order remains deterministic.
+func (r *Catalog) fetchScanTaskFrontier(
+	ctx context.Context,
+	ident table.Identifier,
+	handles []string,
+	maxConcurrency int,
+) ([]FetchScanTasksResponse, error) {
+	responses := make([]FetchScanTasksResponse, len(handles))
+	errs := make([]error, len(handles))
+	if len(handles) == 0 {
+		return responses, nil
+	}
+	if maxConcurrency <= 0 {
+		maxConcurrency = runtime.GOMAXPROCS(0)
+	}
+	maxConcurrency = min(maxConcurrency, len(handles))
+
+	requestCtxs := make([]context.Context, len(handles))
+	requestCancels := make([]context.CancelFunc, len(handles))
+	for i := range handles {
+		requestCtxs[i], requestCancels[i] = context.WithCancel(ctx)
+	}
+	defer func() {
+		for _, cancel := range requestCancels {
+			cancel()
+		}
+	}()
+
+	var (
+		mu               sync.Mutex
+		completed        = make([]bool, len(handles))
+		siblingCanceled  = make([]bool, len(handles))
+		lowestFailureIdx = -1
+	)
+
+	var group errgroup.Group
+	group.SetLimit(maxConcurrency)
+
+	for i, handle := range handles {
+		group.Go(func() error {
+			response, fetchErr := r.FetchScanTasks(requestCtxs[i], ident, FetchScanTasksRequest{PlanTask: handle})
+
+			mu.Lock()
+			defer mu.Unlock()
+			completed[i] = true
+			if fetchErr == nil {
+				responses[i] = response
+
+				return nil
+			}
+
+			errs[i] = fmt.Errorf("fetching scan tasks for handle %q: %w", handle, fetchErr)
+			if siblingCanceled[i] || (lowestFailureIdx >= 0 && i > lowestFailureIdx) {
+				return fetchErr
+			}
+
+			if lowestFailureIdx < 0 || i < lowestFailureIdx {
+				lowestFailureIdx = i
+				for j := i + 1; j < len(handles); j++ {
+					if completed[j] || siblingCanceled[j] {
+						continue
+					}
+					siblingCanceled[j] = true
+					requestCancels[j]()
+				}
+			}
+
+			return fetchErr
+		})
+	}
+
+	if waitErr := group.Wait(); waitErr != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		for i, err := range errs {
+			if err != nil && !siblingCanceled[i] {
+				return nil, err
+			}
+		}
+
+		return nil, waitErr
+	}
+
+	return responses, nil
+}
+
+// remoteScanTasks decodes each server task envelope into domain FileScanTasks.
+// The decoder must run before envelopes are combined because delete-file
+// references are indexes into the envelope-local delete-files array.
+func remoteScanTasks(envelopes []ScanTasks, req table.ScanPlanningRequest) ([]table.FileScanTask, error) {
+	var result []table.FileScanTask
+	plans := newPartitionDecodePlanCache()
+	for i, envelope := range envelopes {
+		// Keep empty completed plans cheap and allow the low-level planner method
+		// to return no tasks even when a caller did not provide metadata.
+		if len(envelope.FileScanTasks) == 0 && len(envelope.DeleteFiles) == 0 {
 			continue
 		}
-		seen[handle] = true
 
-		resp, err := r.FetchScanTasks(ctx, ident, FetchScanTasksRequest{PlanTask: handle})
+		tasks, err := decodeScanTasks(envelope, req.Metadata, req.Schema, req.RowFilter, plans)
 		if err != nil {
-			return nil, nil, err
+			return nil, fmt.Errorf("decoding remote scan task envelope %d: %w", i, err)
 		}
-		files = append(files, resp.FileScanTasks...)
-		deletes = append(deletes, resp.DeleteFiles...)
-		queue = append(queue, resp.PlanTasks...)
+		result = append(result, tasks...)
 	}
 
-	return files, deletes, nil
+	return result, nil
 }
 
-// remoteScanTasks decodes the server's task payload into domain FileScanTasks.
-// Blocked for now: RESTFileScanTask/RESTDeleteFile are empty pending the
-// scan-task decoder phase, so an empty plan decodes to no tasks while any actual
-// task surfaces ErrNotImplemented. The decoder phase replaces this body.
-func remoteScanTasks(files []RESTFileScanTask, deletes []RESTDeleteFile) ([]table.FileScanTask, error) {
-	if len(files) == 0 && len(deletes) == 0 {
-		return nil, nil
-	}
-
-	return nil, fmt.Errorf("%w: decoding remote scan tasks", iceberg.ErrNotImplemented)
-}
-
-// planIOFromCredentials wraps a plan's vended storage credentials in a lazy
-// PlanIO, overlaid on the table's base IO props so vended keys win on collision.
-// With none vended it returns a nil PlanIO, and the scan falls back to the
-// table's own FileIO.
+// planIOFromCredentials wraps a plan's prefix-scoped storage credentials in a
+// lazy PlanIO. The returned IO resolves the longest matching credential prefix
+// for each data or delete file it opens, overlaid on the table's base IO props
+// so vended keys win on collision. With none vended it returns a nil PlanIO,
+// and the scan falls back to the table's own FileIO.
 func planIOFromCredentials(creds []StorageCredential, location string, baseProps iceberg.Properties) table.PlanIO {
 	if len(creds) == 0 {
 		return nil
 	}
 
-	// TODO(#1178): plan.storage-credentials is prefix-scoped, but this builds one
-	// IO from the metadata location — wrong cred if data/delete files sit under a
-	// different prefix. The scan-task decoder settles the PlanIO shape.
-	resolved := resolveStorageCredentials(creds, location)
-	props := make(iceberg.Properties, len(baseProps)+len(resolved))
-	maps.Copy(props, baseProps)
-	maps.Copy(props, resolved)
-
 	return &planScopedIO{refresher: &vendedCredentialRefresher{
-		mu:       semaphore.NewWeighted(1),
-		location: location,
-		props:    props,
+		mu:          semaphore.NewWeighted(1),
+		location:    location,
+		props:       maps.Clone(baseProps),
+		credentials: slices.Clone(creds),
 		// fetchCreds stays nil: a plan's creds can't be renewed via the
 		// table-credentials endpoint, so an expiry is fatal, not a re-fetch.
 	}}
@@ -342,17 +501,42 @@ func (p *planScopedIO) Close() error {
 	return p.refresher.close()
 }
 
+// planIOWithCleanup keeps the remote plan alive for the lifetime of the
+// plan-scoped IO. Scan owns the IO through its PlanIO state and closes it only
+// after replacing the plan and releasing active readers, so cancellation cannot
+// invalidate credentials before ReadTasks opens the files.
+type planIOWithCleanup struct {
+	io      table.PlanIO
+	cleanup func()
+	once    sync.Once
+}
+
+func (p *planIOWithCleanup) Load(ctx context.Context) (iceio.IO, error) {
+	return p.io.Load(ctx)
+}
+
+func (p *planIOWithCleanup) Close() error {
+	defer p.once.Do(p.cleanup)
+
+	return p.io.Close()
+}
+
 // planTableScanRequestFrom builds the planTableScan request body from the
 // planner-level request, serializing the row filter to ExpressionParser JSON. A
 // nil or always-true filter is left off so the server plans without one.
 func planTableScanRequestFrom(req table.ScanPlanningRequest) (PlanTableScanRequest, error) {
 	out := PlanTableScanRequest{
 		SnapshotID:        req.SnapshotID,
-		Select:            req.SelectedFields,
 		MinRowsRequested:  req.MinRowsRequested,
 		CaseSensitive:     req.CaseSensitive,
 		UseSnapshotSchema: req.UseSnapshotSchema,
 		StatsFields:       req.StatsFields,
+	}
+	// `*` is table.Scan's local sentinel, not a REST FieldName. A planner
+	// normally expands it to schema field names before reaching this function;
+	// omitting it here is the safe fallback for direct callers without a schema.
+	if len(req.SelectedFields) > 0 && !slices.Contains(req.SelectedFields, "*") {
+		out.Select = slices.Clone(req.SelectedFields)
 	}
 
 	if req.RowFilter != nil && !req.RowFilter.Equals(iceberg.AlwaysTrue{}) {
@@ -380,8 +564,15 @@ func marshalScanFilter(req table.ScanPlanningRequest) ([]byte, error) {
 		caseSensitive = *req.CaseSensitive
 	}
 
-	// Snapshot-schema selection (UseSnapshotSchema) is OQ4, deferred; bind current.
-	bound, err := iceberg.BindExpr(req.Metadata.CurrentSchema(), req.RowFilter, caseSensitive)
+	schema := req.Schema
+	if schema == nil {
+		schema = req.Metadata.CurrentSchema()
+	}
+	if schema == nil {
+		return nil, fmt.Errorf("%w: cannot encode scan filter without a scan schema", iceberg.ErrInvalidArgument)
+	}
+
+	bound, err := iceberg.BindExpr(schema, req.RowFilter, caseSensitive)
 	if err != nil {
 		return nil, fmt.Errorf("%w: binding scan filter: %s", iceberg.ErrInvalidArgument, err)
 	}
@@ -404,7 +595,17 @@ func marshalScanFilter(req table.ScanPlanningRequest) ([]byte, error) {
 // Any other status — including the empty status of a 200 with no body, which
 // bypasses the response UnmarshalJSON validation — returns an ErrRESTError so a
 // malformed response cannot masquerade as an empty completed plan.
-func (r *Catalog) PlanTableScan(ctx context.Context, ident table.Identifier, req PlanTableScanRequest) (PlanTableScanResponse, error) {
+//
+// Transient HTTP responses (408, 429, 500, 502, 503, 504) are retried up to
+// three times with jittered backoff and the same idempotency key. Retry-After
+// is honored, capped at five seconds when ctx has no deadline. Transport
+// failures and malformed successful responses are not retried.
+func (r *Catalog) PlanTableScan(ctx context.Context, ident table.Identifier, req PlanTableScanRequest) (result PlanTableScanResponse, err error) {
+	ctx, finish := scanmetrics.Start(ctx, "plan")
+	defer func() {
+		finish(err)
+	}()
+
 	if err := r.endpoints.check(endpointPlanTableScan); err != nil {
 		return PlanTableScanResponse{}, err
 	}
@@ -419,10 +620,12 @@ func (r *Catalog) PlanTableScan(ctx context.Context, ident table.Identifier, req
 		return PlanTableScanResponse{}, err
 	}
 
-	resp, err := doPost[PlanTableScanRequest, PlanTableScanResponse](
-		ctx, r.baseURI, path, req, r.cl,
-		map[int]error{http.StatusNotFound: ErrRESTError},
-		withHeaders(headers), withErrorTypeOverride(planTableScanErrorTypes))
+	resp, err := retryScanPlanning(ctx, "plan", func() (PlanTableScanResponse, error) {
+		return doPost[PlanTableScanRequest, PlanTableScanResponse](
+			ctx, r.baseURI, path, req, r.cl,
+			map[int]error{http.StatusNotFound: ErrRESTError},
+			withHeaders(headers), withErrorTypeOverride(planTableScanErrorTypes))
+	})
 	if err != nil {
 		return PlanTableScanResponse{}, err
 	}
@@ -451,7 +654,15 @@ func (r *Catalog) PlanTableScan(ctx context.Context, ident table.Identifier, req
 // namespace is catalog.ErrNoSuchTable / catalog.ErrNoSuchNamespace, so the poller
 // can tell retry-with-a-new-plan from abort. A bare or unrecognized 404 stays an
 // ambiguous ErrRESTError rather than being guessed as an expiry.
-func (r *Catalog) FetchPlanningResult(ctx context.Context, ident table.Identifier, planID string, opts FetchPlanningResultOptions) (FetchPlanningResultResponse, error) {
+func (r *Catalog) FetchPlanningResult(ctx context.Context, ident table.Identifier, planID string, opts FetchPlanningResultOptions) (result FetchPlanningResultResponse, err error) {
+	ctx, finish := scanmetrics.Start(ctx, "fetch-result")
+	defer func() {
+		if errors.Is(err, ErrPlanExpired) {
+			scanmetrics.Expired(ctx, "fetch-result")
+		}
+		finish(err)
+	}()
+
 	if err := r.endpoints.check(endpointFetchPlanResult); err != nil {
 		return FetchPlanningResultResponse{}, err
 	}
@@ -490,7 +701,9 @@ func (r *Catalog) FetchPlanningResult(ctx context.Context, ident table.Identifie
 // the session-default access-delegation header (cancel vends no credentials). A
 // 404 (already-expired or unknown plan) is not special-cased: cancel is
 // best-effort, so the generic REST error is acceptable.
-func (r *Catalog) CancelPlanning(ctx context.Context, ident table.Identifier, planID string) error {
+func (r *Catalog) CancelPlanning(ctx context.Context, ident table.Identifier, planID string) (err error) {
+	ctx, finish := scanmetrics.Start(ctx, "cancel")
+	defer func() { finish(err) }()
 	if err := r.endpoints.check(endpointCancelPlanning); err != nil {
 		return err
 	}
@@ -515,7 +728,17 @@ func (r *Catalog) CancelPlanning(ctx context.Context, ident table.Identifier, pl
 // vanishing. A bare or unrecognized 404 stays an ambiguous ErrRESTError. An
 // empty 200 body is rejected (requireBody) so a truncated response is not read
 // as a successfully completed empty task set.
-func (r *Catalog) FetchScanTasks(ctx context.Context, ident table.Identifier, req FetchScanTasksRequest) (FetchScanTasksResponse, error) {
+// Transient HTTP responses use the same retry policy as [Catalog.PlanTableScan],
+// retaining the idempotency key and plan-task handle across attempts.
+func (r *Catalog) FetchScanTasks(ctx context.Context, ident table.Identifier, req FetchScanTasksRequest) (result FetchScanTasksResponse, err error) {
+	ctx, finish := scanmetrics.Start(ctx, "fetch-tasks")
+	defer func() {
+		if errors.Is(err, ErrNoSuchPlanTask) {
+			scanmetrics.Expired(ctx, "fetch-tasks")
+		}
+		finish(err)
+	}()
+
 	if err := r.endpoints.check(endpointFetchScanTasks); err != nil {
 		return FetchScanTasksResponse{}, err
 	}
@@ -530,11 +753,13 @@ func (r *Catalog) FetchScanTasks(ctx context.Context, ident table.Identifier, re
 		return FetchScanTasksResponse{}, err
 	}
 
-	return doPost[FetchScanTasksRequest, FetchScanTasksResponse](
-		ctx, r.baseURI, path, req, r.cl,
-		map[int]error{http.StatusNotFound: ErrRESTError},
-		withHeaders(headers), withSuppressedHeaders(headerIcebergAccessDelegation),
-		withErrorTypeOverride(fetchScanTasksErrorTypes), requireBody())
+	return retryScanPlanning(ctx, "fetch-tasks", func() (FetchScanTasksResponse, error) {
+		return doPost[FetchScanTasksRequest, FetchScanTasksResponse](
+			ctx, r.baseURI, path, req, r.cl,
+			map[int]error{http.StatusNotFound: ErrRESTError},
+			withHeaders(headers), withSuppressedHeaders(headerIcebergAccessDelegation),
+			withErrorTypeOverride(fetchScanTasksErrorTypes), requireBody())
+	})
 }
 
 // WaitForPlan polls a submitted plan to completion using jittered backoff. It
@@ -655,6 +880,9 @@ func (r *Catalog) WaitForPlan(ctx context.Context, ident table.Identifier, planI
 
 			return CompletedPlanningResult{}, fmt.Errorf("waiting for plan %q on %v: %w", planID, ident, ctx.Err())
 		case <-timer.C:
+			if err != nil {
+				scanmetrics.Retry(ctx, "fetch-result")
+			}
 		}
 	}
 }
@@ -665,8 +893,7 @@ func (r *Catalog) WaitForPlan(ctx context.Context, ident table.Identifier, planI
 // ErrServiceUnavailable preserves compatibility with callers or transports that
 // return the sentinel without the package's concrete errorResponse wrapper.
 func scanPlanPollRetry(err error) (time.Duration, bool) {
-	var restErr errorResponse
-	if errors.As(err, &restErr) {
+	if restErr, ok := errors.AsType[errorResponse](err); ok {
 		switch restErr.statusCode {
 		case http.StatusRequestTimeout,
 			http.StatusTooManyRequests,
@@ -866,8 +1093,8 @@ func idempotencyHeaderValue(idempotencyKey *string) (string, error) {
 		// Plan and task POSTs always send an idempotency key. The spec pins it
 		// to a UUIDv7 string (RFC 9562) so a server can key its dedup window off
 		// the embedded timestamp, matching Java's UUIDUtil.generateUuidV7(). A
-		// v4 key would be treated as undefined by such servers. There is no
-		// transport retry here, so nil means a fresh key for this call.
+		// v4 key would be treated as undefined by such servers. All automatic
+		// retries within this call reuse the generated key.
 		key, err := uuid.NewV7()
 		if err != nil {
 			return "", fmt.Errorf("generating idempotency key: %w", err)
@@ -955,9 +1182,8 @@ type CompletedPlanningResult struct {
 type PlanTableScanRequest struct {
 	// IdempotencyKey is sent as the Idempotency-Key header, not in the JSON body.
 	// If set, it must be a UUIDv7 string (RFC 9562). If nil, a fresh UUIDv7 is
-	// generated per call and not returned, so passing nil and retrying on a
-	// transient error sends a different key each attempt and defeats server-side
-	// dedup: pass an explicit key to get idempotency across retries.
+	// generated per call and reused for automatic retries. Supply an explicit
+	// key to preserve idempotency across separate calls.
 	IdempotencyKey *string `json:"-"`
 	// AccessDelegation is sent as the X-Iceberg-Access-Delegation header, not
 	// in the JSON body. Nil uses the catalog default.
@@ -1007,10 +1233,19 @@ func (r *PlanTableScanResponse) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("%w: planTableScan response with status %q missing plan-id", ErrRESTError, resp.Status)
 		}
 	case PlanStatusFailed:
+		if resp.PlanID != nil {
+			return fmt.Errorf("%w: planTableScan response with status %q must not include plan-id", ErrRESTError, resp.Status)
+		}
 	case PlanStatusCancelled:
 		return fmt.Errorf("%w: planTableScan response has invalid status %q", ErrRESTError, resp.Status)
 	default:
 		return fmt.Errorf("%w: planTableScan response has unknown status %q", ErrRESTError, resp.Status)
+	}
+	if resp.Status != PlanStatusFailed && len(resp.Error) > 0 && !isJSONNull(resp.Error) {
+		return fmt.Errorf("%w: planTableScan response includes error for status %q", ErrRESTError, resp.Status)
+	}
+	if err := validatePlanningTaskEnvelope(data, resp.Status, resp.ScanTasks, "planTableScan"); err != nil {
+		return err
 	}
 
 	*r = PlanTableScanResponse{
@@ -1050,6 +1285,12 @@ func (r *FetchPlanningResultResponse) UnmarshalJSON(data []byte) error {
 	default:
 		return fmt.Errorf("%w: fetchPlanningResult response has unknown status %q", ErrRESTError, resp.Status)
 	}
+	if resp.Status != PlanStatusFailed && len(resp.Error) > 0 && !isJSONNull(resp.Error) {
+		return fmt.Errorf("%w: fetchPlanningResult response includes error for status %q", ErrRESTError, resp.Status)
+	}
+	if err := validatePlanningTaskEnvelope(data, resp.Status, resp.ScanTasks, "fetchPlanningResult"); err != nil {
+		return err
+	}
 
 	*r = FetchPlanningResultResponse{
 		Status:             resp.Status,
@@ -1081,9 +1322,8 @@ func decodePlanningError(raw json.RawMessage) *PlanningError {
 type FetchScanTasksRequest struct {
 	// IdempotencyKey is sent as the Idempotency-Key header, not in the JSON body.
 	// If set, it must be a UUIDv7 string (RFC 9562). If nil, a fresh UUIDv7 is
-	// generated per call and not returned, so passing nil and retrying on a
-	// transient error sends a different key each attempt and defeats server-side
-	// dedup: pass an explicit key to get idempotency across retries.
+	// generated per call and reused for automatic retries. Supply an explicit
+	// key to preserve idempotency across separate calls.
 	IdempotencyKey *string `json:"-"`
 
 	PlanTask string `json:"plan-task"`

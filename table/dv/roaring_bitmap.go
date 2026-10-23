@@ -25,7 +25,6 @@ import (
 	"iter"
 	"maps"
 	"slices"
-	"sort"
 
 	"github.com/DataDog/iceberg-go/puffin"
 	"github.com/RoaringBitmap/roaring/v2"
@@ -193,7 +192,7 @@ func (b *RoaringPositionBitmap) Serialize(w io.Writer) error {
 			keys = append(keys, k)
 		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	slices.Sort(keys)
 
 	if err := binary.Write(w, binary.LittleEndian, int64(len(keys))); err != nil {
 		return fmt.Errorf("write bitmap count: %w", err)
@@ -208,6 +207,20 @@ func (b *RoaringPositionBitmap) Serialize(w io.Writer) error {
 	}
 
 	return nil
+}
+
+// serializedSize returns the exact size of the portable bitmap encoding after
+// RunLengthEncode has been called. Empty buckets are omitted by Serialize and
+// therefore do not contribute.
+func (b *RoaringPositionBitmap) serializedSize() uint64 {
+	size := uint64(8) // bitmap count
+	for _, bm := range b.bitmaps {
+		if bm.GetCardinality() > 0 {
+			size += 4 + bm.GetSerializedSizeInBytes() // bucket key + bitmap
+		}
+	}
+
+	return size
 }
 
 // DeserializeRoaringPositionBitmap reads a bitmap from the Iceberg portable format.
@@ -282,35 +295,44 @@ func (b *RoaringPositionBitmap) KeepMaskBytes(length int64) []byte {
 	memory.Set(out, 0xFF)
 
 	for key, bm := range b.bitmaps {
-		bucketBitBase := int64(key) << 32
-		if bucketBitBase >= length {
+		bucketBitBase := uint64(key) << 32
+		if bucketBitBase >= uint64(length) {
 			continue
 		}
+		bucketBits := min(uint64(length)-bucketBitBase, 1<<32)
+		if bm.CardinalityInRange(0, bucketBits) < bm.DenseSize() {
+			it := bm.Iterator()
+			for it.HasNext() {
+				pos := uint64(it.Next())
+				if pos >= bucketBits {
+					break
+				}
+				globalPos := bucketBitBase + pos
+				out[globalPos>>3] &^= byte(1 << (globalPos & 7))
+			}
+
+			continue
+		}
+
 		dense := bm.ToDense()
 		if len(dense) == 0 {
 			continue
 		}
 		// Cap the bucket's bit range to what fits in `length`.
-		bucketBits := int64(len(dense)) * 64
-		if bucketBitBase+bucketBits > length {
-			bucketBits = length - bucketBitBase
-		}
+		bucketBits = min(uint64(len(dense))*64, uint64(length)-bucketBitBase)
 		// bucketBitBase = key << 32 is always 8-byte-aligned, so the
 		// BitmapWordWriter runs with offset=0 internally. The trailing-byte
 		// loop below relies on that alignment — PutNextTrailingByte's
 		// validBits=8 path is byte-aligned only when offset == 0.
 		wr := bitutil.NewBitmapWordWriter(out, int(bucketBitBase), int(bucketBits))
 		full := int(bucketBits / 64)
-		for i := 0; i < full; i++ {
+		for i := range full {
 			wr.PutNextWord(^dense[i])
 		}
 		if rem := int(bucketBits & 63); rem > 0 {
 			last := ^dense[full]
 			for rem > 0 {
-				valid := 8
-				if rem < 8 {
-					valid = rem
-				}
+				valid := min(rem, 8)
 				wr.PutNextTrailingByte(byte(last), valid)
 				last >>= 8
 				rem -= valid

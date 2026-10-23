@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -313,6 +314,9 @@ func (t awsAsTest) TopicErrorCheck(topic *pubsub.Topic, err error) error {
 	if !topic.ErrorAs(err, &e) {
 		return errors.New("Topic.ErrorAs failed")
 	}
+	if !errors.As(err, &e) {
+		return errors.New("errors.As failed")
+	}
 	switch t.topicKind {
 	case topicKindSNS, topicKindSNSRaw:
 		if got, want := e.ErrorCode(), (&snstypes.NotFoundException{}).ErrorCode(); want != got {
@@ -332,6 +336,9 @@ func (t awsAsTest) SubscriptionErrorCheck(s *pubsub.Subscription, err error) err
 	var e smithy.APIError
 	if !s.ErrorAs(err, &e) {
 		return errors.New("Subscription.ErrorAs failed")
+	}
+	if !errors.As(err, &e) {
+		return errors.New("errors.As failed")
 	}
 	if got, want := e.ErrorCode(), "AWS.SimpleQueueService.NonExistentQueue"; got != want {
 		return fmt.Errorf("got %q, want %q", got, want)
@@ -630,9 +637,7 @@ func testFIFOTopic(t *testing.T, kind topicKind) {
 
 			// Set the FIFO attributes.
 			attributes := make(map[string]string)
-			for k, v := range tt.harness.attributes {
-				attributes[k] = v
-			}
+			maps.Copy(attributes, tt.harness.attributes)
 			switch kind {
 			case topicKindSNS:
 				attributes[attributeKeyFifoTopic] = "true"

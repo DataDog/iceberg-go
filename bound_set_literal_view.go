@@ -37,10 +37,13 @@ func cloneBoundLiteral(lit Literal) Literal {
 	}
 }
 
-func cloneBoundLiteralSet(lits Set[Literal]) Set[Literal] {
-	cloned := newLiteralSet()
-	for _, literal := range lits.Members() {
-		cloned.Add(cloneBoundLiteral(literal))
+func cloneBoundLiteralSet(lits literalSet) Set[Literal] {
+	cloned := make(literalSet, len(lits))
+	for key, value := range lits {
+		if value.orig != nil {
+			value.orig = cloneBoundLiteral(value.orig)
+		}
+		cloned[key] = value
 	}
 
 	return cloned
@@ -50,8 +53,16 @@ type boundSetLiteralRef interface {
 	boundSetLiteralsRef() Set[Literal]
 }
 
+type boundSetExtremaRef interface {
+	boundSetExtremaRef() (minLit, maxLit Literal, ok bool)
+}
+
 func (bsp *boundSetPredicate[T]) boundSetLiteralsRef() Set[Literal] {
 	return bsp.lits
+}
+
+func (bsp *boundSetPredicate[T]) boundSetExtremaRef() (minLit, maxLit Literal, ok bool) {
+	return bsp.minLiteral, bsp.maxLiteral, bsp.hasExtrema
 }
 
 func boundSetLiteralsForVisit(predicate BoundPredicate) Set[Literal] {

@@ -21,7 +21,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"github.com/goccy/go-json"
 	"io"
 	"net"
 	"net/http"
@@ -29,6 +28,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -512,10 +513,7 @@ func TestServerHandlesConcurrentPollAndTaskRequests(t *testing.T) {
 	errCh := make(chan error, requestCount)
 	var wg sync.WaitGroup
 	for range requestCount {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for requestIndex, request := range []struct {
 				method string
 				url    string
@@ -555,7 +553,7 @@ func TestServerHandlesConcurrentPollAndTaskRequests(t *testing.T) {
 				}
 			}
 			errCh <- nil
-		}()
+		})
 	}
 	wg.Wait()
 	close(errCh)

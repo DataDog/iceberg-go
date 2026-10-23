@@ -29,7 +29,7 @@ import (
 	"github.com/DataDog/iceberg-go/go-cloud/docstore"
 
 	// Import the docstore driver packages we want to be able to open.
-	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb"
+	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/awsdynamodb/v2"
 	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/gcpfirestore"
 	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/memdocstore"
 	_ "github.com/DataDog/iceberg-go/go-cloud/docstore/mongodocstore"

@@ -33,6 +33,7 @@ import (
 	_ "github.com/DataDog/iceberg-go/go-cloud/runtimevar/constantvar"
 	_ "github.com/DataDog/iceberg-go/go-cloud/runtimevar/filevar"
 	_ "github.com/DataDog/iceberg-go/go-cloud/runtimevar/gcpruntimeconfig"
+	_ "github.com/DataDog/iceberg-go/go-cloud/runtimevar/hashivault"
 	_ "github.com/DataDog/iceberg-go/go-cloud/runtimevar/httpvar"
 )
 

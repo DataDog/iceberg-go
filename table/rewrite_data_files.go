@@ -19,16 +19,23 @@ package table
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	iofs "io/fs"
 	"log/slog"
 	"maps"
-	"slices"
 
 	"github.com/DataDog/iceberg-go"
+	iceberginternal "github.com/DataDog/iceberg-go/internal"
+	iceio "github.com/DataDog/iceberg-go/io"
 )
 
 // RewriteResult summarizes a completed compaction.
 type RewriteResult struct {
+	// Table is the latest committed table when PartialProgress is enabled.
+	// It is nil for an atomic rewrite until the caller commits the transaction.
+	Table *Table
+
 	// RewrittenGroups is the number of compaction groups committed.
 	RewrittenGroups int
 
@@ -59,6 +66,49 @@ type RewriteResult struct {
 
 	// BytesAfter is the total size of output data files (measured from written files).
 	BytesAfter int64
+
+	// CompletedGroups contains the groups whose snapshots were committed in
+	// partial-progress mode.
+	CompletedGroups []CompactionGroupResult
+
+	// FailedGroups contains groups whose catalog commits failed. A partial
+	// rewrite can return both completed and failed groups.
+	FailedGroups []CompactionGroupFailure
+}
+
+// CompactionGroupFailure records a group that could not be committed during a
+// partial-progress rewrite.
+type CompactionGroupFailure struct {
+	PartitionKey string
+	Err          error
+}
+
+// RewriteDataFiles runs a compaction rewrite as a table-level action. Atomic
+// rewrites are committed before this method returns. Partial-progress rewrites
+// commit each group as they run and return the latest table through
+// [RewriteResult.Table].
+//
+// Use [Transaction.RewriteDataFiles] when the rewrite must be staged alongside
+// other updates in one transaction. Partial progress is terminal and should
+// normally be invoked through this action so callers do not accidentally try
+// to commit the parent transaction again.
+func (t Table) RewriteDataFiles(ctx context.Context, groups []CompactionTaskGroup, opts RewriteDataFilesOptions) (*RewriteResult, error) {
+	txn, err := t.NewTransactionOnBranchWithError(MainBranch)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := txn.RewriteDataFiles(ctx, groups, opts)
+	if err != nil || opts.PartialProgress {
+		return result, err
+	}
+
+	committed, err := txn.Commit(ctx)
+	if result != nil && err == nil {
+		result.Table = committed
+	}
+
+	return result, err
 }
 
 // CompactionTaskGroup is a set of scan tasks in the same partition that
@@ -105,8 +155,9 @@ type CompactionGroupResult struct {
 
 	// SafePosDeletes are position-delete files referenced by tasks in
 	// this group whose target data file is being rewritten, computed
-	// via [CollectSafePositionDeletes]. They are safe to expunge in
-	// the rewrite snapshot.
+	// via [CollectSafePositionDeletes]. Partial-progress callers must
+	// re-check them against the complete commit batch before expunging
+	// them because one file can reference data files in multiple groups.
 	SafePosDeletes []iceberg.DataFile
 
 	// SafeDeletionVectors are deletion vectors attached to tasks in this
@@ -127,24 +178,26 @@ type CompactionGroupResult struct {
 // RewriteDataFilesOptions bundles the per-rewrite knobs for
 // [Transaction.RewriteDataFiles].
 type RewriteDataFilesOptions struct {
-	// PartialProgress, when true, stages each group as its own
-	// rewrite snapshot inside the loop so a mid-loop write failure
-	// leaves the already-completed groups staged on this transaction
-	// (the in-memory transaction can be discarded by group rather
-	// than wholesale). When false (the default), every group lands in
-	// a single atomic rewrite snapshot.
-	//
-	// In both modes the catalog commit happens once at
-	// [Transaction.Commit] time, so a process crash mid-loop loses
-	// every staged group regardless of this flag. Callers who need
-	// true per-group catalog durability (matching Java's behavior)
-	// should drive [Transaction.NewRewrite] themselves and commit a
-	// fresh transaction per group.
+	// PartialProgress, when true, commits non-empty groups in durable catalog
+	// batches. When false (the default), every group is staged in a single
+	// atomic rewrite snapshot.
 	PartialProgress bool
 
+	// MaxCommits bounds the number of catalog snapshots produced in
+	// partial-progress mode. Groups are batched so all groups are processed
+	// while staying within this bound. Zero uses the default of 10. It has no
+	// effect for atomic rewrites.
+	MaxCommits int
+
+	// MaxFailedCommits bounds catalog commit failures in partial-progress mode.
+	// Zero (the default) and negative values allow unlimited failures. Failures
+	// within the bound are returned in RewriteResult.FailedGroups without making
+	// the operation return an error.
+	MaxFailedCommits int
+
 	// SnapshotProps are added to the rewrite snapshot's summary.
-	// In partial-progress mode the same properties land on every
-	// per-group snapshot rather than being summed or split.
+	// In partial-progress mode the same properties land on every batch
+	// snapshot rather than being summed or split.
 	SnapshotProps iceberg.Properties
 
 	// ExtraDeleteFilesToRemove are delete files that are dead after
@@ -171,8 +224,11 @@ type RewriteDataFilesOptions struct {
 type CompactionGroupOption func(*compactionGroupConfig)
 
 type compactionGroupConfig struct {
-	targetFileSize  int64
-	scanConcurrency int
+	targetFileSize        int64
+	scanConcurrency       int
+	arrowBatchSize        int
+	recordBatchBufferSize int
+	parquetRowGroupLimit  int
 }
 
 // WithCompactionTargetFileSize sets the size target for output files
@@ -193,9 +249,66 @@ func WithCompactionTargetFileSize(size int64) CompactionGroupOption {
 // WithCompactionScanConcurrency sets the scan concurrency used when
 // reading the group's tasks. Forwarded to [Table.Scan] as
 // [WithMaxConcurrency]. Zero (the default) means runtime.GOMAXPROCS.
+// The scan runs min(n, number of tasks) workers, and each worker holds
+// the decoded batches of at most one task until the writer has taken
+// them, so the worker count multiplies the read-side term of the
+// memory bound stated on [WithCompactionArrowBatchSize].
 func WithCompactionScanConcurrency(n int) CompactionGroupOption {
 	return func(c *compactionGroupConfig) {
 		c.scanConcurrency = n
+	}
+}
+
+// WithCompactionArrowBatchSize caps the number of rows decoded per
+// Arrow record batch while reading the group's tasks, forwarded to the
+// scan as [WithArrowBatchSize]. The record pipeline holds at most
+//
+//	workers x (rows in the largest task + n) + (recordBatchBufferSize + 2) x n
+//
+// rows, where workers is the scan's worker count (see
+// [WithCompactionScanConcurrency]) and recordBatchBufferSize is the
+// [WithCompactionRecordBatchBufferSize] value. Each scan worker holds
+// the batches of at most one task at a time, in its hands, in the
+// records channel, in the reorder heap or in the sequenced channel,
+// and does not start its next task until the last batch of the
+// previous one has been consumed; a task's batches total at most its
+// row count rounded up to a multiple of n. The clustered writer holds
+// one batch while routing it, recordBatchBufferSize batches in its
+// input channel and one batch while encoding. Not covered: the Parquet
+// reader's own buffers, including the raw batch it last returned, and
+// delete-side memory, since positional deletes and deletion-vector
+// bitmaps for the group's tasks are materialized up front and sized by
+// delete volume, not by these knobs. A non-positive value keeps the
+// table's read.parquet.batch-size property.
+func WithCompactionArrowBatchSize(n int) CompactionGroupOption {
+	return func(c *compactionGroupConfig) {
+		if n > 0 {
+			c.arrowBatchSize = n
+		}
+	}
+}
+
+// WithCompactionRecordBatchBufferSize sets the capacity, in record
+// batches, of the write pipeline's per-writer input buffer, forwarded
+// to [WriteRecords] as [WithRecordBatchBufferSize]. The default is 64
+// batches. A non-positive value is ignored.
+func WithCompactionRecordBatchBufferSize(n int) CompactionGroupOption {
+	return func(c *compactionGroupConfig) {
+		if n > 0 {
+			c.recordBatchBufferSize = n
+		}
+	}
+}
+
+// WithCompactionParquetRowGroupLimit caps the rows per Parquet row
+// group in the compacted output files, forwarded to [WriteRecords] as
+// [WithParquetRowGroupLimit]. A non-positive value keeps the table's
+// write.parquet.row-group-limit property.
+func WithCompactionParquetRowGroupLimit(n int) CompactionGroupOption {
+	return func(c *compactionGroupConfig) {
+		if n > 0 {
+			c.parquetRowGroupLimit = n
+		}
 	}
 }
 
@@ -224,12 +337,11 @@ func (t *Transaction) RewriteDataFiles(ctx context.Context, groups []CompactionT
 	if _, err := t.txnMeta(); err != nil {
 		return nil, err
 	}
-	if len(groups) == 0 {
-		return &RewriteResult{}, nil
-	}
-
 	if opts.PartialProgress {
 		return t.rewriteDataFilesPartial(ctx, groups, opts)
+	}
+	if len(groups) == 0 {
+		return &RewriteResult{}, nil
 	}
 
 	result := &RewriteResult{}
@@ -326,6 +438,9 @@ func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTas
 	if cfg.scanConcurrency > 0 {
 		scanOpts = append(scanOpts, WithMaxConcurrency(cfg.scanConcurrency))
 	}
+	if cfg.arrowBatchSize > 0 {
+		scanOpts = append(scanOpts, WithArrowBatchSize(cfg.arrowBatchSize))
+	}
 
 	// Preserve row lineage only when every source file in the group carries
 	// it. A mixed group (some files with FirstRowID, some without — e.g.
@@ -370,6 +485,12 @@ func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTas
 	if cfg.targetFileSize > 0 {
 		writeOpts = append(writeOpts, WithTargetFileSize(cfg.targetFileSize))
 	}
+	if cfg.recordBatchBufferSize > 0 {
+		writeOpts = append(writeOpts, WithRecordBatchBufferSize(cfg.recordBatchBufferSize))
+	}
+	if cfg.parquetRowGroupLimit > 0 {
+		writeOpts = append(writeOpts, WithParquetRowGroupLimit(cfg.parquetRowGroupLimit))
+	}
 	if preserveLineage {
 		// Rebuild the arrow schema from the projected iceberg schema so the
 		// reserved row-lineage field IDs (_row_id, _last_updated_sequence_number)
@@ -394,7 +515,11 @@ func ExecuteCompactionGroup(ctx context.Context, tbl *Table, group CompactionTas
 	)
 	for df, err := range WriteRecords(ctx, tbl, arrowSchema, records, writeOpts...) {
 		if err != nil {
-			return CompactionGroupResult{}, fmt.Errorf("write compacted files for group %q: %w", group.PartitionKey, err)
+			return CompactionGroupResult{
+				PartitionKey: group.PartitionKey,
+				NewDataFiles: newFiles,
+				BytesAfter:   bytesAfter,
+			}, fmt.Errorf("write compacted files for group %q: %w", group.PartitionKey, err)
 		}
 		newFiles = append(newFiles, df)
 		bytesAfter += df.FileSizeBytes()
@@ -432,64 +557,250 @@ func allTasksHaveRowLineage(tasks []FileScanTask) bool {
 	return true
 }
 
-// rewriteDataFilesPartial stages each group as its own rewrite
-// snapshot via [Transaction.ReplaceFiles] directly. Per-group staging
-// lets a mid-loop write failure leave already-staged groups on the
-// transaction; the catalog still receives them at
-// [Transaction.Commit] time.
-//
-// Validator registration is coalesced: a single [rewriteValidator]
-// covering every rewritten path across all groups is registered once,
-// after the loop, instead of one per group. The transaction's
-// validator list otherwise grows linearly with the group count, and
-// each entry independently walks the concurrent-snapshot set on
-// refresh-replay — the union walk subsumes them.
+// rewriteDataFilesPartial executes groups and commits them in durable batches.
+// A batch is the atomic unit for both the MaxCommits bound and delete cleanup:
+// classic position deletes are rechecked against the union of every old data
+// file in the batch before they are removed. A later batch can fail without
+// rolling back snapshots already committed for earlier batches.
 func (t *Transaction) rewriteDataFilesPartial(ctx context.Context, groups []CompactionTaskGroup, opts RewriteDataFilesOptions) (*RewriteResult, error) {
-	result := &RewriteResult{}
-	props := maps.Clone(opts.SnapshotProps)
-	var allRewritten []iceberg.DataFile
+	if err := t.checkNotNil(); err != nil {
+		return nil, err
+	}
+	t.mx.Lock()
+	defer t.mx.Unlock()
 
+	meta, err := t.txnMeta()
+	if err != nil {
+		return nil, err
+	}
+	if t.committed {
+		return nil, errors.New("transaction has already been committed")
+	}
+	result := &RewriteResult{Table: t.tbl}
+	if len(meta.updates) > 0 || len(t.reqs) > 0 || len(t.validators) > 0 {
+		return nil, fmt.Errorf("%w: partial progress requires a fresh transaction",
+			ErrInvalidOperation)
+	}
+	maxCommits := opts.MaxCommits
+	if maxCommits == 0 {
+		maxCommits = 10
+	}
+	if maxCommits < 0 {
+		return nil, fmt.Errorf("%w: MaxCommits must be non-negative", ErrInvalidOperation)
+	}
+	maxFailedCommits := opts.MaxFailedCommits
+	if len(groups) == 0 {
+		return result, nil
+	}
+
+	pendingGroups := make([]CompactionTaskGroup, 0, len(groups))
 	for _, group := range groups {
+		if len(group.Tasks) > 0 {
+			pendingGroups = append(pendingGroups, group)
+		}
+	}
+	if len(pendingGroups) == 0 {
+		return result, nil
+	}
+
+	// Match Iceberg's action semantics: MaxCommits is a bound on snapshots,
+	// not on the number of groups processed. Distribute all groups across at
+	// most MaxCommits batches.
+	groupsPerCommit := (len(pendingGroups)-1)/maxCommits + 1
+	props := maps.Clone(opts.SnapshotProps)
+	current := t.tbl
+	failedCommits := 0
+
+	for batchStart := 0; batchStart < len(pendingGroups); batchStart += groupsPerCommit {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
 
-		if len(group.Tasks) == 0 {
-			continue
-		}
-
-		gr, err := ExecuteCompactionGroup(ctx, t.tbl, group, opts.GroupOptions...)
+		batchEnd := min(batchStart+groupsPerCommit, len(pendingGroups))
+		batchGroups := pendingGroups[batchStart:batchEnd]
+		batchResults := make([]CompactionGroupResult, 0, len(batchGroups))
+		rewrittenPaths := make(map[string]struct{})
+		rewrittenFiles := make([]iceberg.DataFile, 0)
+		fs, err := current.fsF(ctx)
 		if err != nil {
-			return result, err
+			return result, fmt.Errorf("open table IO for partial rewrite batch: %w", err)
+		}
+		cleanupBatch := func(cause error, extras ...CompactionGroupResult) error {
+			results := batchResults
+			if len(extras) > 0 {
+				results = make([]CompactionGroupResult, 0, len(batchResults)+len(extras))
+				results = append(results, batchResults...)
+				results = append(results, extras...)
+			}
+			if cleanupErr := cleanupCompactionOutputs(fs, results); cleanupErr != nil {
+				return errors.Join(cause, fmt.Errorf("clean up partial rewrite batch outputs: %w", cleanupErr))
+			}
+
+			return cause
 		}
 
-		if len(gr.OldDataFiles) == 0 && len(gr.NewDataFiles) == 0 {
+		for _, group := range batchGroups {
+			if err := ctx.Err(); err != nil {
+				return result, cleanupBatch(err)
+			}
+
+			gr, err := ExecuteCompactionGroup(ctx, current, group, opts.GroupOptions...)
+			if err != nil {
+				return result, cleanupBatch(err, gr)
+			}
+
+			if len(gr.OldDataFiles) == 0 && len(gr.NewDataFiles) == 0 {
+				continue
+			}
+			batchResults = append(batchResults, gr)
+			for _, df := range gr.OldDataFiles {
+				if _, ok := rewrittenPaths[df.FilePath()]; ok {
+					continue
+				}
+				rewrittenPaths[df.FilePath()] = struct{}{}
+				rewrittenFiles = append(rewrittenFiles, df)
+			}
+		}
+
+		if len(batchResults) == 0 {
 			continue
 		}
 
-		deletesToRemove := append(slices.Clone(gr.SafePosDeletes), gr.SafeDeletionVectors...)
-		if err := t.ReplaceFiles(ctx, gr.OldDataFiles, gr.NewDataFiles, deletesToRemove,
-			props, withRewriteSemantics()); err != nil {
-			return result, fmt.Errorf("commit compaction group %q: %w", group.PartitionKey, err)
+		deadPositionDeletes, err := CollectDeadPositionDeletes(
+			ctx, fs, latestSnapshotForBranch(current.Metadata(), t.branch), rewrittenPaths)
+		if err != nil {
+			return result, cleanupBatch(fmt.Errorf("collect dead position deletes for partial rewrite batch: %w", err))
 		}
 
-		allRewritten = append(allRewritten, gr.OldDataFiles...)
-		accumulateGroupMetrics(result, gr)
-	}
+		// Deletion vectors are one-to-one with their referenced data file, so
+		// task-level results are sufficient. Deduplicate by reference because
+		// ReplaceFiles rejects multiple DVs for one data file.
+		safeDVs := make([]iceberg.DataFile, 0)
+		seenDVRefs := make(map[string]struct{})
+		for _, gr := range batchResults {
+			for _, dv := range gr.SafeDeletionVectors {
+				ref := dv.ReferencedDataFile()
+				if ref == nil {
+					continue
+				}
+				if _, ok := seenDVRefs[*ref]; ok {
+					continue
+				}
+				seenDVRefs[*ref] = struct{}{}
+				safeDVs = append(safeDVs, dv)
+			}
+		}
+		deletesToRemove := append(deadPositionDeletes, safeDVs...)
 
-	if len(allRewritten) > 0 {
-		t.addValidator(rewriteValidator(allRewritten))
+		groupTxn, err := current.NewTransactionOnBranchWithError(t.branch)
+		if err != nil {
+			return result, cleanupBatch(fmt.Errorf("create transaction for partial rewrite batch: %w", err))
+		}
+		newDataFiles := make([]iceberg.DataFile, 0)
+		oldDataFiles := make([]iceberg.DataFile, 0, len(rewrittenFiles))
+		for _, gr := range batchResults {
+			oldDataFiles = append(oldDataFiles, gr.OldDataFiles...)
+			newDataFiles = append(newDataFiles, gr.NewDataFiles...)
+		}
+		if err := groupTxn.ReplaceFiles(ctx, oldDataFiles, newDataFiles, deletesToRemove,
+			props, withRewriteSemantics()); err != nil {
+			return result, cleanupBatch(fmt.Errorf("stage partial rewrite batch: %w", err))
+		}
+		groupTxn.addValidator(rewriteValidator(rewrittenFiles))
+
+		next, err := groupTxn.Commit(ctx)
+		if err != nil {
+			if next != nil {
+				// A non-nil table means the catalog commit succeeded even if a
+				// post-commit hook returned an error. Keep the committed state and
+				// stop before planning another batch from an error-bearing result.
+				recordCommittedRewriteBatch(result, next, batchResults, deadPositionDeletes, safeDVs, &current, t)
+
+				return result, err
+			}
+
+			// ErrCommitFailed is the only error that proves the catalog did not
+			// commit. Every other error leaves commit state unknown, so continuing
+			// with the old table could apply later batches on stale state.
+			if !errors.Is(err, ErrCommitFailed) {
+				t.committed = true
+
+				return result, err
+			}
+
+			failedCommits++
+			for _, gr := range batchResults {
+				result.FailedGroups = append(result.FailedGroups, CompactionGroupFailure{
+					PartitionKey: gr.PartitionKey,
+					Err:          err,
+				})
+			}
+			if cleanupErr := cleanupCompactionOutputs(fs, batchResults); cleanupErr != nil {
+				return result, errors.Join(err, fmt.Errorf("clean up failed partial rewrite batch outputs: %w", cleanupErr))
+			}
+			if maxFailedCommits > 0 && failedCommits > maxFailedCommits {
+				return result, fmt.Errorf("commit partial rewrite batch %d: %w (maximum failed commits reached)",
+					batchStart/groupsPerCommit+1, err)
+			}
+
+			continue
+		}
+
+		recordCommittedRewriteBatch(result, next, batchResults, deadPositionDeletes, safeDVs, &current, t)
 	}
 
 	return result, nil
 }
 
+func recordCommittedRewriteBatch(
+	result *RewriteResult,
+	next *Table,
+	batchResults []CompactionGroupResult,
+	deadPositionDeletes []iceberg.DataFile,
+	safeDVs []iceberg.DataFile,
+	current **Table,
+	txn *Transaction,
+) {
+	*current = next
+	txn.tbl = next
+	txn.committed = true
+	for _, gr := range batchResults {
+		accumulateGroupMetricsWithDeletes(result, gr, 0, 0)
+		result.CompletedGroups = append(result.CompletedGroups, gr)
+	}
+	result.RemovedPositionDeleteFiles += len(deadPositionDeletes)
+	result.RemovedDeletionVectorFiles += len(safeDVs)
+	result.Table = next
+}
+
+func cleanupCompactionOutputs(fs iceio.IO, batchResults []CompactionGroupResult) error {
+	paths := make(map[string]struct{})
+	for _, result := range batchResults {
+		for _, file := range result.NewDataFiles {
+			paths[file.FilePath()] = struct{}{}
+		}
+	}
+
+	var cleanupErr error
+	for path := range paths {
+		if err := fs.Remove(path); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+
+	return cleanupErr
+}
+
 func accumulateGroupMetrics(r *RewriteResult, gr CompactionGroupResult) {
+	accumulateGroupMetricsWithDeletes(r, gr, len(gr.SafePosDeletes), len(gr.SafeDeletionVectors))
+}
+
+func accumulateGroupMetricsWithDeletes(r *RewriteResult, gr CompactionGroupResult, positionDeletes, deletionVectors int) {
 	r.RewrittenGroups++
 	r.AddedDataFiles += len(gr.NewDataFiles)
 	r.RemovedDataFiles += len(gr.OldDataFiles)
-	r.RemovedPositionDeleteFiles += len(gr.SafePosDeletes)
-	r.RemovedDeletionVectorFiles += len(gr.SafeDeletionVectors)
+	r.RemovedPositionDeleteFiles += positionDeletes
+	r.RemovedDeletionVectorFiles += deletionVectors
 	r.BytesBefore += gr.BytesBefore
 	r.BytesAfter += gr.BytesAfter
 }
@@ -502,9 +813,24 @@ func accumulateGroupMetrics(r *RewriteResult, gr CompactionGroupResult) {
 // Always runs — no isolation gating, because rewrite is a structural
 // operation, not a user-facing isolation choice.
 func rewriteValidator(rewrittenFiles []iceberg.DataFile) conflictValidatorFunc {
+	return rewriteValidatorWithReferencedDataFiles(rewrittenFiles, nil)
+}
+
+// rewriteValidatorWithReferencedDataFiles extends rewrite validation to data
+// files targeted by deletion vectors added by the rewrite. Existing targets
+// must remain live, and no concurrent delete may be added for them before the
+// rewrite commits; otherwise the rewrite could create a duplicate DV or leave
+// a position delete surviving beside the new DV.
+func rewriteValidatorWithReferencedDataFiles(
+	rewrittenFiles []iceberg.DataFile,
+	referencedDataFilePaths []string,
+) conflictValidatorFunc {
 	return func(cc *conflictContext) error {
 		if cc == nil {
 			return nil
+		}
+		if err := validateDataFilesExist(cc, referencedDataFilePaths); err != nil {
+			return err
 		}
 
 		return validateNoNewDeletesForRewrittenFiles(cc, rewrittenFiles)
@@ -577,7 +903,7 @@ func CollectSafeDeletionVectors(tasks []FileScanTask) []iceberg.DataFile {
 
 	for _, task := range tasks {
 		for _, dv := range task.DeletionVectorFiles {
-			ref := dv.ReferencedDataFile()
+			ref := iceberginternal.BorrowedDataFileReferencedDataFile(dv)
 			if ref == nil {
 				continue
 			}

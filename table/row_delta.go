@@ -24,6 +24,7 @@ import (
 	"maps"
 
 	"github.com/DataDog/iceberg-go"
+	iceberginternal "github.com/DataDog/iceberg-go/internal"
 	iceio "github.com/DataDog/iceberg-go/io"
 )
 
@@ -97,6 +98,7 @@ func (rd *RowDelta) AddRows(files ...iceberg.DataFile) *RowDelta {
 // Equality delete files must have ContentType == EntryContentEqDeletes
 // and non-empty EqualityFieldIDs referencing valid schema columns.
 // Position delete files must have ContentType == EntryContentPosDeletes.
+// DVs are rejected by Commit unless the table is v3 or later.
 func (rd *RowDelta) AddDeletes(files ...iceberg.DataFile) *RowDelta {
 	rd.delFiles = append(rd.delFiles, files...)
 
@@ -149,6 +151,7 @@ func (rd *RowDelta) RemoveDeletes(files ...iceberg.DataFile) *RowDelta {
 // on one data file (a replacement added while the superseded live DV
 // is not removed, or two added replacements for one data file), or if
 // the table format version does not support delete files.
+// Deletes require v2 or later, DVs require v3 or later.
 //
 // With removals present the staged commit is non-replayable: an
 // optimistic-concurrency conflict fails the transaction's Commit with
@@ -193,6 +196,15 @@ func (rd *RowDelta) Commit(ctx context.Context) error {
 		if ct != iceberg.EntryContentPosDeletes && ct != iceberg.EntryContentEqDeletes {
 			return fmt.Errorf("expected delete file, got content type %s: %s",
 				ct, f.FilePath())
+		}
+
+		if IsDeletionVector(f) {
+			if err := validateDeletionVectorToAdd(f, meta.formatVersion, "row delta"); err != nil {
+				return err
+			}
+		} else if ct == iceberg.EntryContentPosDeletes && meta.formatVersion >= 3 {
+			return fmt.Errorf("position delete file %s must be a deletion vector for v%d table for row delta",
+				f.FilePath(), meta.formatVersion)
 		}
 
 		// Equality delete files must declare which columns form the delete key,
@@ -250,7 +262,7 @@ func (rd *RowDelta) Commit(ctx context.Context) error {
 		// row-delta semantics; RowDelta registers its own validator
 		// below, so suppress the default the same way rewrites do.
 		producer = newOverwriteFilesProducer(op, rd.txn, wfs, nil, rd.props)
-		producer.producerImpl.(*overwriteFiles).skipDefaultValidator = true
+		producer.setSkipDefaultValidator(true)
 
 		for _, live := range resolvedRemovals {
 			producer.removeDeletionVector(live)
@@ -405,7 +417,7 @@ func (rd *RowDelta) validateRemovedDeletes(resolved, replacedLive []iceberg.Data
 // need; deltas without removals do not pay for it (nor get it — see
 // AddDeletes).
 func (rd *RowDelta) resolveRemovedDeletes(fs iceio.IO, meta *MetadataBuilder) (resolved, replacedLive []iceberg.DataFile, _ error) {
-	snap := meta.currentSnapshot()
+	snap := rd.txn.planningSnapshot(meta)
 	if snap == nil {
 		return nil, nil, errors.New("cannot remove delete files from a table without an existing snapshot")
 	}
@@ -423,12 +435,9 @@ func (rd *RowDelta) resolveRemovedDeletes(fs iceio.IO, meta *MetadataBuilder) (r
 	}
 
 	liveByPath := make(map[string][]iceberg.DataFile, len(rd.removedDels))
-	for entry, err := range snap.entries(fs, iceberg.ManifestContentDeletes) {
+	for entry, err := range snap.entries(fs, iceberg.ManifestContentDeletes, true) {
 		if err != nil {
 			return nil, nil, err
-		}
-		if entry.Status() == iceberg.EntryStatusDELETED {
-			continue
 		}
 		df := entry.DataFile()
 		if _, ok := want[df.FilePath()]; ok {
@@ -553,7 +562,7 @@ func (rd *RowDelta) validate(cc *conflictContext) error {
 	for _, f := range rd.delFiles {
 		switch f.ContentType() {
 		case iceberg.EntryContentPosDeletes:
-			if ref := f.ReferencedDataFile(); ref != nil && *ref != "" {
+			if ref := iceberginternal.BorrowedDataFileReferencedDataFile(f); ref != nil && *ref != "" {
 				referenced = append(referenced, *ref)
 			}
 		case iceberg.EntryContentEqDeletes:

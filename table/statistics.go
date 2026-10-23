@@ -19,6 +19,7 @@ package table
 
 import (
 	"fmt"
+
 	"github.com/goccy/go-json"
 )
 

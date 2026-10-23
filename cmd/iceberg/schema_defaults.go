@@ -19,9 +19,10 @@ package main
 
 import (
 	"fmt"
-	"github.com/goccy/go-json"
 	"os"
 	"strconv"
+
+	"github.com/goccy/go-json"
 
 	"github.com/DataDog/iceberg-go"
 	"github.com/pterm/pterm"
