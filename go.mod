@@ -83,7 +83,8 @@ require (
 	github.com/substrait-io/substrait-go/v8 v8.1.1
 	github.com/testcontainers/testcontainers-go/modules/compose v0.44.0
 	github.com/twmb/avro v1.9.0
-	github.com/twmb/murmur3 v1.2.0
+	// v1.2.0 makes Sum64's []byte input escape in downstream hot paths.
+	github.com/twmb/murmur3 v1.1.8
 	github.com/twpayne/go-geom v1.7.0
 	github.com/uptrace/bun v1.2.18
 	github.com/uptrace/bun/dialect/mssqldialect v1.2.18
